@@ -18,7 +18,7 @@
 //! data types from [`crate::doc`] and an ed25519 key.
 
 use crate::doc::{DocId, Hash32, ModelRef, Origin, VecClock};
-use ed25519_dalek::{Signer, Signature, SigningKey, VerifyingKey};
+use ed25519_dalek::{Signature, Signer, SigningKey, VerifyingKey};
 use serde::{Deserialize, Serialize};
 
 fn sig_ser<S: serde::Serializer>(sig: &[u8; 64], s: S) -> Result<S::Ok, S::Error> {
@@ -74,13 +74,13 @@ pub struct Action {
     pub sig: [u8; 64],
 }
 
-/// Canonical byte form an action is signed over. Every field except the
-/// signature participates, including the (canonical) vector clock and the
-/// model ref's pinned hash:
+/// Canonical byte form an action is signed over. The primary signature and
+/// the co-signatures are excluded — a signature cannot be part of the bytes
+/// it covers — so the origin and every co-signer sign this same message:
 ///
 /// `doc_id(16) || 0x01 name 0x01 version [0x01 hash | 0x00]
 ///  || 0x01 kind || 0x01 payload || ts(8) || 0x01 clock
-///  || 0x01 origin || 0x01 cosig… || [0x01 prev_hash | 0x00]`
+///  || 0x01 origin || [0x01 prev_hash | 0x00]`
 impl Action {
     pub fn message_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(128);
@@ -121,14 +121,9 @@ impl Action {
         out.extend_from_slice(&(o.len() as u32).to_be_bytes());
         out.extend_from_slice(o);
 
-        out.push(0x01);
-        out.extend_from_slice(&(self.cosig.len() as u32).to_be_bytes());
-        for c in &self.cosig {
-            let co = c.origin.as_bytes();
-            out.extend_from_slice(&(co.len() as u32).to_be_bytes());
-            out.extend_from_slice(co);
-            out.extend_from_slice(&c.sig);
-        }
+        // The co-signatures are deliberately excluded: each co-signer signs
+        // this same message (see the doc comment), so the bytes are stable
+        // regardless of how many cosigs are attached.
 
         match &self.prev_hash {
             Some(h) => {
@@ -198,7 +193,7 @@ mod tests {
 
     fn sample_action(key: &SigningKey) -> Action {
         let mut a = Action {
-            doc_id: DocId::new(),
+            doc_id: DocId::parse("00000000-0000-0000-0000-000000000001").unwrap(),
             model: ModelRef::new("invoice", "1.0.0"),
             kind: "add-line".into(),
             payload: serde_json::json!({ "id": "L1", "qty": 2 }),

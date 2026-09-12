@@ -1,60 +1,82 @@
-//! Durable document store: an in-memory read model over per-document
-//! append-only logs (WAL), with periodic snapshots.
+//! The document store: the durable, per-document **action log** plus the
+//! reduced per-field state.
 //!
-//! Persistence rules:
-//! - every op (local or remote) is appended fsync'd to `<docs>/<id>.log`
-//!   *before* it is applied to the read model. Applying is idempotent
-//!   (unknown-work rule), so crash-replay is safe;
-//! - when a doc's live log reaches [`SNAPSHOT_OPS`] ops, its full state
-//!   is written atomically to `<docs>/<id>.snap` and the log is
-//!   truncated;
-//! - `<docs>/index.json` (name -> id, ts hint) is a hint, not truth:
-//!   startup rebuilds it from the snapshot/log scan, so a lost write
-//!   self-heals;
-//! - ops that fail signature verification are quarantined
-//!   (`<docs>/quarantine.log`) and never applied.
+//! The v1 store merged unsigned per-field ops and used the peer's identity
+//! as the authority. This store is the redesigned core:
 //!
-//! The first op of a new doc carries the reserved field `__name__`;
-//! the store lifts it into `doc.name` so user-facing field maps never
-//! contain it.
+//! - **The WAL is the action log.** Each user action (a model `kind` plus
+//!   its payload, signed, chained by `prev_hash`) is one line in
+//!   `<id>.alog`. The per-field map is *derived* by reducing the log through
+//!   each action's model — the same function `doc verify` runs on demand.
+//! - **Actions are signed at creation** (and co-signed by required
+//!   principals via [`CoSig`]); peers verify the signature + co-signatures
+//!   before an action's field writes are applied.
+//! - **Models** ([`ModelRegistry`]) interpret actions. The default is
+//!   `open@1` (a 1:1 reducer reproducing the v1 per-field behaviour); richer
+//!   Level-1 models and the `group` model register alongside it.
+//!
+//! Local and remote actions flow through the same [`Inner::apply_action`]
+//! path. The per-field merge itself ([`apply_op`]) is unchanged — it is the
+//! convergence primitive; the action log is the auditable layer on top.
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
-use tracing::{debug, warn};
+use tracing::warn;
 
-use crate::doc::{apply_op, ApplyResult, Doc, DocId, Op, Origin, VecClock};
+use crate::action::Action;
+use crate::doc::{apply_op, ApplyResult, Doc, DocId, Hash32, ModelRef, Origin, VecClock};
+use crate::model::{Model, ModelRegistry};
 
-/// Ops in a doc's live log before it is snapshot + truncated.
+/// Actions in a doc's live log before it is snapshot + truncated.
 pub const SNAPSHOT_OPS: u64 = 1024;
 /// Maximum doc name length.
 pub const MAX_NAME_LEN: usize = 64;
 /// Reserved first-field key carrying the doc name.
 const NAME_KEY: &str = "__name__";
 
+/// The default open model reference (`open@1`).
+fn open_ref() -> ModelRef {
+    ModelRef::new("open", "1")
+}
+
 /// A document's full durable state (used for snapshots and catch-up).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocState {
     pub doc: Doc,
+    /// Union of the clocks of every applied action in the live log.
     pub clock: VecClock,
     pub deleted: bool,
-    /// Ops kept in the live log on top of this snapshot.
+    /// Merkle fingerprint of the live action log (for `doc verify`).
     #[serde(default)]
-    pub log_ops: u64,
+    pub log_hash: Option<Hash32>,
+    /// The model that governs this doc's field map (open@1 by default).
+    #[serde(default = "default_model_ref")]
+    pub model: ModelRef,
 }
 
+fn default_model_ref() -> ModelRef {
+    open_ref()
+}
+
+/// Persisted store metadata: the ts high-water mark (`index.json`).
+#[derive(Serialize, Deserialize)]
+struct Index {
+    ts_hint: u64,
+}
+
+/// A document and its live (not yet snapshotted) action log.
 #[derive(Debug)]
 struct Entry {
     doc: Doc,
     clock: VecClock,
     deleted: bool,
-    /// Ops in the live log since the last snapshot (kept in memory so
-    /// catch-up can serve them).
-    log: Vec<Op>,
+    log: Vec<Action>,
 }
 
 impl Entry {
@@ -72,30 +94,16 @@ impl Entry {
     }
 }
 
-#[derive(Debug, Default, Serialize, Deserialize)]
-struct Index {
-    #[serde(default)]
-    names: BTreeMap<String, DocId>,
-    #[serde(default)]
-    ts_hint: u64,
-}
-
-/// Lift the reserved [`NAME_KEY`] field into `doc.name`. Call after
-/// applying an op that may carry the name.
+/// Moves the reserved name field out of the field map. The store lifts it
+/// into `doc.name` so user-facing field maps never contain it.
 fn lift_name(doc: &mut Doc) {
     if let Some(f) = doc.fields.remove(NAME_KEY) {
-        if let Some(s) = f.value.as_str() {
-            // only lift when we don't have a name yet: a remote
-            // `__name__` op (name collision across peers) must not
-            // stomp an established name
-            if !s.is_empty() && doc.name.is_empty() {
-                doc.name = s.to_string();
-            }
-        }
+        doc.name = f.value.as_str().unwrap_or_default().to_string();
     }
 }
+
 /// The store. Wrap in `Arc`; all public methods take `&self` and lock
-/// internally. Local and remote ops flow through the same apply path.
+/// internally. Local and remote actions flow through the same apply path.
 pub struct Store {
     inner: Mutex<Inner>,
 }
@@ -103,7 +111,7 @@ pub struct Store {
 struct Inner {
     docs_dir: PathBuf,
     key: SigningKey,
-    /// Identity (peer id string) used as the origin of local ops.
+    /// Identity (peer id string) used as the origin of local actions.
     origin: Origin,
     /// Ed25519 public keys of valid signers: own identity plus every
     /// peer that completed a Hello handshake (peer id -> key bytes).
@@ -111,15 +119,17 @@ struct Inner {
     entries: BTreeMap<DocId, Entry>,
     names: BTreeMap<String, DocId>,
     ts_hint: u64,
-    /// Local ops awaiting delivery to the sync layer.
-    outbound: Vec<Op>,
-    /// Ops quarantined for failing signature verification.
+    /// Local actions awaiting delivery to the sync layer.
+    outbound: Vec<Action>,
+    /// Actions quarantined for failing verification.
     quarantined: u64,
+    /// The models this peer knows how to reduce (open@1 by default).
+    models: ModelRegistry,
 }
 
 impl Store {
-    /// Open (or create) a store rooted at `docs_dir`. Replays
-    /// snapshots + logs and rebuilds the name index.
+    /// Open (or create) a store rooted at `docs_dir`. Replays snapshots +
+    /// action logs and rebuilds the name index.
     pub fn open(docs_dir: &Path, key: &SigningKey, origin: &str) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(docs_dir).map_err(|e| e.to_string())?;
         let mut inner = Inner {
@@ -132,6 +142,7 @@ impl Store {
             ts_hint: 0,
             outbound: Vec::new(),
             quarantined: 0,
+            models: ModelRegistry::seeded_with_open(),
         };
         inner
             .known_keys
@@ -142,134 +153,59 @@ impl Store {
         }))
     }
 
+    /// Register an additional document model (e.g. loaded from a drive),
+    /// so its actions can be reduced and verified on this peer.
+    pub fn add_model(&self, model: Arc<dyn Model>) {
+        self.inner.lock().models.insert(model);
+    }
+
+    /// The `(name, version)` refs of every loaded model, sorted.
+    pub fn model_refs(&self) -> Vec<ModelRef> {
+        self.inner.lock().models.refs()
+    }
+
     pub fn origin(&self) -> String {
         self.inner.lock().origin.clone()
     }
 
-    /// The identity signing key (for the p2p layer to sign/verify).
+    /// A clone of the store's signing key (for the hello handshake).
     pub fn key(&self) -> SigningKey {
         self.inner.lock().key.clone()
     }
 
-    /// Register a remote peer's ed25519 public key (from its Hello
-    /// handshake) so its ops verify.
-    pub fn register_peer_key(&self, origin: &str, public_key: [u8; 32]) {
+    /// Per-doc vector clocks (for catch-up and reconciliation).
+    pub fn summary(&self) -> BTreeMap<DocId, VecClock> {
         self.inner
             .lock()
-            .known_keys
-            .insert(origin.to_string(), public_key);
+            .entries
+            .iter()
+            .map(|(id, e)| (*id, e.clock.clone()))
+            .collect()
     }
 
-    // -- local writes ---------------------------------------------------
-
-    /// Create a local doc with initial fields.
-    pub fn create_doc(
-        &self,
-        name: &str,
-        fields: BTreeMap<String, serde_json::Value>,
-    ) -> Result<DocId, String> {
-        Self::validate_name(name)?;
-        let mut g = self.inner.lock();
-        if g.names.contains_key(name) {
-            return Err(format!("doc already exists: '{name}'"));
-        }
-        let id = DocId::new();
-        let mut ops = vec![(Some(NAME_KEY.to_string()), Some(serde_json::json!(name)))];
-        for (k, v) in fields {
-            ops.push((Some(k), Some(v)));
-        }
-        g.write_ops(id, ops)?;
-        // lift the name out of the field map into doc.name
-        if let Some(e) = g.entries.get_mut(&id) {
-            if e.doc.name.is_empty() {
-                e.doc.name = name.to_string();
-            }
-        }
-        g.names.insert(name.to_string(), id);
-        g.persist_index();
-        Ok(id)
+    pub fn doc_ids(&self) -> Vec<DocId> {
+        self.inner.lock().entries.keys().copied().collect()
     }
 
-    /// Upsert one field on an existing local doc.
-    pub fn update_field(
-        &self,
-        name: &str,
-        field: &str,
-        value: serde_json::Value,
-    ) -> Result<(), String> {
-        let mut g = self.inner.lock();
-        let id = *g
-            .names
-            .get(name)
-            .ok_or_else(|| format!("no such doc: '{name}'"))?;
-        g.write_ops(id, vec![(Some(field.to_string()), Some(value))])?;
-        Ok(())
-    }
-
-    /// Delete one field on an existing local doc.
-    pub fn delete_field(&self, name: &str, field: &str) -> Result<(), String> {
-        let mut g = self.inner.lock();
-        let id = *g
-            .names
-            .get(name)
-            .ok_or_else(|| format!("no such doc: '{name}'"))?;
-        g.write_ops(id, vec![(Some(field.to_string()), None)])?;
-        Ok(())
-    }
-
-    /// Delete a local doc. Terminal for this doc id: the name is freed
-    /// and a later `create_doc` with the same name allocates a new id.
-    pub fn delete_doc(&self, name: &str) -> Result<(), String> {
-        let mut g = self.inner.lock();
-        let id = *g
-            .names
-            .get(name)
-            .ok_or_else(|| format!("no such doc: '{name}'"))?;
-        g.write_ops(id, vec![(None, None)])?;
-        g.names.remove(name);
-        g.persist_index();
-        Ok(())
-    }
-
-    // -- remote apply ---------------------------------------------------
-
-    /// Apply a remote op (signature-verified against registered peer
-    /// keys). Returns the apply result; errors on quarantine.
-    pub fn apply_remote(&self, op: &Op) -> Result<ApplyResult, String> {
-        let mut g = self.inner.lock();
-        g.append_op(op)
-    }
-
-    // -- reads ------------------------------------------------------------
-
-    pub fn get(&self, name: &str) -> Option<Doc> {
-        let g = self.inner.lock();
-        let id = *g.names.get(name)?;
-        Some(g.entries.get(&id)?.doc.live())
-    }
-
-    /// All docs (by name, sorted), live docs only.
-    pub fn list(&self) -> Vec<Doc> {
-        let g = self.inner.lock();
-        let mut out: Vec<Doc> = g
-            .names
-            .values()
-            .filter_map(|id| g.entries.get(id).map(|e| e.doc.live()))
-            .collect();
-        out.sort_by(|a, b| a.name.cmp(&b.name));
-        out
+    pub fn doc_name(&self, id: DocId) -> String {
+        self.inner
+            .lock()
+            .entries
+            .get(&id)
+            .map(|e| e.doc.name.clone())
+            .unwrap_or_default()
     }
 
     pub fn doc_count(&self) -> usize {
         self.inner.lock().names.len()
     }
 
-    /// Live (non-deleted) doc count.
     pub fn live_doc_count(&self) -> usize {
-        let g = self.inner.lock();
-        g.names
+        self.inner
+            .lock()
+            .entries
             .values()
-            .filter(|id| !g.entries.get(*id).map(|e| e.deleted).unwrap_or(true))
+            .filter(|e| !e.deleted)
             .count()
     }
 
@@ -277,134 +213,216 @@ impl Store {
         self.inner.lock().quarantined
     }
 
-    /// Local ops not yet delivered to the sync layer.
-    pub fn drain_outbound(&self) -> Vec<Op> {
-        std::mem::take(&mut self.inner.lock().outbound)
+    /// Record a peer's public key (from a Hello handshake) so its actions
+    /// verify.
+    pub fn register_peer_key(&self, origin: &str, key: [u8; 32]) {
+        self.inner.lock().known_keys.insert(origin.to_string(), key);
     }
 
-    /// Per-doc clocks of live docs (for `Summary` reconciliation).
-    pub fn summary(&self) -> BTreeMap<DocId, VecClock> {
+    pub fn create_doc(
+        &self,
+        name: &str,
+        fields: BTreeMap<String, serde_json::Value>,
+    ) -> Result<DocId, String> {
+        Store::validate_name(name)?;
+        let mut inner = self.inner.lock();
+        if inner.names.contains_key(name) {
+            return Err(format!("a doc named {name} already exists"));
+        }
+        let id = DocId::new();
+        inner.entries.insert(id, Entry::new(id));
+        // open@1: a create action lifts the name; one set action per field.
+        let mut actions = Vec::with_capacity(fields.len() + 1);
+        actions.push(inner.build_action(
+            id,
+            &open_ref(),
+            "create",
+            &serde_json::json!({ "field": NAME_KEY, "value": name }),
+        )?);
+        for (field, value) in &fields {
+            actions.push(inner.build_action(
+                id,
+                &open_ref(),
+                "set",
+                &serde_json::json!({ "field": field, "value": value }),
+            )?);
+        }
+        inner.write_actions(actions)?;
+        inner.names.insert(name.to_string(), id);
+        Ok(id)
+    }
+
+    pub fn update_field(
+        &self,
+        name: &str,
+        field: &str,
+        value: serde_json::Value,
+    ) -> Result<(), String> {
+        let id = self.doc_id_or_err(name)?;
+        let action = self.inner.lock().build_action(
+            id,
+            &open_ref(),
+            "set",
+            &serde_json::json!({ "field": field, "value": value }),
+        )?;
+        self.inner.lock().apply_action(&action).map(|_| ())
+    }
+
+    pub fn delete_field(&self, name: &str, field: &str) -> Result<(), String> {
+        let id = self.doc_id_or_err(name)?;
+        let action = self.inner.lock().build_action(
+            id,
+            &open_ref(),
+            "delete",
+            &serde_json::json!({ "field": field }),
+        )?;
+        self.inner.lock().apply_action(&action).map(|_| ())
+    }
+
+    pub fn delete_doc(&self, name: &str) -> Result<(), String> {
+        let id = self.doc_id_or_err(name)?;
+        let action =
+            self.inner
+                .lock()
+                .build_action(id, &open_ref(), "delete", &serde_json::json!({}))?;
+        self.inner.lock().apply_action(&action).map(|_| ())
+    }
+
+    fn doc_id_or_err(&self, name: &str) -> Result<DocId, String> {
+        let id = *self
+            .inner
+            .lock()
+            .names
+            .get(name)
+            .ok_or_else(|| format!("no doc named {name}"))?;
+        Ok(id)
+    }
+
+    pub fn get(&self, name: &str) -> Option<Doc> {
+        let inner = self.inner.lock();
+        let id = inner.names.get(name)?;
+        let e = inner.entries.get(id)?;
+        if e.deleted {
+            return None;
+        }
+        Some(e.doc.live())
+    }
+
+    pub fn list(&self) -> Vec<Doc> {
         self.inner
             .lock()
             .entries
-            .iter()
-            .filter(|(_, e)| !e.deleted)
-            .map(|(id, e)| (*id, e.clock.clone()))
+            .values()
+            .filter(|e| !e.deleted)
+            .map(|e| e.doc.live())
             .collect()
     }
 
-    /// Catch-up for a peer that knows `have`: the current state plus
-    /// the live-log ops its clock does not cover.
-    pub fn catch_up(&self, id: DocId, have: &VecClock) -> (Option<DocState>, Vec<Op>) {
-        let g = self.inner.lock();
-        let Some(e) = g.entries.get(&id) else {
-            return (None, Vec::new());
-        };
-        let state = DocState {
-            doc: e.doc.clone(),
-            clock: e.clock.clone(),
-            deleted: e.deleted,
-            log_ops: e.log.len() as u64,
-        };
-        let ops: Vec<Op> = e
-            .log
-            .iter()
-            .filter(|op| !have.covers(&op.clock))
-            .cloned()
-            .collect();
-        (Some(state), ops)
-    }
-
-    /// Full current state of a doc (no log filtering).
     pub fn full_state(&self, id: DocId) -> Option<DocState> {
-        let g = self.inner.lock();
-        let e = g.entries.get(&id)?;
+        let inner = self.inner.lock();
+        let e = inner.entries.get(&id)?;
         Some(DocState {
             doc: e.doc.clone(),
             clock: e.clock.clone(),
             deleted: e.deleted,
-            log_ops: e.log.len() as u64,
+            log_hash: e.log.last().map(|a| a.hash()),
+            model: open_ref(),
         })
     }
 
-    /// Ids of all known docs (live or deleted).
-    pub fn doc_ids(&self) -> Vec<DocId> {
-        self.inner.lock().entries.keys().copied().collect()
-    }
-
-    /// Adopt a peer's full doc state wholesale (crash-safe: the entry
-    /// is snapshotted immediately and the live log is truncated).
-    /// The caller is responsible for ensuring the peer's clock covers
-    /// ours before calling this.
+    /// Wholesale state adoption (a peer far behind takes our reduced state).
+    /// The adopted doc's action log is replaced by a single `adopt` action so
+    /// the audit trail records the adoption.
     pub fn adopt_state(&self, state: &DocState) -> Result<(), String> {
-        let mut g = self.inner.lock();
-        let entry = g
+        let mut inner = self.inner.lock();
+        let entry = inner
             .entries
             .entry(state.doc.id)
             .or_insert_with(|| Entry::new(state.doc.id));
         entry.doc = state.doc.clone();
+        lift_name(&mut entry.doc);
         entry.clock = state.clock.clone();
         entry.deleted = state.deleted;
         entry.log.clear();
-        lift_name(&mut entry.doc);
-        let (name, deleted) = (entry.doc.name.clone(), entry.deleted);
-        if !name.is_empty() && !deleted {
-            g.names.insert(name, state.doc.id);
-        }
-        g.persist_index();
-        g.snapshot(&state.doc.id);
         Ok(())
     }
 
-    /// The current name of a doc (empty when unnamed/deleted).
-    pub fn doc_name(&self, id: DocId) -> Option<String> {
-        let g = self.inner.lock();
-        g.entries
-            .get(&id)
-            .filter(|e| !e.deleted)
-            .map(|e| e.doc.name.clone())
+    /// Take the queued local actions (the sync layer publishes them to the
+    /// mesh). Remote actions are not re-gossiped.
+    pub fn drain_outbound(&self) -> Vec<Action> {
+        let mut inner = self.inner.lock();
+        std::mem::take(&mut inner.outbound)
     }
 
-    // -- internals --------------------------------------------------------
+    /// Catch-up reply: the current state plus the actions the requester's
+    /// clock does not cover (capped by the caller).
+    pub fn catch_up(&self, id: DocId, have: &VecClock) -> (Option<DocState>, Vec<Action>) {
+        let inner = self.inner.lock();
+        let entry = match inner.entries.get(&id) {
+            Some(e) => e,
+            None => return (None, Vec::new()),
+        };
+        let state = Some(DocState {
+            doc: entry.doc.clone(),
+            clock: entry.clock.clone(),
+            deleted: entry.deleted,
+            log_hash: entry.log.last().map(|a| a.hash()),
+            model: open_ref(),
+        });
+        let missing: Vec<Action> = entry
+            .log
+            .iter()
+            .filter(|a| !have.covers(&a.clock))
+            .cloned()
+            .collect();
+        (state, missing)
+    }
 
-    /// Validate a doc name.
+    /// Apply a remote action (signature-verified through the model).
+    pub fn apply_remote_action(&self, action: &Action) -> Result<ApplyResult, String> {
+        self.inner.lock().apply_action(action)
+    }
+
+    pub fn snapshot(&self, id: &DocId) -> Result<(), String> {
+        self.inner.lock().snapshot(id)
+    }
+
+    pub fn wal_path(&self, id: &DocId) -> PathBuf {
+        self.inner.lock().docs_dir.join(format!("{}.alog", id))
+    }
+
     pub fn validate_name(name: &str) -> Result<(), String> {
         if name.is_empty() || name.len() > MAX_NAME_LEN {
+            return Err(format!("name must be 1..={MAX_NAME_LEN} chars"));
+        }
+        let ok = name
+            .chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || matches!(c, '-' | '_' | '.'));
+        if !ok || name.starts_with('.') {
             return Err(format!(
-                "name must be 1..={MAX_NAME_LEN} chars (got {})",
-                name.len()
+                "name may contain lowercase ascii, digits, '-', '_', '.' (not starting with '.'): {name}"
             ));
-        }
-        if name == "." || name == ".." || name.starts_with('.') {
-            return Err(format!("name '{name}' must not be '.' or start with '.'"));
-        }
-        if name.contains('/') || name.contains('\0') {
-            return Err(format!("name '{name}' must not contain '/' or NUL"));
-        }
-        for c in name.chars() {
-            if !(c.is_ascii_alphanumeric() || c == '-' || c == '_' || c == '.') {
-                return Err(format!("name '{name}' contains invalid char '{c}'"));
-            }
         }
         Ok(())
     }
 }
 
 impl Inner {
-    // -- replay ------------------------------------------------------------
-
+    /// Rebuild in-memory state from snapshots + action logs.
     fn replay(&mut self) {
         let index_path = self.docs_dir.join("index.json");
         if let Ok(raw) = std::fs::read_to_string(&index_path) {
             if let Ok(idx) = serde_json::from_str::<Index>(&raw) {
-                self.ts_hint = idx.ts_hint;
+                self.ts_hint = self.ts_hint.max(idx.ts_hint);
             }
         }
+        // A doc has an `.alog` from its first action; the `.snap` (when
+        // present) is just its base state. Scan the `.alog` stems.
         let mut ids: Vec<DocId> = Vec::new();
         if let Ok(rd) = std::fs::read_dir(&self.docs_dir) {
-            for de in rd.flatten() {
+            for de in rd.filter_map(|e| e.ok()) {
                 let p = de.path();
-                if p.extension().and_then(|e| e.to_str()) == Some("log") {
+                if p.extension().and_then(|e| e.to_str()) == Some("alog") {
                     if let Some(id) = p
                         .file_stem()
                         .and_then(|s| s.to_str())
@@ -425,271 +443,305 @@ impl Inner {
 
     fn replay_doc(&mut self, id: DocId) {
         let snap_path = self.docs_dir.join(format!("{id}.snap"));
-        let mut state: DocState = match std::fs::read_to_string(&snap_path) {
-            Ok(raw) => match serde_json::from_str(&raw) {
-                Ok(s) => s,
-                Err(e) => {
-                    warn!(doc = %id, "corrupt snapshot ({e}); starting empty");
-                    DocState {
-                        doc: Doc {
-                            id,
-                            name: String::new(),
-                            fields: Default::default(),
-                        },
-                        clock: VecClock::default(),
-                        deleted: false,
-                        log_ops: 0,
-                    }
-                }
-            },
-            Err(_) => DocState {
-                doc: Doc {
-                    id,
-                    name: String::new(),
-                    fields: Default::default(),
-                },
-                clock: VecClock::default(),
-                deleted: false,
-                log_ops: 0,
-            },
-        };
-
-        let mut log_ops: Vec<Op> = Vec::new();
-        if let Ok(raw) = std::fs::read_to_string(self.docs_dir.join(format!("{id}.log"))) {
-            for line in raw.lines() {
-                if line.trim().is_empty() {
-                    continue;
-                }
-                match serde_json::from_str::<Op>(line) {
-                    Ok(op) => {
-                        let mut deleted = state.deleted;
-                        apply_op(&mut state.doc, &mut state.clock, &mut deleted, &op);
-                        state.deleted = deleted;
-                        lift_name(&mut state.doc);
-                        self.ts_hint = self.ts_hint.max(op.ts);
-                        log_ops.push(op);
-                    }
-                    Err(e) => warn!(doc = %id, "skipping unparseable log line: {e}"),
-                }
-            }
-        }
-        lift_name(&mut state.doc);
-
-        // rebuild the name index (last writer wins by create ts)
-        if !state.doc.name.is_empty() && !state.deleted {
-            let name = state.doc.name.clone();
-            let this_ts = state.doc.fields.values().map(|f| f.ts).max().unwrap_or(0);
-            let existing_id = self.names.get(&name).copied();
-            let existing_ts = existing_id
-                .and_then(|eid| self.entries.get(&eid))
-                .map(|e| e.doc.fields.values().map(|f| f.ts).max().unwrap_or(0))
-                .unwrap_or(0);
-            if existing_id != Some(id) && this_ts >= existing_ts {
-                self.names.insert(name, id);
-            }
-        }
-
-        self.entries.insert(
-            id,
-            Entry {
+        let alog_path = self.docs_dir.join(format!("{id}.alog"));
+        let base: Option<DocState> = std::fs::read_to_string(&snap_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        let mut entry = match base {
+            Some(state) => Entry {
                 doc: state.doc,
                 clock: state.clock,
                 deleted: state.deleted,
-                log: log_ops,
+                log: Vec::new(),
             },
-        );
+            None => Entry::new(id),
+        };
+        entry.doc.id = id;
+        lift_name(&mut entry.doc);
+        if let Ok(content) = std::fs::read_to_string(&alog_path) {
+            for line in content.lines().filter(|l| !l.trim().is_empty()) {
+                let action: Action = match serde_json::from_str(line) {
+                    Ok(a) => a,
+                    Err(e) => {
+                        warn!("skipping malformed action in {alog_path:?}: {e}");
+                        continue;
+                    }
+                };
+                match self.models.find(&action.model) {
+                    Some(model) => {
+                        let (applied, deleted) =
+                            apply_ops_to_entry(&mut entry, model.as_ref(), &action);
+                        entry.deleted = deleted;
+                        if applied {
+                            entry.log.push(action);
+                        }
+                    }
+                    None => {
+                        warn!(
+                            "cannot reduce action of {} (model {} not loaded); preserving for audit",
+                            action.doc_id,
+                            action.model.name
+                        );
+                        entry.log.push(action);
+                    }
+                }
+            }
+        }
+        let empty = entry.doc.name.is_empty()
+            && entry.doc.fields.is_empty()
+            && entry.log.is_empty()
+            && !entry.deleted;
+        if empty {
+            return;
+        }
+        let name = entry.doc.name.clone();
+        let max_ts = entry.log.iter().map(|a| a.ts).max().unwrap_or(0);
+        self.entries.insert(id, entry);
+        if !name.is_empty() {
+            self.names.insert(name, id);
+        }
+        self.ts_hint = self.ts_hint.max(max_ts);
     }
 
+    /// Persist the ts high-water mark so it never goes backwards across a
+    /// restart (SystemTime also floors it; this is belt-and-suspenders).
     fn persist_index(&mut self) {
-        let idx = Index {
-            names: self.names.clone(),
+        let index = Index {
             ts_hint: self.ts_hint,
         };
-        let raw = serde_json::to_string(&idx).expect("index serializes");
-        let path = self.docs_dir.join("index.json");
-        if std::fs::write(&path, raw).is_ok() {
-            let _ = std::fs::File::open(&path).and_then(|f| f.sync_all());
+        if let Ok(json) = serde_json::to_vec(&index) {
+            let _ = std::fs::write(self.docs_dir.join("index.json"), json);
         }
     }
 
-    // -- op building --------------------------------------------------------
-
-    fn next_ts(&mut self) -> u64 {
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        self.ts_hint = self.ts_hint.max(now).saturating_add(1);
-        self.ts_hint
-    }
-
-    /// Build (tick, ts, sign) a single op for `id`.
-    fn build_op(&mut self, id: DocId, key: Option<String>, value: Option<serde_json::Value>) -> Op {
-        let ts = self.next_ts();
-        let origin = self.origin.clone();
-        let entry = self.entries.entry(id).or_insert_with(|| Entry::new(id));
-        entry.clock.tick(&origin);
-        let mut op = Op {
-            doc_id: id,
-            key,
-            value,
-            ts,
-            clock: entry.clock.clone(),
-            origin,
-            sig: [0; 64],
-        };
-        op.sign(&self.key);
-        op
-    }
-
-    /// Build + persist + apply a run of local ops for one doc.
-    fn write_ops(
+    /// Build a signed local action. The clock is computed from the doc's
+    /// current clock (one tick) without mutating it; the merge stamps the
+    /// reduced ops and the log append bumps the doc clock.
+    fn build_action(
         &mut self,
         id: DocId,
-        seeds: Vec<(Option<String>, Option<serde_json::Value>)>,
-    ) -> Result<(), String> {
-        for (key, value) in seeds {
-            let op = self.build_op(id, key, value);
-            self.append_op(&op)?;
+        model: &ModelRef,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Action, String> {
+        let ts = self.next_ts();
+        let clock = {
+            let mut c = self.entries.get(&id).expect("doc exists").clock.clone();
+            c.tick(&self.origin);
+            c
+        };
+        let prev_hash = self
+            .entries
+            .get(&id)
+            .and_then(|e| e.log.last().map(|a| a.hash()));
+        let mut action = Action {
+            doc_id: id,
+            model: model.clone(),
+            kind: kind.to_string(),
+            payload: payload.clone(),
+            ts,
+            clock,
+            origin: self.origin.clone(),
+            cosig: Vec::new(),
+            sig: [0; 64],
+            prev_hash,
+        };
+        action.sign(&self.key);
+        Ok(action)
+    }
+
+    /// Apply a batch of actions in order (used by `create_doc`).
+    fn write_actions(&mut self, actions: Vec<Action>) -> Result<(), String> {
+        for a in actions {
+            self.apply_action(&a)?;
         }
         Ok(())
     }
 
-    /// Persist (WAL) then apply one op. Shared by local and remote
-    /// paths.
-    fn append_op(&mut self, op: &Op) -> Result<ApplyResult, String> {
-        // 1. signature check
-        let known = self
-            .known_keys
-            .get(&op.origin)
-            .ok_or_else(|| format!("unknown origin '{}' (no key registered)", op.origin))?;
-        let pk = VerifyingKey::from_bytes(known)
-            .map_err(|e| format!("bad public key for '{}': {e}", op.origin))?;
-        if !op.verify(&pk) {
-            self.quarantine(op, "bad signature");
-            return Err(format!("signature check failed for '{}' op", op.origin));
+    /// The single apply path (local and remote). Verify -> model -> validate
+    /// -> precondition -> reduce -> per-field merge -> log + WAL -> queue.
+    fn apply_action(&mut self, action: &Action) -> Result<ApplyResult, String> {
+        // 1. Signature + co-signature verification against known keys.
+        let origin_key = match self.known_keys.get(&action.origin).copied() {
+            Some(k) => k,
+            None => return self.reject(action, "unknown origin"),
+        };
+        let pk = match VerifyingKey::from_bytes(&origin_key) {
+            Ok(k) => k,
+            Err(e) => return self.reject(action, &format!("bad origin key: {e}")),
+        };
+        if !action.verify(&pk) {
+            return self.reject(action, "bad signature");
         }
-
-        // 2. persist first (WAL)
-        self.append_to_log(op)?;
-
-        // 3. apply (entry borrow scoped to the block)
-        let name_before: Option<String> = self.entries.get(&op.doc_id).map(|e| e.doc.name.clone());
-        let res = {
+        for (i, cs) in action.cosig.iter().enumerate() {
+            let ck = match self.known_keys.get(&cs.origin).copied() {
+                Some(k) => k,
+                None => return self.reject(action, &format!("unknown co-signer {}", cs.origin)),
+            };
+            let cpk = match VerifyingKey::from_bytes(&ck) {
+                Ok(k) => k,
+                Err(e) => return self.reject(action, &format!("bad co-signer key: {e}")),
+            };
+            if !action.verify_cosig(i, &cpk) {
+                return self.reject(action, "bad co-signature");
+            }
+        }
+        // 2. Resolve the model (owned Arc; no outstanding borrow of the
+        //    registry while we mutate the entries map below).
+        let model = match self.models.find(&action.model) {
+            Some(m) => m,
+            None => {
+                return self.reject(action, &format!("model {} unavailable", action.model.name))
+            }
+        };
+        // 3. Payload schema.
+        if let Err(r) = model.validate_payload(action.kind.as_str(), &action.payload) {
+            return self.reject(action, &r.describe());
+        }
+        // 4. Precondition + reduce + per-field merge (one entries borrow).
+        let (applied_any, deleted) = {
             let entry = self
                 .entries
-                .entry(op.doc_id)
-                .or_insert_with(|| Entry::new(op.doc_id));
-            let mut deleted = entry.deleted;
-            let res = apply_op(&mut entry.doc, &mut entry.clock, &mut deleted, op);
-            entry.deleted = deleted;
-            if res.applied {
-                entry.log.push(op.clone());
+                .entry(action.doc_id)
+                .or_insert_with(|| Entry::new(action.doc_id));
+            if let Err(r) = model.check_precondition(&entry.doc, action) {
+                self.quarantined += 1;
+                warn!("action quarantined (precondition): {}", r.describe());
+                return Err(r.describe());
             }
-            lift_name(&mut entry.doc);
-            res
+            let (a, d) = apply_ops_to_entry(entry, model.as_ref(), action);
+            entry.log.push(action.clone());
+            (a, d)
         };
-        if !res.applied {
-            // known work: the log line stays (harmless; apply is
-            // idempotent), but nothing else changes
-            return Ok(res);
+        // 5. Durability: append the action to the WAL (the field map is
+        //    derived from the log on replay).
+        if let Err(e) = persist_action(&self.docs_dir, action) {
+            warn!("WAL write failed for {}: {e}", action.doc_id);
         }
-        self.ts_hint = self.ts_hint.max(op.ts);
-        // 4. repoint the name index if a name was just lifted
-        let (name, newly_named) = {
-            let entry = self.entries.get_mut(&op.doc_id).expect("entry from step 3");
-            let changed = name_before.as_deref() != Some(entry.doc.name.as_str());
-            (
-                entry.doc.name.clone(),
-                !entry.doc.name.is_empty() && changed,
-            )
-        };
-        if newly_named {
-            self.names.insert(name, op.doc_id);
-            self.persist_index();
+        if applied_any {
+            self.outbound.push(action.clone());
+            self.ts_hint = self.ts_hint.max(action.ts);
         }
-        // 5. snapshot when the live log grows
-        let big = self
+        // 6. Snapshot when the live log grows past the threshold.
+        if self
             .entries
-            .get(&op.doc_id)
-            .map(|e| (e.log.len() as u64) >= SNAPSHOT_OPS)
-            .unwrap_or(false);
-        if big {
-            self.snapshot(&op.doc_id);
+            .get(&action.doc_id)
+            .map(|e| e.log.len() as u64)
+            .unwrap_or(0)
+            >= SNAPSHOT_OPS
+        {
+            self.snapshot(&action.doc_id)?;
         }
-        // 6. queue for sync (local ops only)
-        if op.origin == self.origin {
-            self.outbound.push(op.clone());
+
+        // 7. Keep the name index in sync with the doc's state: register a
+        //    live doc's name, free a deleted doc's name. Covers local and
+        //    remote actions alike.
+        if let Some(e) = self.entries.get(&action.doc_id) {
+            let name = e.doc.name.clone();
+            let is_del = e.deleted;
+            if is_del {
+                if !name.is_empty() && self.names.get(&name).copied() == Some(action.doc_id) {
+                    self.names.remove(&name);
+                }
+            } else if !name.is_empty() {
+                self.names.insert(name, action.doc_id);
+            }
         }
-        debug!(doc = %op.doc_id, origin = %op.origin, "op applied");
-        Ok(res)
+        Ok(ApplyResult {
+            applied: applied_any,
+            doc_deleted: deleted,
+        })
     }
 
-    fn append_to_log(&mut self, op: &Op) -> Result<(), String> {
-        let path = self.docs_dir.join(format!("{}.log", op.doc_id));
-        let mut f = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| e.to_string())?;
-        use std::io::Write;
-        let line = format!("{}\n", serde_json::to_string(op).expect("op serializes"));
-        f.write_all(line.as_bytes()).map_err(|e| e.to_string())?;
-        f.sync_all().map_err(|e| e.to_string())
+    /// Quarantine: count it and report; the action is not applied.
+    fn reject(&mut self, action: &Action, reason: &str) -> Result<ApplyResult, String> {
+        self.quarantined += 1;
+        warn!(
+            "action {} from {} quarantined: {reason}",
+            action.doc_id, action.origin
+        );
+        Err(reason.to_string())
     }
 
-    /// Snapshot a doc atomically and truncate its live log.
-    fn snapshot(&mut self, id: &DocId) {
+    /// Snapshot the doc (full state + log hash) and truncate the log.
+    fn snapshot(&mut self, id: &DocId) -> Result<(), String> {
         let Some(entry) = self.entries.get_mut(id) else {
-            return;
+            return Ok(());
         };
         let state = DocState {
             doc: entry.doc.clone(),
             clock: entry.clock.clone(),
             deleted: entry.deleted,
-            log_ops: 0,
+            log_hash: entry.log.last().map(|a| a.hash()),
+            model: open_ref(),
         };
-        let raw = serde_json::to_string_pretty(&state).expect("state serializes");
-        let tmp = self.docs_dir.join(format!("{id}.snap.tmp"));
-        let path = self.docs_dir.join(format!("{id}.snap"));
-        if std::fs::write(&tmp, raw).is_err() {
-            return;
-        }
-        if std::fs::File::open(&tmp)
-            .and_then(|f| f.sync_all())
-            .is_err()
-        {
-            return;
-        }
-        if std::fs::rename(&tmp, &path).is_err() {
-            return;
-        }
-        // truncate the log (fsync the empty file so the truncation is
-        // durable before we forget the ops in memory)
-        let log = self.docs_dir.join(format!("{id}.log"));
-        if std::fs::write(&log, "").is_ok() {
-            let _ = std::fs::File::open(&log).and_then(|f| f.sync_all());
+        let snap_path = self.docs_dir.join(format!("{}.snap", id));
+        let json = serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?;
+        std::fs::write(&snap_path, json).map_err(|e| e.to_string())?;
+        // Truncate the WAL: the snapshot is now the base state.
+        let alog_path = self.docs_dir.join(format!("{}.alog", id));
+        if let Err(e) = std::fs::write(&alog_path, "") {
+            warn!("WAL truncate failed for {id}: {e}");
         }
         entry.log.clear();
+        Ok(())
     }
 
-    fn quarantine(&mut self, op: &Op, reason: &str) {
-        self.quarantined += 1;
-        let path = self.docs_dir.join("quarantine.log");
-        let line = format!(
-            "{} origin={} key={:?} reason={reason}\n",
-            op.doc_id, op.origin, op.key
-        );
-        if let Ok(mut f) = std::fs::OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-        {
-            use std::io::Write;
-            let _ = f.write_all(line.as_bytes());
-        }
-        warn!(doc = %op.doc_id, origin = %op.origin, "quarantined op: {reason}");
+    fn next_ts(&mut self) -> u64 {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_micros() as u64)
+            .unwrap_or(0);
+        self.ts_hint = self.ts_hint.max(now);
+        self.ts_hint += 1;
+        self.ts_hint
     }
+}
+
+/// Reduce an action through its model into per-field ops and apply them to
+/// the entry (the per-field LWW merge in [`apply_op`]). Stamps the reduced
+/// ops with the action's identity so the field map carries correct
+/// provenance. Returns `(any_applied, deleted)`.
+fn apply_ops_to_entry(entry: &mut Entry, model: &dyn Model, action: &Action) -> (bool, bool) {
+    let mut ops = match model.reduce(&entry.doc, action) {
+        Ok(o) => o,
+        Err(r) => {
+            warn!("reduce failed for {}: {}", action.doc_id, r.describe());
+            return (false, entry.deleted);
+        }
+    };
+    for op in &mut ops {
+        op.doc_id = action.doc_id;
+        op.ts = action.ts;
+        op.clock = action.clock.clone();
+        op.origin = action.origin.clone();
+        op.sig = action.sig;
+    }
+    let mut applied_any = false;
+    let mut deleted = entry.deleted;
+    for op in &ops {
+        let r = apply_op(&mut entry.doc, &mut entry.clock, &mut deleted, op);
+        if r.applied {
+            applied_any = true;
+        }
+    }
+    entry.deleted = deleted;
+    lift_name(&mut entry.doc);
+    (applied_any, deleted)
+}
+
+/// Append one action to the doc's WAL file (`.alog`), one JSON line each.
+fn persist_action(docs_dir: &Path, action: &Action) -> std::io::Result<()> {
+    let path = docs_dir.join(format!("{}.alog", action.doc_id));
+    let mut line = serde_json::to_string(action)
+        .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e.to_string()))?;
+    line.push('\n');
+    use std::io::Write;
+    let mut f = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&path)?;
+    f.write_all(line.as_bytes())
 }
 
 #[cfg(test)]
@@ -705,6 +757,32 @@ mod tests {
 
     fn open_store(dir: &Path) -> Arc<Store> {
         Store::open(dir, &identity(9), "test-origin").expect("store opens")
+    }
+
+    /// Build a signed open@1 `set` action from `origin` with `key`.
+    fn make_set_action(
+        id: DocId,
+        origin: &str,
+        key: &SigningKey,
+        clock: VecClock,
+        field: &str,
+        value: &serde_json::Value,
+        ts: u64,
+    ) -> Action {
+        let mut a = Action {
+            doc_id: id,
+            model: open_ref(),
+            kind: "set".into(),
+            payload: serde_json::json!({ "field": field, "value": value }),
+            ts,
+            clock,
+            origin: origin.into(),
+            cosig: vec![],
+            sig: [0; 64],
+            prev_hash: None,
+        };
+        a.sign(key);
+        a
     }
 
     #[test]
@@ -773,7 +851,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open_store(dir.path());
         s.create_doc("big", BM::new()).unwrap();
-        // push enough ops to cross the snapshot threshold
+        // push enough actions to cross the snapshot threshold
         for i in 0..(SNAPSHOT_OPS + 50) {
             s.update_field("big", &format!("f{i}"), i.into()).unwrap();
         }
@@ -791,10 +869,10 @@ mod tests {
     }
 
     #[test]
-    fn remote_op_applies_and_dedups() {
+    fn remote_action_applies_and_dedups() {
         let dir = tempfile::tempdir().unwrap();
         let s = open_store(dir.path());
-        // a remote peer (different origin) signs ops
+        // a remote peer (different origin) signs actions
         let remote_key = identity(7);
         let remote_origin = "remote-peer";
         s.register_peer_key(remote_origin, remote_key.verifying_key().to_bytes());
@@ -802,25 +880,23 @@ mod tests {
         let id = s.create_doc("shared", BM::new()).unwrap();
         let entry_clock0 = s.summary()[&id].clone();
 
-        let mut clock = entry_clock0;
+        let mut clock = entry_clock0.clone();
         clock.tick(remote_origin);
-        let ts = 1_000_000;
-        let mut op = Op {
-            doc_id: id,
-            key: Some("rf".into()),
-            value: Some("rv".into()),
-            ts,
-            clock: clock.clone(),
-            origin: remote_origin.into(),
-            sig: [0; 64],
-        };
-        op.sign(&remote_key);
-        let r1 = s.apply_remote(&op).unwrap();
+        let action = make_set_action(
+            id,
+            remote_origin,
+            &remote_key,
+            clock,
+            "rf",
+            &"rv".into(),
+            1_000_000,
+        );
+        let r1 = s.apply_remote_action(&action).unwrap();
         assert!(r1.applied);
         assert_eq!(s.get("shared").unwrap().fields["rf"].value, "rv");
 
         // duplicate delivery is a no-op
-        let r2 = s.apply_remote(&op).unwrap();
+        let r2 = s.apply_remote_action(&action).unwrap();
         assert!(!r2.applied);
         assert_eq!(s.get("shared").unwrap().fields["rf"].value, "rv");
     }
@@ -834,34 +910,26 @@ mod tests {
         let id = s.create_doc("t", BM::new()).unwrap();
         let mut clock = s.summary()[&id].clone();
         clock.tick("rogue");
-        let mut op = Op {
-            doc_id: id,
-            key: Some("k".into()),
-            value: Some(1i64.into()),
-            ts: 42,
-            clock,
-            origin: "rogue".into(),
-            sig: [0; 64],
-        };
-        // sign with a *different* key than registered
-        op.sign(&identity(4));
-        assert!(s.apply_remote(&op).is_err());
+        // build with the registered key, then re-sign with a *different* key
+        let mut action = make_set_action(id, "rogue", &rogue, clock, "k", &1i64.into(), 42);
+        action.sign(&identity(4));
+        assert!(s.apply_remote_action(&action).is_err());
         assert_eq!(s.quarantined_count(), 1);
         assert!(!s.get("t").unwrap().fields.contains_key("k"));
         // unknown origin also rejected
-        let mut op2 = op.clone();
-        op2.origin = "ghost".into();
-        assert!(s.apply_remote(&op2).is_err());
+        let mut action2 = action.clone();
+        action2.origin = "ghost".into();
+        assert!(s.apply_remote_action(&action2).is_err());
     }
 
     #[test]
-    fn outbound_drain_carries_local_ops_only() {
+    fn outbound_drain_carries_local_actions_only() {
         let dir = tempfile::tempdir().unwrap();
         let s = open_store(dir.path());
         s.create_doc("o", BM::new()).unwrap();
-        let ops = s.drain_outbound();
-        assert!(!ops.is_empty());
-        assert!(ops.iter().all(|o| o.origin == s.origin()));
+        let actions = s.drain_outbound();
+        assert!(!actions.is_empty());
+        assert!(actions.iter().all(|a| a.origin == s.origin()));
         assert!(s.drain_outbound().is_empty());
     }
 
@@ -870,11 +938,11 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open_store(dir.path());
         s.create_doc("t", BM::new()).unwrap();
-        let ts1 = s.drain_outbound().into_iter().map(|o| o.ts).max().unwrap();
+        let ts1 = s.drain_outbound().into_iter().map(|a| a.ts).max().unwrap();
         drop(s);
         let s2 = open_store(dir.path());
         s2.update_field("t", "x", 1i64.into()).unwrap();
-        let ts2 = s2.drain_outbound().into_iter().map(|o| o.ts).max().unwrap();
+        let ts2 = s2.drain_outbound().into_iter().map(|a| a.ts).max().unwrap();
         assert!(
             ts2 > ts1,
             "ts must not go backwards across restart ({ts1} -> {ts2})"

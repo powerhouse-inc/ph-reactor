@@ -353,7 +353,6 @@ pub fn apply_op(doc: &mut Doc, clock: &mut VecClock, deleted: &mut bool, op: &Op
     }
 }
 
-
 // ---- content hashing & model references ----------------------------------
 //
 // Added for the model core: an action hashes its content (chaining the
@@ -362,7 +361,7 @@ pub fn apply_op(doc: &mut Doc, clock: &mut VecClock, deleted: &mut bool, op: &Op
 // layer, and the store.
 
 /// A 32-byte SHA-256 digest, serialized as lowercase hex.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct Hash32([u8; 32]);
 
 impl Hash32 {
@@ -390,12 +389,6 @@ impl Hash32 {
 
     pub fn is_zero(&self) -> bool {
         self.0 == [0; 32]
-    }
-}
-
-impl Default for Hash32 {
-    fn default() -> Self {
-        Self([0; 32])
     }
 }
 

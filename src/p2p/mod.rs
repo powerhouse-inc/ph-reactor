@@ -3,8 +3,8 @@
 //! One engine per daemon: a `Swarm` composing
 //!
 //! - **gossipsub** (topic [`GOSSIPSUB_TOPIC`]): mesh fan-out of signed
-//!   ops (`OpMsg` payloads);
-//! - **request-response** (`/ph-reactor/sync/1.0.0`, length-prefixed
+//!   actions (`ActionMsg` payloads);
+//! - **request-response** (`/ph-reactor/sync/2.0.0`, length-prefixed
 //!   JSON, [`SyncCodec`]): the per-drive protocol — hello handshake
 //!   (version, identity, token), per-doc catch-up (vector-clock based),
 //!   and summary exchange so both sides converge;
@@ -32,11 +32,12 @@ use libp2p::swarm::{dial_opts::DialOpts, NetworkBehaviour, Swarm, SwarmEvent};
 use libp2p::{mdns, noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBuilder};
 use tokio::sync::mpsc;
 
-use crate::doc::{DocId, Op, VecClock};
+use crate::action::Action;
+use crate::doc::{DocId, VecClock};
 use crate::drives::{Drive, DriveStatus};
 use crate::p2p::codec::{
-    CatchUp, CatchUpAck, DocSummary, Hello, HelloAck, HelloError, OpMsg, Summary, SummaryAck,
-    SyncCodec, SyncMsg, CATCH_UP_MAX_OPS, GOSSIPSUB_TOPIC, PROTOCOL_VERSION, SYNC_PROTOCOL,
+    ActionMsg, CatchUp, CatchUpAck, DocSummary, Hello, HelloAck, HelloError, Summary, SummaryAck,
+    SyncCodec, SyncMsg, CATCH_UP_MAX_ACTIONS, GOSSIPSUB_TOPIC, PROTOCOL_VERSION, SYNC_PROTOCOL,
 };
 use crate::store::Store;
 
@@ -441,9 +442,9 @@ impl SyncEngine {
         // Fan out newly applied local ops to the mesh (the store's
         // outbound queue is local-only; remote ops are not re-gossiped).
         let topic = gossipsub::IdentTopic::new(GOSSIPSUB_TOPIC);
-        for op in self.store.drain_outbound() {
-            let msg = OpMsg {
-                op,
+        for action in self.store.drain_outbound() {
+            let msg = ActionMsg {
+                action,
                 name: Some(self.pub_name.clone()),
             };
             match serde_json::to_vec(&msg) {
@@ -587,10 +588,10 @@ impl SyncEngine {
     // -- gossip -------------------------------------------------------------
 
     fn on_gossip(&mut self, message: &gossipsub::Message) {
-        let Ok(OpMsg { op, .. }) = serde_json::from_slice(&message.data) else {
+        let Ok(ActionMsg { action, .. }) = serde_json::from_slice(&message.data) else {
             return;
         };
-        self.apply_remote_op(&op);
+        self.apply_remote_action(&action);
     }
 
     // -- request/response ---------------------------------------------------
@@ -713,13 +714,10 @@ impl SyncEngine {
                 let own = self.store.summary();
                 let docs: Vec<DocSummary> = own
                     .iter()
-                    .filter_map(|(id, clock)| {
-                        let name = self.store.doc_name(*id)?;
-                        Some(DocSummary {
-                            id: *id,
-                            name,
-                            clock: clock.clone(),
-                        })
+                    .map(|(id, clock)| DocSummary {
+                        id: *id,
+                        name: self.store.doc_name(*id),
+                        clock: clock.clone(),
                     })
                     .collect();
                 let ack = HelloAck {
@@ -735,13 +733,13 @@ impl SyncEngine {
                     .send_response(channel, SyncMsg::HelloAck(ack));
             }
             SyncMsg::CatchUp(c) => {
-                let (state, mut ops) = self.store.catch_up(c.doc_id, &c.have);
-                let more = ops.len() > CATCH_UP_MAX_OPS;
-                ops.truncate(CATCH_UP_MAX_OPS);
+                let (state, mut actions) = self.store.catch_up(c.doc_id, &c.have);
+                let more = actions.len() > CATCH_UP_MAX_ACTIONS;
+                actions.truncate(CATCH_UP_MAX_ACTIONS);
                 let ack = CatchUpAck {
                     doc_id: c.doc_id,
                     state,
-                    ops,
+                    actions,
                     more,
                 };
                 let _ = self
@@ -863,14 +861,14 @@ impl SyncEngine {
             }
             SyncMsg::CatchUpAck(ack) => {
                 let mut applied = 0usize;
-                for op in &ack.ops {
-                    if self.apply_remote_op(op) {
+                for action in &ack.actions {
+                    if self.apply_remote_action(action) {
                         applied += 1;
                     }
                 }
                 let mut synced = false;
                 if let Some(rt) = self.drives.get_mut(&name) {
-                    if let Some(clock) = ack.ops.last().map(|op| op.clock.clone()) {
+                    if let Some(clock) = ack.actions.last().map(|a| a.clock.clone()) {
                         rt.remote_clocks.insert(ack.doc_id, clock);
                     }
                     rt.last_seen = tokio::time::Instant::now();
@@ -883,7 +881,7 @@ impl SyncEngine {
                     self.set_status(
                         &name,
                         DriveStatus::Synced,
-                        Some(format!("{applied} ops applied")),
+                        Some(format!("{applied} actions applied")),
                     );
                 }
             }
@@ -901,17 +899,19 @@ impl SyncEngine {
 
     // -- helpers ---------------------------------------------------------------
 
-    /// Applies a remote op through the store (signature-verified).
-    fn apply_remote_op(&mut self, op: &Op) -> bool {
-        match self.store.apply_remote(op) {
+    /// Applies a remote action through the store (signature-verified).
+    fn apply_remote_action(&mut self, action: &Action) -> bool {
+        match self.store.apply_remote_action(action) {
             Ok(r) if r.applied => {
-                let name = self.store.doc_name(op.doc_id);
-                let _ = self.evt_tx.send(EngineEvent::DocChanged { name });
+                let name = self.store.doc_name(action.doc_id);
+                let _ = self
+                    .evt_tx
+                    .send(EngineEvent::DocChanged { name: Some(name) });
                 true
             }
             Ok(_) => false,
             Err(e) => {
-                tracing::warn!("op from {} quarantined: {e}", op.origin);
+                tracing::warn!("action from {} quarantined: {e}", action.origin);
                 false
             }
         }

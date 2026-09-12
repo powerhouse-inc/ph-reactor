@@ -12,21 +12,22 @@ use libp2p::request_response;
 use libp2p::swarm::StreamProtocol;
 use serde::{Deserialize, Serialize};
 
-use crate::doc::{DocId, Op, VecClock};
+use crate::action::Action;
+use crate::doc::{DocId, VecClock};
 use crate::store::DocState;
 
 /// Protocol version. Bumped for incompatible changes; mismatched majors
 /// are rejected in the hello handshake.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 /// Stream protocol id.
-pub const SYNC_PROTOCOL: &str = "/ph-reactor/sync/1.0.0";
+pub const SYNC_PROTOCOL: &str = "/ph-reactor/sync/2.0.0";
 /// Gossipsub topic for op fan-out.
-pub const GOSSIPSUB_TOPIC: &str = "ph-reactor/docs/1.0.0";
+pub const GOSSIPSUB_TOPIC: &str = "ph-reactor/docs/2.0.0";
 /// Maximum framed message size.
 pub const MAX_MSG_BYTES: u32 = 1 << 20;
-/// Max ops per catch-up response (keeps frames bounded; `more` signals
+/// Max actions per catch-up response (keeps frames bounded; `more` signals
 /// the remainder).
-pub const CATCH_UP_MAX_OPS: usize = 64;
+pub const CATCH_UP_MAX_ACTIONS: usize = 64;
 
 /// A doc summary: id, name, and per-doc clock.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -100,8 +101,8 @@ pub struct CatchUpAck {
     pub doc_id: DocId,
     /// `None` when the responder does not know the doc.
     pub state: Option<DocState>,
-    pub ops: Vec<Op>,
-    /// True when more ops exist beyond the cap (re-request with the
+    pub actions: Vec<Action>,
+    /// True when more actions exist beyond the cap (re-request with the
     /// updated clock).
     pub more: bool,
 }
@@ -118,10 +119,10 @@ pub struct SummaryAck {
     pub clocks: Vec<(DocId, VecClock)>,
 }
 
-/// Gossip payload: one op for mesh fan-out.
+/// Gossip payload: one signed action for mesh fan-out.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct OpMsg {
-    pub op: Op,
+pub struct ActionMsg {
+    pub action: Action,
     /// The sender's instance name (diagnostics only).
     #[serde(default)]
     pub name: Option<String>,
@@ -274,7 +275,7 @@ mod tests {
             SyncMsg::CatchUpAck(CatchUpAck {
                 doc_id: DocId::new(),
                 state: None,
-                ops: Vec::new(),
+                actions: Vec::new(),
                 more: true,
             }),
             SyncMsg::Summary(Summary { clocks: Vec::new() }),

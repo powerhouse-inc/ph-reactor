@@ -18,9 +18,13 @@
 //!   itself an `l1` definition.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use crate::action::Action;
 use crate::doc::{Doc, ModelRef, Op};
+use crate::model::open::Open;
+
+pub mod open;
 
 /// Why a model rejected an action or a state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -53,7 +57,7 @@ impl Reject {
 /// RNG), so reducing the same action against the same state yields the
 /// same field writes on every peer. `reduce` emits [`Op`]s; the caller
 /// stamps them and feeds them to the per-field merge.
-pub trait Model: Send {
+pub trait Model: Send + Sync {
     /// The model's reference (`name@version[#hash]`).
     fn ref_(&self) -> &ModelRef;
 
@@ -74,7 +78,7 @@ pub trait Model: Send {
 /// Loaded models, keyed by `(name, version)`.
 #[derive(Default)]
 pub struct ModelRegistry {
-    models: BTreeMap<(String, String), Box<dyn Model>>,
+    models: BTreeMap<(String, String), Arc<dyn Model>>,
 }
 
 impl ModelRegistry {
@@ -82,23 +86,29 @@ impl ModelRegistry {
         Self::default()
     }
 
-    /// Register a model (replacing any prior same-name/version entry).
-    pub fn insert(&mut self, model: Box<dyn Model>) {
-        let r = model.ref_();
-        self.models.insert((r.name.clone(), r.version.clone()), model);
+    /// A registry seeded with the built-in `open@1` model (the default).
+    pub fn seeded_with_open() -> Self {
+        let mut r = Self::default();
+        r.insert(Arc::new(Open::new()));
+        r
     }
 
-    pub fn get(&self, name: &str, version: &str) -> Option<&dyn Model> {
+    /// Register a model (replacing any prior same-name/version entry).
+    pub fn insert(&mut self, model: Arc<dyn Model>) {
+        let r = model.ref_();
         self.models
-            .get(&(name.to_string(), version.to_string()))
-            .map(|m| m.as_ref())
+            .insert((r.name.clone(), r.version.clone()), model);
     }
 
     /// Look up a model by reference. When the ref pins a hash, the loaded
     /// model's hash must match (otherwise `None` — a tampered model is
-    /// never used).
-    pub fn find(&self, ref_: &ModelRef) -> Option<&dyn Model> {
-        let m = self.get(&ref_.name, &ref_.version)?;
+    /// never used). Returns an owned `Arc` so callers can hold it across
+    /// other borrows of the registry.
+    pub fn find(&self, ref_: &ModelRef) -> Option<Arc<dyn Model>> {
+        let m = self
+            .models
+            .get(&(ref_.name.clone(), ref_.version.clone()))?
+            .clone();
         if let Some(want) = ref_.hash {
             if m.ref_().hash != Some(want) {
                 return None;
