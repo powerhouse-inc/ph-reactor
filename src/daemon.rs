@@ -940,8 +940,9 @@ pub async fn stop(state_dir: Option<&Path>) -> Result<()> {
 // ---------------------------------------------------------------------------
 
 /// Prints the shared snapshot: from the running daemon when it is up,
-/// from the config file (degraded) when it is not.
-pub async fn status(state_dir: Option<&Path>) -> Result<()> {
+/// from the config file (degraded) when it is not. With `--json` the
+/// `StatusSnapshot` is emitted as JSON (the shell-plugin contract).
+pub async fn status(state_dir: Option<&Path>, json: bool) -> Result<()> {
     let paths = StatePaths::resolve(state_dir);
     paths.ensure_dirs()?;
     let config = config::load(&paths)?;
@@ -964,12 +965,20 @@ pub async fn status(state_dir: Option<&Path>) -> Result<()> {
     };
     match live {
         Some(snap) => {
-            print!("{}", status::render_text(&snap));
+            if json {
+                println!("{}", serde_json::to_string(&snap)?);
+            } else {
+                print!("{}", status::render_text(&snap));
+            }
             Ok(())
         }
         None => {
             let snap = degraded_snapshot(&paths, &config);
-            print!("{}", status::render_text(&snap));
+            if json {
+                println!("{}", serde_json::to_string(&snap)?);
+            } else {
+                print!("{}", status::render_text(&snap));
+            }
             Ok(())
         }
     }
@@ -1457,4 +1466,138 @@ fn init_logging(paths: &StatePaths, config: &ReactorConfig, to_stderr: bool) -> 
             .init();
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::config::{NodeConfig, SettingsConfig, SwitchboardConfig};
+    use crate::status::SettingsStatus;
+    use clap::Parser;
+    use std::collections::BTreeMap;
+
+    fn test_config() -> ReactorConfig {
+        ReactorConfig {
+            version: 1,
+            switchboard: SwitchboardConfig {
+                port: 4001,
+                package_spec: "@powerhousedao/switchboard".into(),
+                npm_registry: "https://registry.dev.vetra.io".into(),
+                node: NodeConfig::default(),
+            },
+            registry: "https://registry.dev.vetra.io".into(),
+            packages: Vec::new(),
+            drives: vec![DriveConfig {
+                name: "vault".into(),
+                url: "https://demo.invalid/d/vault".into(),
+                token_env: None,
+                available_offline: false,
+                paused: false,
+            }],
+            settings: SettingsConfig::default(),
+            log_level: "info".into(),
+            extra: BTreeMap::new(),
+        }
+    }
+
+    #[test]
+    fn status_json_flag_parses() {
+        let args = crate::cli::CliArgs::parse_from(["ph-reactor", "status", "--json"]);
+        match args.command {
+            Some(crate::cli::Command::Status { json: true }) => {}
+            other => panic!("unexpected parse: {other:?}"),
+        }
+    }
+
+    /// The exact JSON shape the shell plugin (ph-reactor-omarchy) consumes
+    /// from `status --json` while the daemon is not running.
+    #[test]
+    fn degraded_snapshot_matches_the_shell_contract() {
+        let t = tempfile::TempDir::new().unwrap();
+        let paths = StatePaths::for_root(t.path());
+        let snap = degraded_snapshot(&paths, &test_config());
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+
+        for key in ["version", "switchboard", "drives", "settings", "updated_at"] {
+            assert!(v.get(key).is_some(), "missing top-level key {key}");
+        }
+
+        let sb = &v["switchboard"];
+        for key in [
+            "running",
+            "healthy",
+            "version",
+            "port",
+            "restarts",
+            "last_event",
+        ] {
+            assert!(sb.get(key).is_some(), "missing switchboard key {key}");
+        }
+        assert_eq!(sb["running"], false);
+        assert_eq!(sb["healthy"], false);
+        assert_eq!(sb["version"], serde_json::Value::Null);
+        assert_eq!(sb["port"], 4001);
+        assert_eq!(sb["restarts"], 0);
+        assert_eq!(sb["last_event"], "daemon not running");
+
+        let d = &v["drives"][0];
+        for key in ["name", "url", "paused", "status", "detail"] {
+            assert!(d.get(key).is_some(), "missing drive key {key}");
+        }
+        assert_eq!(d["name"], "vault");
+        assert_eq!(d["url"], "https://demo.invalid/d/vault");
+        assert_eq!(d["paused"], false);
+        assert_eq!(d["status"], "offline");
+        assert_eq!(d["detail"], "daemon not running");
+
+        assert_eq!(v["settings"]["url"], "http://127.0.0.1:4002");
+        assert_eq!(v["version"], crate::VERSION);
+
+        let ts = v["updated_at"].as_str().unwrap();
+        assert!(
+            ts.chars().next().is_some_and(|c| c.is_ascii_digit()) && ts.contains('T'),
+            "updated_at is not RFC 3339-shaped: {ts}"
+        );
+    }
+
+    /// The daemon's `/api/status` serves the same struct; the live shape
+    /// (healthy switchboard, paused drive) must carry the same keys and the
+    /// documented drive-status vocabulary.
+    #[test]
+    fn live_snapshot_shape_is_the_same_contract() {
+        let snap = StatusSnapshot {
+            version: crate::VERSION.to_string(),
+            switchboard: SwitchboardStatus {
+                running: true,
+                healthy: true,
+                version: Some("6.2.2".into()),
+                port: 4001,
+                restarts: 1,
+                last_event: Some("switchboard healthy".into()),
+            },
+            drives: vec![DriveStatusEntry {
+                name: "vault".into(),
+                url: "https://demo.invalid/d/vault".into(),
+                paused: true,
+                status: "paused".into(),
+                detail: String::new(),
+            }],
+            settings: SettingsStatus {
+                url: "http://127.0.0.1:4002".into(),
+            },
+            updated_at: "2026-09-12T00:00:00Z".into(),
+        };
+        let v: serde_json::Value =
+            serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
+        assert_eq!(v["switchboard"]["running"], true);
+        assert_eq!(v["switchboard"]["healthy"], true);
+        assert_eq!(v["switchboard"]["version"], "6.2.2");
+        assert_eq!(v["drives"][0]["paused"], true);
+        assert_eq!(v["drives"][0]["status"], "paused");
+    }
 }

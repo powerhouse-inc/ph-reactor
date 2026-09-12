@@ -52,7 +52,7 @@ async fn dispatch(
     match command.unwrap_or(ph::cli::Command::Run { daemonize: false }) {
         ph::cli::Command::Run { daemonize } => ph::daemon::run(state_dir, daemonize).await,
         ph::cli::Command::Stop => ph::daemon::stop(state_dir).await,
-        ph::cli::Command::Status => ph::daemon::status(state_dir).await,
+        ph::cli::Command::Status { json } => ph::daemon::status(state_dir, json).await,
         ph::cli::Command::Drive(cmd) => ph::daemon::drive_command(state_dir, cmd).await,
         ph::cli::Command::Doctor => ph::daemon::doctor(state_dir).await,
         ph::cli::Command::Config(cmd) => config_command(state_dir, cmd).await,

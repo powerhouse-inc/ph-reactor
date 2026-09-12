@@ -70,7 +70,7 @@ ph-reactor [state-dir options] <command>
 
   run [--daemonize]   start the daemon (default command)
   stop                stop the running daemon (SIGTERM)
-  status              show daemon, switchboard, and drive state
+  status [--json]      show daemon, switchboard, and drive state
   drive add <url> [--name N] [--token-env E] [--offline]
   drive remove <name-or-index>
   drive list
@@ -86,6 +86,35 @@ Global: --state-dir <dir> (default $PH_REACTOR_STATE_DIR or ~/.ph/reactor)
 
 `drive` subcommands talk to the running daemon over its loopback settings
 API; `config` and `doctor` work standalone.
+
+### Stable CLI contract (0.2.0+)
+
+For shell integrations (see the companion Omarchy 4 plugin
+`powerhouse-inc/ph-reactor-omarchy`), the following is stable:
+
+- `ph-reactor --version` prints `ph-reactor <semver>`.
+- `status --json` exits 0 whenever the CLI runs and prints a
+  `StatusSnapshot`: live from the daemon's `/api/status` when the daemon is
+  up, or a degraded shape built from `config.json` when it is not
+  (`switchboard.running` is `false` and `last_event` says why):
+
+```json
+{
+  "version": "0.2.0",
+  "switchboard": { "running": true, "healthy": true, "version": "6.2.2",
+                   "port": 4001, "restarts": 0, "last_event": "…" },
+  "drives": [ { "name": "…", "url": "…", "paused": false,
+                "status": "synced|connecting|paused|offline|requires-auth|error",
+                "detail": "…" } ],
+  "settings": { "url": "http://127.0.0.1:4002" },
+  "updated_at": "2026-09-12T00:00:00Z"
+}
+```
+
+- `run --daemonize`, `stop`, and the `drive` subcommands are the other
+  commands integrations use. Drive tokens are referenced by environment
+  variable *name* only (`--token-env NAME`); the value is resolved by the
+  daemon and never passed or stored by callers.
 
 ## Tray
 

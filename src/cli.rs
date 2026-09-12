@@ -33,7 +33,14 @@ pub enum Command {
     /// Stop the running daemon (SIGTERM, waits for a clean exit).
     Stop,
     /// Show daemon, switchboard, and drive status.
-    Status,
+    Status {
+        /// Machine-readable output: the same `StatusSnapshot` JSON the
+        /// daemon serves at `/api/status` (degraded shape from config when
+        /// the daemon is down). Stable contract for shell plugins since
+        /// 0.2.0.
+        #[arg(long)]
+        json: bool,
+    },
     /// Manage synced remote drives.
     #[command(subcommand)]
     Drive(DriveCommand),
