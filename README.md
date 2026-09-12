@@ -1,35 +1,26 @@
 # ph-reactor
 
-A small Rust daemon that runs a local Powerhouse **switchboard** in the
-background on Linux, with a status-bar **tray icon** and a loopback
+A single-process Rust daemon that runs a local Powerhouse **reactor** in
+the background on Linux: an event-sourced document vault with
+**libp2p-based drive sync**, a status-bar **tray icon**, and a loopback
 **settings page** for configuring the remote drives to keep in sync
-(e.g. the `powerhouse-knowledge` vault drive).
+(e.g. the `powerhouse-knowledge` vault on another machine).
 
-It is the "reactor" of the Powerhouse stack in the desktop sense: the
-Node-based switchboard inside is the document engine and the sync engine
-(the same GqlChannel sync the browser Connect uses). The Rust daemon is
-the operator surface — bootstrap, supervision, tray, drive configuration:
+No Node, no npm, no child processes: the daemon *is* the reactor.
 
-- **Bootstrap**: finds a system Node ≥ 24 or downloads a private,
-  sha256-verified Node runtime into the state directory; installs
-  `@powerhousedao/switchboard` (pinned npm spec) once; generates the
-  switchboard's `powerhouse.config.json` (port, registry, boot packages,
-  auth off).
-- **Supervision**: spawns the switchboard, polls its `/health` endpoint,
-  restarts with exponential backoff on crash or unhealthiness, rotates
-  logs, stops cleanly (no orphan processes).
-- **Tray**: a `StatusNotifierItem` over D-Bus (zbus) with a `DBusMenu` —
-  no GTK dependency; headless-safe (runs without a session bus, tray is
-  optional).
-- **Drive sync**: adds/removes/pauses/resumes remote drives by driving
-  the local switchboard's own sync manager through its built-in MCP
-  endpoint (`addRemoteDrive` / `deleteDrive`).
-- **Missing packages**: document model packages are auto-installed from
-  `https://registry.dev.vetra.io` — the same `HttpPackageLoader` path
-  Connect uses (boot packages via the generated config, on-demand models
-  via dynamic model loading).
+- **Store**: event-sourced docs (per-field last-writer-wins with vector
+  clocks, ed25519-signed ops), durable as per-doc WAL + snapshots under
+  `<state>/docs/`.
+- **Sync**: libp2p (TCP + Noise + Yamux) with two behaviours — gossipsub
+  for live op fan-out and a request/response protocol
+  (`/ph-reactor/sync/1.0.0`) for the hello handshake, per-doc catch-up,
+  and periodic summary reconciliation. A "drive" is a remote **peer**
+  addressed by multiaddr, not a URL.
+- **Tray**: an `org.kde.StatusNotifierItem` over D-Bus (zbus) with a
+  `DBusMenu` — no GTK dependency; headless-safe (no session bus → the
+  daemon runs without a tray).
 - **Settings**: a single-page UI + JSON API on `127.0.0.1:4002`
-  (drives, switchboard, registry/packages, quit).
+  (drives, reactor, quit).
 
 ## Install
 
@@ -44,50 +35,54 @@ cargo build --release --target x86_64-unknown-linux-musl
 install -Dm755 target/x86_64-unknown-linux-musl/release/ph-reactor ~/.local/bin/ph-reactor
 ```
 
-The binary is statically linked (musl); no runtime dependencies. A Homebrew
-tap is a follow-up (the formula would install the release tarball).
-
-## Quick start
-
 ```sh
-ph-reactor run --daemonize        # start in the background (tray + settings)
-ph-reactor status                 # daemon, switchboard, drives
-ph-reactor drive add https://light-colt-c497cfbd-switchboard.vetra.io/d/powerhouse-knowledge \
-    --name "Powerhouse Knowledge"
+ph-reactor run --daemonize      # start in the background (tray + settings)
+ph-reactor status               # daemon, reactor, drives
+ph-reactor drive add /ip4/10.0.0.2/tcp/4201/p2p/12D3Koo… --name "Vault"
 ph-reactor drive list
-ph-reactor stop                   # clean shutdown
+ph-reactor doc add note --field "body=hello" --field "n=42"
+ph-reactor doc list
+ph-reactor stop                 # clean shutdown
 ```
 
-`ph-reactor` with no subcommand runs the daemon in the foreground.
+`ph-reactor` with no subcommand (or bare `run`) runs the daemon in the
+foreground; `run --daemonize` forks it into the background (pidfile in
+the state dir, stdio detached, logs in the state dir).
 
-On first start the daemon bootstraps Node + the switchboard package into
-`~/.ph/reactor/` (a few minutes; watch `ph-reactor logs`).
+On first start the daemon creates its identity key (one ed25519 keypair
+for the whole instance) under `~/.ph/reactor/` and starts listening on
+`/ip4/0.0.0.0/tcp/4201`. Peers on the LAN can also be found via mDNS
+(`p2p.mdns`); everything else is explicit multiaddr.
 
 ## CLI
 
 ```
-ph-reactor [state-dir options] <command>
+ph-reactor [--state-dir <dir>] <command>
 
-  run [--daemonize]   start the daemon (default command)
-  stop                stop the running daemon (SIGTERM)
-  status [--json]      show daemon, switchboard, and drive state
-  drive add <url> [--name N] [--token-env E] [--offline]
+  run [--daemonize]        start the daemon (foreground; --daemonize forks to background)
+  stop                     stop the running daemon (SIGTERM)
+  status [--json]          show daemon, reactor, and drive state
+  drive add <multiaddr> [--name N] [--token-env E] [--offline]
   drive remove <name-or-index>
   drive list
-  drive pause <name-or-index>     stop syncing; local mirror deleted
-  drive resume <name-or-index>    re-add and re-sync the drive
-  drive resync <name-or-index>    delete + re-add (forced re-sync)
-  doctor                diagnostics (node, npm, registry, switchboard, MCP)
+  drive pause <name-or-index>     stop syncing; docs stay local
+  drive resume <name-or-index>    re-dial and re-sync
+  drive resync <name-or-index>    force a fresh catch-up
+  doc list                             local docs
+  doc get <name>                       a doc's fields as JSON
+  doc add <name> [--field K=V …]      create a local doc (daemon must be running)
+  doctor                     diagnostics (state dir, identity, store, listen, settings, session bus)
   config show | config set <dotted.key> <value>
-  logs [--follow] [--switchboard]
+  logs [--follow]
 
 Global: --state-dir <dir> (default $PH_REACTOR_STATE_DIR or ~/.ph/reactor)
 ```
 
-`drive` subcommands talk to the running daemon over its loopback settings
-API; `config` and `doctor` work standalone.
+`drive` and `doc add` talk to the running daemon over its loopback
+settings API (the daemon is the single writer); `doc list`/`doc get`,
+`config`, and `doctor` work standalone.
 
-### Stable CLI contract (0.2.0+)
+### Stable CLI contract (1.0.0)
 
 For shell integrations (see the companion Omarchy 4 plugin
 `powerhouse-inc/ph-reactor-omarchy`), the following is stable:
@@ -96,14 +91,16 @@ For shell integrations (see the companion Omarchy 4 plugin
 - `status --json` exits 0 whenever the CLI runs and prints a
   `StatusSnapshot`: live from the daemon's `/api/status` when the daemon is
   up, or a degraded shape built from `config.json` when it is not
-  (`switchboard.running` is `false` and `last_event` says why):
+  (`reactor.running` is `false` and `last_event` says why):
 
 ```json
 {
-  "version": "0.2.0",
-  "switchboard": { "running": true, "healthy": true, "version": "6.2.2",
-                   "port": 4001, "restarts": 0, "last_event": "…" },
-  "drives": [ { "name": "…", "url": "…", "paused": false,
+  "version": "1.0.0",
+  "reactor": { "running": true, "healthy": true,
+               "peer_id": "12D3Koo…", "listen": "/ip4/0.0.0.0/tcp/4201",
+               "docs": 12, "last_event": "…" },
+  "drives": [ { "name": "…", "addr": "/ip4/…/tcp/4201/p2p/12D3Koo…",
+                "paused": false,
                 "status": "synced|connecting|paused|offline|requires-auth|error",
                 "detail": "…" } ],
   "settings": { "url": "http://127.0.0.1:4002" },
@@ -111,21 +108,47 @@ For shell integrations (see the companion Omarchy 4 plugin
 }
 ```
 
-- `run --daemonize`, `stop`, and the `drive` subcommands are the other
-  commands integrations use. Drive tokens are referenced by environment
-  variable *name* only (`--token-env NAME`); the value is resolved by the
-  daemon and never passed or stored by callers.
+- `run` (daemonized), `stop`, and the `drive`/`doc` subcommands are the
+  other commands integrations use. Drive tokens are referenced by
+  environment variable *name* only (`--token-env NAME`); the value is
+  resolved by the daemon and never passed or stored by callers.
+
+## Sync model
+
+Every doc mutation is an **op**: `{ doc_id, field?, value?, ts, clock,
+origin, signature }` where `clock` is a per-document vector clock and
+`origin` signs it with the instance's identity key. Ops apply in any
+order: unknown work is accepted (clock not covered), same-field
+conflicts resolve by last-writer-wins on `(ts, origin)`, and unverified
+signatures are quarantined, never applied.
+
+Three paths move ops between peers:
+
+1. **Gossip** (gossipsub topic `ph-reactor/docs/1.0.0`): the tick loop
+   publishes each newly applied local op; peers apply and the message
+   fans out.
+2. **Catch-up** (request/response): on a gap (a peer's clock covers
+   work we lack), the requester asks for the exact ops it is missing;
+   responses are capped and resumable.
+3. **Summary reconciliation**: every 30 s an authenticated drive
+   exchanges per-doc clocks; anything missed by gossip (loss, a
+   reconnection, a doc created before the link existed) is closed by
+   catch-up.
+
+`doc add` publishes through the mesh as the doc is created, so a new
+vault mirror picks it up on the next reconcile without waiting for a
+reconnect.
 
 ## Tray
 
-The tray icon is a classic `org.kde.StatusNotifierItem` (D-Bus session bus)
-served by the daemon itself — it shows in KDE out of the box and in GNOME
-with any SNI indicator extension. Icon: themed `network-server`
+The tray icon is a classic `org.kde.StatusNotifierItem` (D-Bus session
+bus) served by the daemon itself — it shows in KDE out of the box and in
+GNOME with any SNI indicator extension. Icon: themed `network-server`
 (attention variant when something needs care). Menu:
 
 ```
 Powerhouse Reactor v<ver>          (disabled)
-Switchboard: <state>               (disabled)
+Reactor: <state>                   (disabled)
 ─────────────
 <drive>  — <status>                (disabled)
     Pause sync / Resume sync
@@ -144,11 +167,12 @@ tray; everything else works.
 
 ## Settings page
 
-`http://127.0.0.1:4002/` (loopback only, no auth by design): switchboard
-card, drives table with pause/resume/resync/remove, add-drive form,
-registry/packages section. JSON API: `GET /api/status`, `POST
-/api/drives`, `POST /api/drives/<name>/pause|resume|resync`, `DELETE
-/api/drives/<name>`, `POST /api/config` (key/value), `POST /api/quit`.
+`http://127.0.0.1:4002/` (loopback only, no auth by design): reactor
+card, drives table with pause/resume/resync/remove, add-drive form
+(multiaddr). JSON API: `GET /api/status`, `POST /api/drives`, `POST
+/api/drives/<name>/pause|resume|resync`, `DELETE /api/drives/<name>`,
+`POST /api/docs` (synchronous doc creation, used by `ph-reactor doc
+add`), `POST /api/config` (key/value), `POST /api/quit`.
 
 ## Configuration
 
@@ -157,19 +181,13 @@ registry/packages section. JSON API: `GET /api/status`, `POST
 
 ```json
 {
-  "version": 1,
-  "switchboard": {
-    "port": 4001,
-    "packageSpec": "@powerhousedao/switchboard@latest",
-    "npmRegistry": "https://registry.npmjs.org",
-    "node": { "minimumVersion": "24", "preferSystem": true }
-  },
-  "registry": "https://registry.dev.vetra.io",
-  "packages": ["@powerhousedao/knowledge-note"],
+  "schemaVersion": 2,
+  "instance": { "name": "reactor", "listen": "/ip4/0.0.0.0/tcp/4201" },
+  "p2p": { "mdns": true, "tokenEnv": null },
   "drives": [
     {
-      "name": "Powerhouse Knowledge",
-      "url": "https://light-colt-c497cfbd-switchboard.vetra.io/d/powerhouse-knowledge",
+      "name": "Vault",
+      "addr": "/ip4/10.0.0.2/tcp/4201/p2p/12D3Koo…",
       "tokenEnv": "PH_REACTOR_DRIVE_TOKEN",
       "availableOffline": true,
       "paused": false
@@ -180,32 +198,36 @@ registry/packages section. JSON API: `GET /api/status`, `POST
 }
 ```
 
-- `tokenEnv` names an environment variable holding a bearer token for a
-  private drive's switchboard (the value is never stored in the file).
-  A drive reported as `requires-auth` is synced once it is (re)added
-  with `--token-env NAME` and `NAME` holds a token the remote accepts —
-  the daemon's post-install patch makes the installed switchboard
-  present that token on the sync channels.
-- `paused`: paused drives are removed from the local reactor (sync stops)
-  but kept in config; resume re-adds them.
+- `instance.listen` — the p2p listen multiaddr (the remote side of a
+  `drive add` is the *peer's* listen address, optionally with its
+  `/p2p/<peer-id>`).
+- `p2p.mdns` — advertise/discover peers on the local segment.
+- `p2p.tokenEnv` — env var name of a global token gate: inbound hellos
+  from peers without a drive entry are rejected unless their token
+  matches.
+- `drives[].tokenEnv` — per-drive shared token (env var *name* only; the
+  value is never stored in the file). A drive reported as
+  `requires-auth` starts syncing once the token matches on both sides.
+- `paused`: paused drives stop syncing but keep their local mirror;
+  resume re-dials and re-catches-up.
 - Edit via `ph-reactor config set <key> <json-value>` or the settings
-  page. Settings that change the running process (port, package spec,
-  registry, packages, log level) make the daemon respawn the switchboard
-  automatically; drive changes are applied to the live switchboard without
-  a restart.
+  page. The daemon adopts config changes on its next poll; process-level
+  settings (listen port) apply on restart.
 
 ## State layout
 
 ```
 ~/.ph/reactor/
-  config.json              daemon configuration
-  node/                    private Node runtime (only when bootstrapped)
-  switchboard/             npm install tree; powerhouse.config.json, .ph/ (PGlite store),
-                           .ph-reactor/ (generated boot wrapper + pristine backup of the
-                           patched switchboard server chunk)
-  logs/                    reactor.log — daemon + switchboard output ([o]/[e]), rotating 10 MB × 3
-  run/                     daemon.pid, lock (single instance), switchboard.pid, ready
+  config.json              configuration (0600, schemaVersion 2)
+  key                      ed25519 identity (0600) — the instance's whole identity
+  docs/                    <doc-id>.log (WAL), <doc-id>.snap, index.json
+  logs/                    reactor.log — size-rotated
+  run/                     daemon.pid, lock (single instance), ready
 ```
+
+Upgrading from 0.x: the 0.x directories (`node/`, `switchboard/`,
+`data/`) are left in place, untouched and unused; delete them once you
+are happy with the new instance.
 
 ## Build the snap
 
@@ -214,51 +236,51 @@ From the repository root, on an Ubuntu host with `snapcraft` (LXD):
 ```sh
 cargo build --release --target x86_64-unknown-linux-musl
 mkdir -p dist && cp target/x86_64-unknown-linux-musl/release/ph-reactor dist/
-snapcraft --use-lxd        # produces ph-reactor_0.1.0_amd64.snap
+snapcraft --use-lxd        # produces ph-reactor_1.0.0_amd64.snap
 ```
 
 The snap is `strict`-confined: state under `$SNAP_USER_DATA/ph-reactor`,
 plugs `home`/`network`/`network-bind`/`dbus` (session bus for the tray),
-and starts on session autostart (`run --daemonize`).
+and starts on session autostart (the daemonized start).
 
 ## Troubleshooting
 
-- `ph-reactor doctor` — checks node availability, the npm registry, the
-  package registry, the installed switchboard, and the MCP endpoint.
-- `ph-reactor logs --follow` — daemon log; `--switchboard` — the
-  switchboard's output lines within it (`[o]`/`[e]` markers).
-- Port 4001 in use: the switchboard falls forward to the next free port
-  (it logs which); the daemon follows it.
-- A drive stuck at `connecting`: the first sync of a large vault takes
-  time; `requires-auth` means the remote needs a token (add it with
-  `--token-env`); `error` means the remote refused or is unreachable
-  (check `offline` for air-gapped mirrors).
-- The daemon applies a small, idempotent post-install patch to the
-  installed switchboard's server chunk so that its boot path accepts
-  the `channelScheme` and `jwtHandler` options the daemon passes
-  (published builds drop them; without the patch a local switchboard
-  can only serve as a sync target and never pull from a remote). The
-  pristine chunk is backed up under
-  `switchboard/.ph-reactor/dist-patch/`; the patch is a no-op on a
-  build that wires those options natively.
+- `ph-reactor doctor` — checks the state dir, the identity key, the doc
+  store, the listen port, the settings server, and the session bus.
+- `ph-reactor logs --follow` — daemon log.
+- A drive stuck at `connecting`: check the peer is listening (its
+  `ph-reactor status` shows `reactor.healthy` and its listen address),
+  the multiaddr is reachable (firewall), and — if the drive requires a
+  token — that `tokenEnv` names a var whose value both sides share
+  (`requires-auth` is the resulting status).
+- A drive flapping: every 30 s the peers exchange per-doc summaries; a
+  one-way link (NAT/firewall that only allows one direction) still
+  converges, just slower.
+- `error` with a version mismatch: the two ends run incompatible
+  protocol versions; upgrade both to the same release.
 
 ## Security notes
 
-- Both servers bind `127.0.0.1` only. Local switchboard auth is disabled
-  by default (the MCP endpoint is therefore loopback-only); enable it in
-  the generated config if you expose the port.
-- Drive tokens live only in environment variables.
-- The downloaded Node runtime is verified against `SHASUMS256.txt` from
-  nodejs.org; the switchboard is installed by npm with its own integrity
-  checks.
+- Every p2p connection is Noise-encrypted; peers are identified by
+  key-derived peer ids (no username/password model).
+- Every op carries an ed25519 signature from its origin; the store
+  applies an op only after verifying the signature against a key
+  registered through a completed hello on an authenticated channel.
+  Unverified ops go to quarantine and are never applied.
+- Tokens (global gate and per-drive) live only in environment
+  variables; config stores names, never values.
+- The settings server binds `127.0.0.1` only. The p2p listener binds
+  the configured address (all interfaces by default) — that is what
+  makes remote sync possible; use the token gates for private drives.
+- No downloads, no package installation, no child processes.
 
 ## Development
 
 ```sh
-cargo test          # 42 tests, offline (mocked HTTP, temp state dirs, fake node)
-cargo clippy --all-targets
-cargo run -- run    # foreground, against the real state dir
+cargo test          # unit + in-process two-engine sync (loopback TCP), offline
+cargo clippy --all-targets -- -D warnings
+cargo run --        # foreground daemon against the real state dir
 ```
 
-Design: `docs/superpowers/specs/2026-09-11-rust-reactor-design.md`;
-plan: `docs/superpowers/plans/2026-09-11-rust-reactor.md`.
+Design: `docs/superpowers/specs/2026-09-12-native-reactor-design.md`;
+plan: `docs/superpowers/plans/2026-09-12-native-reactor.md`.
