@@ -16,6 +16,7 @@
 
 pub mod bootstrap;
 pub mod cli;
+pub mod doc;
 pub mod commands;
 pub mod config;
 pub mod daemon;
@@ -26,6 +27,7 @@ pub mod paths;
 pub mod registry;
 pub mod settings;
 pub mod status;
+pub mod store;
 pub mod supervisor;
 pub mod tray;
 
