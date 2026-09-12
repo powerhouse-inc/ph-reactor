@@ -182,3 +182,81 @@ async fn two_engines_sync_docs_both_directions() {
     a.cmd_tx.send(EngineCommand::Shutdown).unwrap();
     b.cmd_tx.send(EngineCommand::Shutdown).unwrap();
 }
+
+#[tokio::test]
+async fn drive_added_after_peer_already_connected_completes_handshake() {
+    // The race: A's dial reaches B before B knows about A (no drive yet
+    // on B). A completes its own handshake from B's hello-ack; B's
+    // half of the handshake must still complete when B adds the drive
+    // later (from the guest record / the existing connection), and full
+    // sync must follow.
+    init_log();
+    let a = spawn_node("alpha").await;
+    let b = spawn_node("beta").await;
+    let a_peer = a.peer;
+    let a_listen = a.listen.clone();
+    // (registering A as a guest) without a drive of its own.
+    a.cmd_tx
+        .send(EngineCommand::AddDrive(drive("beta", &b)))
+        .unwrap();
+
+    let mut a_evt = a.evt_rx;
+    let mut b_evt = b.evt_rx;
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        wait_status(&mut a_evt, "beta", DriveStatus::Synced),
+    )
+    .await
+    .expect("A's one-sided handshake did not complete");
+
+    // Now B learns about A, with A already connected.
+    b.cmd_tx
+        .send(EngineCommand::AddDrive(Drive {
+            name: "alpha".into(),
+            addr: with_peer(a_listen, a_peer),
+            token_env: None,
+            paused: false,
+            available_offline: false,
+        }))
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        wait_status(&mut b_evt, "alpha", DriveStatus::Synced),
+    )
+    .await
+    .expect("B's drive never handshaken after the late add");
+
+    // Docs flow both ways over the completed handshake.
+    let mut fields = BTreeMap::new();
+    fields.insert("body".into(), serde_json::json!("late drive, early doc"));
+    a.store.create_doc("late-note", fields).unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        wait_field(
+            &b.store,
+            "late-note",
+            "body",
+            &serde_json::json!("late drive, early doc"),
+        ),
+    )
+    .await
+    .expect("doc did not reach beta");
+
+    b.store
+        .update_field("late-note", "body", serde_json::json!("beta saw it"))
+        .unwrap();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        wait_field(
+            &a.store,
+            "late-note",
+            "body",
+            &serde_json::json!("beta saw it"),
+        ),
+    )
+    .await
+    .expect("update did not reach alpha");
+
+    a.cmd_tx.send(EngineCommand::Shutdown).unwrap();
+    b.cmd_tx.send(EngineCommand::Shutdown).unwrap();
+}

@@ -177,6 +177,10 @@ pub struct SyncEngine {
     /// Local token (from the config's `p2p.tokenEnv` env var), if any.
     token: Option<String>,
     drives: HashMap<String, DriveRuntime>,
+    /// Peers that presented a valid hello (their key is registered) even
+    /// though no drive for them existed yet; a drive added later
+    /// completes the handshake from this record.
+    guests: HashSet<PeerId>,
     cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
     evt_tx: mpsc::UnboundedSender<EngineEvent>,
     running: bool,
@@ -262,6 +266,7 @@ impl SyncEngine {
             listen,
             token,
             drives: HashMap::new(),
+            guests: HashSet::new(),
             cmd_rx,
             evt_tx,
             running: true,
@@ -344,6 +349,27 @@ impl SyncEngine {
                     tracing::info!("adding drive '{name}' ({peer})");
                 }
                 if !drive.paused {
+                    // A hello from this peer may have arrived before
+                    // the drive existed: that half-completed the
+                    // handshake (their key is registered), so finish it
+                    // now.
+                    if self.guests.contains(&peer) {
+                        if let Some(rt) = self.drives.get_mut(&name) {
+                            rt.handshaken = true;
+                            rt.last_seen = now;
+                        }
+                        self.set_status(&name, DriveStatus::Connecting, None);
+                    }
+                    // The peer may already be connected (their dial
+                    // reached us before this drive existed, so the
+                    // ConnectionEstablished handshake never fired for
+                    // it): open the handshake on the existing
+                    // connection.
+                    if self.drives.get(&name).is_some_and(|rt| !rt.handshaken)
+                        && self.swarm.is_connected(&peer)
+                    {
+                        self.open_handshake(&name);
+                    }
                     let _ = self.swarm.dial(
                         DialOpts::peer_id(peer)
                             .addresses(vec![drive.addr.clone()])
@@ -511,25 +537,9 @@ impl SyncEngine {
                 let Some(name) = self.drive_name_by_peer(peer_id) else {
                     return;
                 };
-                // Handshake: the dialer (us, for configured drives)
-                // opens with hello.
-                if let Some(rt) = self.drives.get_mut(&name) {
-                    if !rt.handshaken && !rt.drive.paused {
-                        let pubkey = self.store.key().verifying_key().to_bytes();
-                        let hello = Hello {
-                            version: PROTOCOL_VERSION,
-                            name: self.pub_name.clone(),
-                            peer_id: self.peer_id.to_base58(),
-                            pubkey: hex::encode(pubkey),
-                            token: self.token.clone(),
-                        };
-                        let _ = self
-                            .swarm
-                            .behaviour_mut()
-                            .sync
-                            .send_request(&peer_id, SyncMsg::Hello(hello));
-                    }
-                }
+                // Handshake: we open it with hello (either side may
+                // have dialed).
+                self.open_handshake(&name);
             }
             SwarmEvent::ConnectionClosed {
                 peer_id,
@@ -691,6 +701,10 @@ impl SyncEngine {
                             }
                             self.set_status(&name, DriveStatus::Connecting, None);
                         }
+                        // Remember the peer even when no drive for it
+                        // exists yet (a drive added later completes the
+                        // handshake from this record).
+                        self.guests.insert(peer);
                         self.store.register_peer_key(&peer.to_base58(), arr);
                     }
                 }
@@ -903,6 +917,31 @@ impl SyncEngine {
         }
     }
 
+    /// Opens the hello handshake to the drive's peer (a no-op when the
+    /// drive already handshaken or is paused).
+    fn open_handshake(&mut self, name: &str) {
+        let should_send = self
+            .drives
+            .get(name)
+            .is_some_and(|rt| !rt.handshaken && !rt.drive.paused);
+        if !should_send {
+            return;
+        }
+        let peer = self.drives.get(name).unwrap().peer;
+        let pubkey = self.store.key().verifying_key().to_bytes();
+        let hello = Hello {
+            version: PROTOCOL_VERSION,
+            name: self.pub_name.clone(),
+            peer_id: self.peer_id.to_base58(),
+            pubkey: hex::encode(pubkey),
+            token: self.token.clone(),
+        };
+        let _ = self
+            .swarm
+            .behaviour_mut()
+            .sync
+            .send_request(&peer, SyncMsg::Hello(hello));
+    }
     fn drive_name_by_peer(&self, peer: PeerId) -> Option<String> {
         self.drives
             .iter()
