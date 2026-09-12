@@ -5,11 +5,15 @@ Worktree: `~/.worktrees/ph-reactor-native`, branch `feat/native-reactor`
 (from `main` = c2f9a0f). Each task is one commit; tasks build in order.
 Machine: rustc 1.98.1 (libp2p 0.56 MSRV 1.83 satisfied).
 
-Status (2026-09-12): all tasks done — see
+Status (2026-09-12): Tasks 1–12 done — the core reactor plus the model
+core (open@1 / action-log store, the L1 interpreter + group model +
+quorum, and `doc verify` / `doc action` with the verify engine). Tasks
+13–15 (full P2P transport, invites, N-peer E2E) pending. See
 `../sdd/2026-09-12-native-reactor/progress.md` for the record and
 deviations (HelloAck carries the responder's pubkey; identity is
 announced on the resolved listen address; `doc` CLI added; gossip
-fan-out on a 5 s tick with 30 s per-drive reconciliation).
+fan-out on a 5 s tick with 30 s per-drive reconciliation; `doc action
+--cosign` deferred to full P2P).
 
 ## Task 1 — Document model (`src/doc.rs`)
 
