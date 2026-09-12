@@ -31,7 +31,7 @@ use tracing::warn;
 
 use crate::action::Action;
 use crate::doc::{apply_op, ApplyResult, Doc, DocId, Hash32, ModelRef, Origin, VecClock};
-use crate::model::{Model, ModelRegistry};
+use crate::model::{Model, ModelRegistry, QuorumSpec};
 
 /// Actions in a doc's live log before it is snapshot + truncated.
 pub const SNAPSHOT_OPS: u64 = 1024;
@@ -68,6 +68,71 @@ fn default_model_ref() -> ModelRef {
 #[derive(Serialize, Deserialize)]
 struct Index {
     ts_hint: u64,
+}
+
+/// The check result for a single action in a verified document log.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionCheck {
+    pub ts: u64,
+    pub origin: String,
+    pub kind: String,
+    pub model: String,
+    pub ok: bool,
+    pub problems: Vec<String>,
+}
+
+/// The result of verifying a document's action log (the audit report):
+/// one entry per surviving action plus an overall verdict.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct VerifyReport {
+    pub name: String,
+    pub doc_id: DocId,
+    /// The model the log was written under (from the first surviving action).
+    pub model: Option<ModelRef>,
+    /// True when the log was truncated by a snapshot (the verified chain
+    /// then starts at the snapshot's stored log hash, not genesis).
+    pub from_snapshot: bool,
+    /// One entry per surviving action, in order.
+    pub actions: Vec<ActionCheck>,
+    /// True when every check passed.
+    pub ok: bool,
+}
+
+impl VerifyReport {
+    /// Render the human-readable audit report (the "legal artifact").
+    pub fn render(&self) -> String {
+        let mut out = String::new();
+        out.push_str(&format!("verify {}\n", self.name));
+        out.push_str(&format!("  doc  {}\n", self.doc_id));
+        if let Some(m) = &self.model {
+            out.push_str(&format!("  model {m}\n"));
+        }
+        out.push_str(&format!(
+            "  {} action(s){}\n\n",
+            self.actions.len(),
+            if self.from_snapshot { " since snapshot" } else { "" }
+        ));
+        for (i, a) in self.actions.iter().enumerate() {
+            out.push_str(&format!(
+                "  [{i}] {} ts={} origin={} kind={} model={}\n",
+                if a.ok { "ok  " } else { "FAIL" },
+                a.ts,
+                a.origin,
+                a.kind,
+                a.model
+            ));
+            for p in &a.problems {
+                out.push_str(&format!("        - {p}\n"));
+            }
+        }
+        out.push('\n');
+        if self.ok {
+            out.push_str("VERIFIED: every signature, co-signature, and precondition\ncheck out, the hash chain is intact, and the re-folded field map matches\nthe stored doc.\n");
+        } else {
+            out.push_str("FAILED: one or more checks did not pass (see above).\n");
+        }
+        out
+    }
 }
 
 /// A document and its live (not yet snapshotted) action log.
@@ -231,23 +296,26 @@ impl Store {
         }
         let id = DocId::new();
         inner.entries.insert(id, Entry::new(id));
-        // open@1: a create action lifts the name; one set action per field.
-        let mut actions = Vec::with_capacity(fields.len() + 1);
-        actions.push(inner.build_action(
+        // open@1: a create action lifts the name, then one set action per
+        // field. Applied one at a time so each action's prev_hash chains
+        // to the previous - building the whole batch against an empty log
+        // would leave every link None.
+        let create = inner.build_action(
             id,
             &open_ref(),
             "create",
             &serde_json::json!({ "field": NAME_KEY, "value": name }),
-        )?);
+        )?;
+        inner.apply_action(&create)?;
         for (field, value) in &fields {
-            actions.push(inner.build_action(
+            let set = inner.build_action(
                 id,
                 &open_ref(),
                 "set",
                 &serde_json::json!({ "field": field, "value": value }),
-            )?);
+            )?;
+            inner.apply_action(&set)?;
         }
-        inner.write_actions(actions)?;
         inner.names.insert(name.to_string(), id);
         Ok(id)
     }
@@ -385,6 +453,188 @@ impl Store {
 
     pub fn snapshot(&self, id: &DocId) -> Result<(), String> {
         self.inner.lock().snapshot(id)
+    }
+
+    /// Verify a document's action log (read-only): replay every surviving
+    /// action (re-reduced through its model), checking each signature,
+    /// co-signature, and precondition, the hash chain, and that the
+    /// re-folded field map equals the stored doc. The chain starts at the
+    /// snapshot's stored log hash when the log was truncated, else at
+    /// genesis. Returns a per-action audit report plus an overall verdict.
+    pub fn verify(&self, name: &str) -> Result<VerifyReport, String> {
+        let g = self.inner.lock();
+        let id = *g
+            .names
+            .get(name)
+            .ok_or_else(|| format!("no doc named '{name}'"))?;
+        let entry = g
+            .entries
+            .get(&id)
+            .ok_or_else(|| format!("no doc named '{name}'"))?;
+        let stored = entry.doc.clone();
+
+        // The snapshot is the trusted base when present; its stored log
+        // hash is where the surviving log chain begins.
+        let snap_path = g.docs_dir.join(format!("{id}.snap"));
+        let base: Option<DocState> = std::fs::read_to_string(&snap_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+        let mut scratch = match &base {
+            Some(b) => Entry {
+                doc: b.doc.clone(),
+                clock: b.clock.clone(),
+                deleted: b.deleted,
+                log: Vec::new(),
+            },
+            None => Entry::new(id),
+        };
+        lift_name(&mut scratch.doc);
+        let mut expected_prev = base.as_ref().and_then(|b| b.log_hash);
+
+        let mut report = VerifyReport {
+            name: name.to_string(),
+            doc_id: id,
+            model: None,
+            from_snapshot: base.is_some(),
+            actions: Vec::new(),
+            ok: true,
+        };
+
+        for action in &entry.log {
+            let mut problems: Vec<String> = Vec::new();
+            let model = match g.models.find(&action.model) {
+                Some(m) => Some(m),
+                None => {
+                    problems.push(format!("model {} not loaded", action.model.name));
+                    None
+                }
+            };
+            if report.model.is_none() {
+                report.model = Some(action.model.clone());
+            }
+
+            // Hash chain.
+            match (action.prev_hash, expected_prev) {
+                (Some(got), Some(want)) if got != want => {
+                    problems.push(format!(
+                        "hash chain broken: prev_hash {got} != expected {want}"
+                    ));
+                }
+                (Some(_), None) => {
+                    problems.push("action carries a prev_hash but the chain starts here".into());
+                }
+                (None, Some(_)) => problems.push("chain gap: missing prev_hash".into()),
+                _ => {}
+            }
+
+            // Origin signature.
+            match g.known_keys.get(&action.origin).copied() {
+                Some(k) => match VerifyingKey::from_bytes(&k) {
+                    Ok(pk) => {
+                        if !action.verify(&pk) {
+                            problems.push("origin signature invalid".into());
+                        }
+                    }
+                    Err(_) => problems.push("origin key malformed".into()),
+                },
+                None => problems.push(format!("unknown origin {}", action.origin)),
+            }
+
+            // Co-signatures.
+            for (i, cs) in action.cosig.iter().enumerate() {
+                match g.known_keys.get(&cs.origin).copied() {
+                    Some(k) => match VerifyingKey::from_bytes(&k) {
+                        Ok(pk) => {
+                            if !action.verify_cosig(i, &pk) {
+                                problems.push(format!(
+                                    "co-signature {} from {} invalid",
+                                    i, cs.origin
+                                ));
+                            }
+                        }
+                        Err(_) => {
+                            problems.push(format!("co-signer {} key malformed", cs.origin))
+                        }
+                    },
+                    None => problems.push(format!("unknown co-signer {}", cs.origin)),
+                }
+            }
+
+            // Precondition + quorum (against the re-folded pre-state).
+            if let Some(m) = &model {
+                if let Err(r) = m.check_precondition(&scratch.doc, action) {
+                    problems.push(format!("precondition: {}", r.describe()));
+                }
+                if let Some(spec) = m.quorum(action.kind.as_str()) {
+                    if let Some(p) = g.quorum_problem(&spec, action) {
+                        problems.push(p);
+                    }
+                }
+            }
+
+            // Re-fold through the model (same merge as live application).
+            if let Some(m) = &model {
+                apply_ops_to_entry(&mut scratch, m.as_ref(), action);
+            }
+
+            expected_prev = Some(action.hash());
+            let ok = problems.is_empty();
+            if !ok {
+                report.ok = false;
+            }
+            report.actions.push(ActionCheck {
+                ts: action.ts,
+                origin: action.origin.clone(),
+                kind: action.kind.clone(),
+                model: action.model.to_string(),
+                ok,
+                problems,
+            });
+        }
+
+        // Field-map equality: the re-folded doc must equal the stored doc.
+        if scratch.doc != stored {
+            report.ok = false;
+            let note = "re-folded field map does not match the stored doc".to_string();
+            match report.actions.last_mut() {
+                Some(last) => {
+                    last.ok = false;
+                    last.problems.push(note);
+                }
+                None => {
+                    report.actions.push(ActionCheck {
+                        ts: 0,
+                        origin: String::new(),
+                        kind: "(field map)".into(),
+                        model: String::new(),
+                        ok: false,
+                        problems: vec![note],
+                    });
+                }
+            }
+        }
+
+        Ok(report)
+    }
+
+    /// Build and apply a locally-signed model action (the store's own key)
+    /// to an existing doc: the local path for `doc action`. The daemon
+    /// publishes it to the mesh through the normal apply path.
+    pub fn apply_local_action(
+        &self,
+        name: &str,
+        model: &ModelRef,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Action, String> {
+        let mut g = self.inner.lock();
+        let id = *g
+            .names
+            .get(name)
+            .ok_or_else(|| format!("no doc named '{name}'"))?;
+        let action = g.build_action(id, model, kind, payload)?;
+        g.apply_action(&action)?;
+        Ok(action)
     }
 
     pub fn wal_path(&self, id: &DocId) -> PathBuf {
@@ -550,14 +800,6 @@ impl Inner {
         Ok(action)
     }
 
-    /// Apply a batch of actions in order (used by `create_doc`).
-    fn write_actions(&mut self, actions: Vec<Action>) -> Result<(), String> {
-        for a in actions {
-            self.apply_action(&a)?;
-        }
-        Ok(())
-    }
-
     /// The single apply path (local and remote). Verify -> model -> validate
     /// -> precondition -> reduce -> per-field merge -> log + WAL -> queue.
     fn apply_action(&mut self, action: &Action) -> Result<ApplyResult, String> {
@@ -603,56 +845,8 @@ impl Inner {
         //     the group's state — a different document). Runs before step 4,
         //     so a failed quorum never mutates the entry.
         if let Some(spec) = model.quorum(action.kind.as_str()) {
-            let group_name = if spec.group == "$self" {
-                let n = self
-                    .entries
-                    .get(&action.doc_id)
-                    .map(|e| e.doc.name.clone())
-                    .unwrap_or_default();
-                if n.is_empty() {
-                    return self.reject(action, "quorum group '$self' has no name");
-                }
-                n
-            } else {
-                spec.group.clone()
-            };
-            let group_doc = self
-                .names
-                .get(&group_name)
-                .and_then(|id| self.entries.get(id).map(|e| e.doc.live()));
-            let members: HashSet<String> = match group_doc {
-                Some(gd) => gd
-                    .fields
-                    .get(&spec.field)
-                    .map(|f| f.value.clone())
-                    .unwrap_or(serde_json::Value::Null)
-                    .as_array()
-                    .map(|a| {
-                        a.iter()
-                            .filter_map(|v| v.as_str().map(String::from))
-                            .collect()
-                    })
-                    .unwrap_or_default(),
-                None => {
-                    return self.reject(action, &format!("quorum group '{group_name}' not found"))
-                }
-            };
-            let mut seen: HashSet<&str> = HashSet::new();
-            let mut in_group = 0usize;
-            for cs in &action.cosig {
-                if seen.insert(cs.origin.as_str()) && members.contains(&cs.origin) {
-                    in_group += 1;
-                }
-            }
-            if in_group < spec.min {
-                return self.reject(
-                    action,
-                    &format!(
-                        "quorum: {in_group} of {} co-signers are members of '{group_name}' (need {})",
-                        action.cosig.len(),
-                        spec.min
-                    ),
-                );
+            if let Some(problem) = self.quorum_problem(&spec, action) {
+                return self.reject(action, &problem);
             }
         }
         // 4. Precondition + reduce + per-field merge (one entries borrow).
@@ -752,6 +946,52 @@ impl Inner {
         self.ts_hint = self.ts_hint.max(now);
         self.ts_hint += 1;
         self.ts_hint
+    }
+
+    /// Check a declared quorum against the group's state. Returns `Some`
+    /// with a problem description when the quorum is not met. The caller
+    /// has already verified the origin and co-signature signatures.
+    fn quorum_problem(&self, spec: &QuorumSpec, action: &Action) -> Option<String> {
+        let group_name = if spec.group == "$self" {
+            match self.entries.get(&action.doc_id).map(|e| e.doc.name.clone()) {
+                Some(n) if !n.is_empty() => n,
+                _ => return Some("quorum group '$self' has no name".into()),
+            }
+        } else {
+            spec.group.clone()
+        };
+        let group_doc = match self
+            .names
+            .get(&group_name)
+            .and_then(|id| self.entries.get(id).map(|e| e.doc.live()))
+        {
+            Some(gd) => gd,
+            None => return Some(format!("quorum group '{group_name}' not found")),
+        };
+        let members: HashSet<String> = group_doc
+            .fields
+            .get(&spec.field)
+            .map(|f| f.value.clone())
+            .unwrap_or(serde_json::Value::Null)
+            .as_array()
+            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .unwrap_or_default();
+        let mut seen: HashSet<&str> = HashSet::new();
+        let mut in_group = 0usize;
+        for cs in &action.cosig {
+            if seen.insert(cs.origin.as_str()) && members.contains(&cs.origin) {
+                in_group += 1;
+            }
+        }
+        if in_group < spec.min {
+            Some(format!(
+                "quorum: {in_group} of {} co-signers are members of '{group_name}' (need {})",
+                action.cosig.len(),
+                spec.min
+            ))
+        } else {
+            None
+        }
     }
 }
 
@@ -1203,6 +1443,167 @@ mod tests {
         assert!(
             s.quarantined_count() > 0,
             "rejections are counted as quarantined"
+        );
+    }
+
+    #[test]
+    fn verify_valid_doc_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_store(dir.path());
+        let mut fields: BM<String, serde_json::Value> = BM::new();
+        fields.insert("title".into(), "hello".into());
+        s.create_doc("v1", fields).unwrap();
+        s.update_field("v1", "body", serde_json::json!("world")).unwrap();
+        s.update_field("v1", "body", serde_json::json!("world2")).unwrap();
+        let report = s.verify("v1").unwrap();
+        assert!(
+            report.ok,
+            "a valid log verifies clean: {:?}",
+            report.actions
+        );
+        assert_eq!(report.actions.len(), 4, "create + set + two updates");
+        assert!(report.actions.iter().all(|a| a.problems.is_empty()));
+        assert!(!report.from_snapshot, "a small doc has no snapshot");
+        let rendered = report.render();
+        assert!(rendered.contains("verify v1"));
+        assert!(rendered.contains("VERIFIED"));
+    }
+
+    #[test]
+    fn verify_cosigned_action_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_store(dir.path());
+        let k_alice = identity(1);
+        let k_bob = identity(2);
+        let k_carol = identity(3);
+        for (name, k) in [("alice", &k_alice), ("bob", &k_bob), ("carol", &k_carol)] {
+            s.register_peer_key(name, k.verifying_key().to_bytes());
+        }
+        let id = DocId::new();
+        let init = make_group_action(
+            id,
+            "init",
+            serde_json::json!({
+                "name": "core",
+                "members": ["alice", "bob", "carol"],
+                "managers": ["alice"],
+            }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 1),
+            1000,
+        );
+        s.apply_remote_action(&init).unwrap();
+        let mut add = make_group_action(
+            id,
+            "add-manager",
+            serde_json::json!({ "member": "bob" }),
+            "alice",
+            &k_alice,
+            &[("bob".into(), &k_bob), ("carol".into(), &k_carol)],
+            clock1("alice", 2),
+            2000,
+        );
+        // Chain to the init action and re-sign: prev_hash is part of the
+        // signed message, so the origin and every co-signer must re-sign.
+        add.prev_hash = Some(init.hash());
+        let mb = add.message_bytes();
+        add.sig = k_alice.sign(&mb).to_bytes();
+        add.cosig[0].sig = k_bob.sign(&mb).to_bytes();
+        add.cosig[1].sig = k_carol.sign(&mb).to_bytes();
+        s.apply_remote_action(&add).unwrap();
+        let report = s.verify("core").unwrap();
+        assert!(
+            report.ok,
+            "a cosigned doc verifies clean: {:?}",
+            report.actions
+        );
+        let add = report.actions.iter().find(|a| a.kind == "add-manager").unwrap();
+        assert!(
+            add.ok,
+            "the co-signatures check out: {:?}",
+            add.problems
+        );
+        let m = report.model.as_ref().expect("the model is reported");
+        assert_eq!(m.name, "group");
+    }
+
+    #[test]
+    fn verify_flags_tampered_signature() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = open_store(dir.path());
+            let mut fields: BM<String, serde_json::Value> = BM::new();
+            fields.insert("title".into(), "hello".into());
+            s.create_doc("v1", fields).unwrap();
+            let alog = s.wal_path(&s.get("v1").unwrap().id);
+            let mut lines: Vec<Action> = std::fs::read_to_string(&alog)
+                .unwrap()
+                .lines()
+                .filter(|l| !l.trim().is_empty())
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            lines[0].sig[0] ^= 0xff; // corrupt the genesis action's signature
+            let mut out = String::new();
+            for a in &lines {
+                out.push_str(&serde_json::to_string(a).unwrap());
+                out.push('\n');
+            }
+            std::fs::write(&alog, out).unwrap();
+        }
+        // The open-time replay re-reduces the log but trusts its signatures;
+        // `verify` is the independent audit that catches the corruption.
+        let s = open_store(dir.path());
+        let report = s.verify("v1").unwrap();
+        assert!(!report.ok, "a tampered signature is flagged");
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|a| a.problems.iter().any(|p| p.contains("signature"))),
+            "the bad signature is named: {:?}",
+            report.actions
+        );
+    }
+
+    #[test]
+    fn verify_flags_broken_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let s = open_store(dir.path());
+            let mut fields: BM<String, serde_json::Value> = BM::new();
+            fields.insert("title".into(), "hello".into());
+            s.create_doc("v1", fields).unwrap();
+            s.update_field("v1", "body", serde_json::json!("world")).unwrap();
+            let alog = s.wal_path(&s.get("v1").unwrap().id);
+            let mut lines: Vec<Action> = std::fs::read_to_string(&alog)
+                .unwrap()
+                .lines()
+                .map(|l| serde_json::from_str(l).unwrap())
+                .collect();
+            // Break the chain: the second action's prev_hash no longer
+            // matches the first action's content hash. Re-sign so the
+            // signature is still valid - only the chain is broken.
+            lines[1].prev_hash = Some(Hash32::of(b"tampered"));
+            lines[1].sign(&identity(9));
+            let mut out = String::new();
+            for a in &lines {
+                out.push_str(&serde_json::to_string(a).unwrap());
+                out.push('\n');
+            }
+            std::fs::write(&alog, out).unwrap();
+        }
+        let s = open_store(dir.path());
+        let report = s.verify("v1").unwrap();
+        assert!(!report.ok, "a broken chain is flagged");
+        assert!(
+            report
+                .actions
+                .iter()
+                .any(|a| a.problems.iter().any(|p| p.contains("chain"))),
+            "the chain break is named: {:?}",
+            report.actions
         );
     }
 }
