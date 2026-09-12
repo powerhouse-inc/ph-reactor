@@ -525,6 +525,25 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
                 let _ = reply.send(Err(e));
             }
         },
+        Command::CreateAction {
+            name,
+            model,
+            kind,
+            payload,
+            reply,
+        } => match crate::doc::ModelRef::parse(&model).and_then(|mr| {
+            ctx.store.apply_local_action(&name, &mr, &kind, &payload)
+        }) {
+            Ok(action) => {
+                tracing::info!("applied {kind} action to '{name}'");
+                ctx.last_event = Some(format!("applied {kind} to '{name}'"));
+                let _ = reply.send(Ok(action));
+            }
+            Err(e) => {
+                tracing::warn!("model action '{kind}' on '{name}' failed: {e}");
+                let _ = reply.send(Err(e));
+            }
+        },
         Command::Quit => {
             tracing::info!("quit requested");
             ctx.stopping = true;
@@ -1150,6 +1169,48 @@ pub async fn doc_command(state_dir: Option<&Path>, cmd: crate::cli::DocCommand) 
             } else {
                 let text = r.text().await.unwrap_or_default();
                 bail!("daemon rejected the doc: {status} {text}")
+            }
+        }
+        DocCommand::Verify { name } => {
+            let store = open_local_store(&paths)?;
+            let report = store.verify(&name).map_err(anyhow::Error::msg)?;
+            print!("{}", report.render());
+            if report.ok {
+                Ok(())
+            } else {
+                bail!("verification failed for '{name}'")
+            }
+        }
+        DocCommand::Action {
+            name,
+            kind,
+            payload,
+            model,
+        } => {
+            if !daemon_is_running(&paths.daemon_pidfile()) {
+                bail!("the daemon is not running — start it (ph-reactor) and retry: model actions are applied through the daemon so they reach the sync mesh");
+            }
+            let payload_val: serde_json::Value =
+                serde_json::from_str(&payload).with_context(|| "the --payload must be JSON")?;
+            let config = config::load(&paths)?;
+            let url = format!(
+                "http://{}:{}/api/docs/action",
+                config.settings.host, config.settings.port
+            );
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()?;
+            let body = serde_json::json!({
+                "name": name, "kind": kind, "payload": payload_val, "model": model
+            });
+            let r = client.post(&url).json(&body).send().await?;
+            let status = r.status();
+            if status.is_success() {
+                println!("applied {kind} to '{name}'");
+                Ok(())
+            } else {
+                let text = r.text().await.unwrap_or_default();
+                bail!("daemon rejected the action: {status} {text}")
             }
         }
     }

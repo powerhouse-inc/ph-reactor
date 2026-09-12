@@ -37,6 +37,17 @@ pub enum Command {
         fields: BTreeMap<String, Value>,
         reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
+    /// Build, sign (the daemon's own key), and apply a model action to an
+    /// existing local doc, publishing it to the mesh. Synchronous, like
+    /// `CreateDoc`: the sender awaits the applied action on `reply`.
+    CreateAction {
+        name: String,
+        /// The governing model, as a `name@version` ref.
+        model: String,
+        kind: String,
+        payload: Value,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<crate::action::Action, String>>,
+    },
     /// Update a dotted config key (validated by `config::set`).
     SetConfig { key: String, value: Value },
     /// Stop the daemon.

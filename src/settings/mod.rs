@@ -62,6 +62,7 @@ impl Settings {
             .route("/api/config", post(set_config))
             .route("/api/quit", post(quit))
             .route("/api/docs", post(add_doc))
+            .route("/api/docs/action", post(action_doc))
             .with_state(Arc::new(self));
         let task = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
@@ -257,6 +258,60 @@ async fn add_doc(
             (status, e).into_response()
         }
         _ => (StatusCode::SERVICE_UNAVAILABLE, "doc creation timed out").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct ActionBody {
+    name: String,
+    kind: String,
+    payload: serde_json::Value,
+    #[serde(default)]
+    model: String,
+}
+
+/// Synchronous model-action application (like `add_doc`): the daemon builds
+/// and signs a model action with its own key and applies it, publishing to
+/// the mesh. The CLI awaits the applied action through a one-shot channel.
+async fn action_doc(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<ActionBody>,
+) -> Response {
+    if !valid_name(&body.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "doc name may be any characters except '/' (max 64)",
+        )
+            .into_response();
+    }
+    let model = if body.model.trim().is_empty() {
+        "open@1".to_string()
+    } else {
+        body.model.clone()
+    };
+    let (reply, wait) = oneshot::channel();
+    let cmd = Command::CreateAction {
+        name: body.name,
+        model,
+        kind: body.kind,
+        payload: body.payload,
+        reply,
+    };
+    if state.cmd_tx.send(cmd).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(Ok(Ok(action))) => {
+            let json = serde_json::to_value(&action)
+                .unwrap_or_else(|_| serde_json::json!({ "ok": true }));
+            (StatusCode::OK, axum::Json(json)).into_response()
+        }
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "model action timed out").into_response(),
     }
 }
 // ---------------------------------------------------------------------------

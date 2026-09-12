@@ -105,6 +105,22 @@ pub enum DocCommand {
         #[arg(long = "field", value_name = "KEY=VALUE")]
         fields: Vec<String>,
     },
+    /// Verify a document's action log: replay and re-check every signature,
+    /// co-signature, the hash chain, and the reduced field map. Read-only.
+    Verify { name: String },
+    /// Build, sign, and apply a model action to a local document. The daemon
+    /// must be running: the action is published to the sync mesh.
+    Action {
+        name: String,
+        /// The reducer kind to invoke (e.g. `add-manager`, `add-member`).
+        kind: String,
+        /// The action payload as a JSON object.
+        #[arg(long)]
+        payload: String,
+        /// The governing model (name@version). Defaults to `open@1`.
+        #[arg(long, default_value = "open@1")]
+        model: String,
+    },
 }
 #[derive(Subcommand, Debug, Clone)]
 pub enum ConfigCommand {
