@@ -1,9 +1,9 @@
 [package]
 name = "ph-reactor"
-version = "0.2.0"
+version = "1.0.0"
 edition = "2021"
-rust-version = "1.80"
-description = "Run a local Powerhouse switchboard in the background with a status-bar tray icon and configurable remote-drive sync"
+rust-version = "1.83"
+description = "Native event-sourced document store and libp2p drive sync, running as a status-bar background daemon"
 license = "SEE LICENSE IN LICENSE"
 
 [lib]
@@ -50,6 +50,21 @@ hex = "0.4"
 libc = "0.2"
 url = "2"
 semver = "1"
+ed25519-dalek = "2"
+uuid = { version = "1", features = ["v4", "serde"] }
+libp2p = { version = "0.56", default-features = false, features = [
+  "tokio",
+  "tcp",
+  "noise",
+  "yamux",
+  "gossipsub",
+  "mdns",
+  "ed25519",
+  "request-response",
+] }
+
+[features]
+quic = ["libp2p/quic"]
 
 [dev-dependencies]
 tempfile = "3"
