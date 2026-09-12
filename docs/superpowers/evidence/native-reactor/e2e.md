@@ -97,10 +97,64 @@ updates it → A has the update, clean shutdown of both.
    now drains it and publishes each op to `ph-reactor/docs/1.0.0`
    (5 s cadence; 30 s per-drive summary/catch-up reconciliation
    unchanged).
+6. **Daemonized child failures were invisible.** Two parts: the child's
+   error was swallowed (`run_inner`'s `Err` mapped to a bare exit code),
+   and the parent's liveness check used `kill(pid, 0)`, which answers
+   *true for a zombie* — so a child that died early (the trigger
+   here: both instances defaulting to settings port 4002; the second
+   failed the bind) sat as a zombie while the parent waited out the
+   full 30 s timeout with nothing to show. Now: the child writes its
+   fatal error to `logs/stderr.log` (and `reactor.log`) and exits 1;
+   the parent reaps with a non-blocking `waitpid` (dead children are
+   detected instantly, with their exit status) and prints the log
+   tails on any failure; a settings-port pre-check fails fast with an
+   actionable message. The failure that took a whole session to
+   diagnose now reports in 0.28 s: `settings port 4002 … already in
+   use (change settings.port in the config)`.
+7. **Hello handshake race on late drive adds.** A's dial reached B
+   before B had a drive for A: B's `serve_request(Hello)` had no drive
+   to mark, so B's half of the handshake never completed — and B's
+   later `AddDrive` dial found the peer *already connected*, so no new
+   `ConnectionEstablished` fired to open it. B's drive sat in
+   `connecting (dialing)` indefinitely while docs still flowed over A's
+   connection. Now: peers that presented a valid hello are remembered
+   (`guests`), a later `AddDrive` for such a peer completes the
+   handshake immediately, and `AddDrive`/`ConnectionEstablished` share
+   an `open_handshake` helper that also fires on an already-connected
+   peer. Regression: `drive_added_after_peer_already_connected_completes_handshake`
+   (one-sided handshake first, late drive add second, then full
+   bidirectional doc propagation).
+
+
+## Live two-binary E2E: late drive add and pre-link docs
+
+Fresh state dirs (`/tmp/ph-e2e-1`, `/tmp/ph-e2e-2`), fresh identities,
+both daemonized. Steps, in order:
+
+1. `doc add` on B **before any link existed** (`note-from-two`, with a
+   JSON-object field `payload` mimicking a knowledge-note document
+   model: nested string, number, and array values).
+2. `drive add` on each side with the other's `/ip4/127.0.0.1/tcp/<port>/p2p/<peer>`
+   (live, against the running daemons — not pre-configured).
+3. A's drive reached `synced` and pulled `note-from-two` via
+   catch-up; the JSON field arrived byte-exact (`"score": 7` still a
+   number, array intact) — the receiving side had no prior notion of
+   the doc's shape; there is no document-model registry to fail
+   against, the field map is open.
+4. Post-link `doc add` on each side: `note-from-one` (nested object
+   field) and `note-two-v2` both appeared on the other side with
+   identical doc UUIDs (same documents, not copies).
+5. Both daemons stopped and restarted: all three docs survived
+   (WAL replay) and both drives re-handshook to `synced` within the
+   first reconcile window; `doc list` output identical on both sides
+   (`diff` clean).
+
+The handshake race this run exposed is bug 7 above; the daemonize
+failure behind the earlier "hangs" is bug 6.
 
 ## Suites
 
-- `cargo test`: 44 unit + 1 integration — all pass.
+- `cargo test`: 44 unit + 2 integration — all pass.
 - `cargo clippy --all-targets -- -D warnings` — clean; `cargo fmt --check` — clean.
 
 ## Not verified here (deferred)
