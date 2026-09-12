@@ -109,3 +109,79 @@ Acceptance: plugin `tests/run` green against v2 output.
 
 Full `cargo test` + clippy + fmt, release build size recorded (vs
 v0.2.0: libp2p cost), E2E evidence file, SDD reports per task.
+
+## v1.1 — document models and full P2P
+
+Spec: the "Extension" section of
+`../specs/2026-09-12-native-reactor-design.md`.
+
+## Task 9 — Action envelope + model foundation
+
+DONE. `doc.rs`: `Hash32`, `ModelRef` (`name@version[#hash]`); `action.rs`:
+`Action` (signed envelope incl. the vector clock, model ref, `cosig`,
+`prev_hash`) + `CoSig`; `model/mod.rs`: `Model` trait (`validate_payload` /
+`check_precondition` / `reduce` / `check_state`) + `Reject` + `ModelRegistry`.
+The v1 `Op` is retained as the field-write primitive a model reduces to.
+Acceptance: sign/verify/cosig/hash round-trip tests; `cargo check` clean.
+
+## Task 10 — `open@1` + action-log store
+
+`model/open.rs`: `open@1` (`set`/`delete`) reduces 1:1 to the v1 field-writes —
+byte-identical for pre-model docs. Rework `store.rs`: the per-doc WAL becomes
+the **action log** (`Entry.log: Vec<Action>`); replay reduces each action
+through its model into field-writes and feeds the (unchanged) per-field LWW;
+the snapshot stores the reduced field map + clocks + the chain hash. `doc add`
+builds an `open@1` action; `drain_outbound` / `catch_up` derive ops.
+Acceptance: the existing 44 unit + 2 integration tests stay green; new test:
+action-log replay reproduces the op-based state.
+
+## Task 11 — L1 declarative interpreter + group model + quorum
+
+`model/l1.rs`: a JSON model definition interpreted by one fixed engine over a
+small vocabulary (typed fields; write templates over `$actor`/`$ts`/
+`$payload.*`; a precondition DSL incl. `actor-in-group`, `field-is|not`, named
+checks, and `quorum {group, min}`). `model/group.rs`: the built-in `group`
+model (`members`/`managers`; `add-member`/`remove-member`/`add-manager`;
+`add-manager` quorum-gated for the two-person rule). Quorum = N distinct valid
+co-signers in the group.
+Acceptance: unit tests — payload schema, precondition (quorum pass/fail,
+distinctness), reduce to expected field-writes, group membership, tamper.
+
+## Task 12 — `doc action` / `doc verify` + verify engine
+
+`doc action <name> <kind> --payload <json> [--cosign <peer> …]` (daemon path,
+like `doc add`) and `doc verify <name>` (read-only store): replay the action
+log — re-reduce every action, verify every signature (origin + cosig), every
+precondition, the hash chain, and that the re-folded field map equals the
+stored one — and print the human-readable audit report.
+Acceptance: a happy-path verify prints `VERIFIED`; a tampered action (bad sig /
+broken chain / failed precondition) is flagged line-by-line.
+
+## Task 13 — Full P2P transport
+
+Cargo: + `libp2p/{kademlia,identify,relay}`. `p2p/mod.rs`: Kademlia DHT (peer
+routing + provider records + name records), relay v2 (client **and** server),
+`identify`; bootstrap list in config. Wire becomes **action-aware** (protocol
+`/ph-reactor/sync/2.0.0`, topic `ph-reactor/docs/2.0.0`): `ActionMsg` carries
+the action + its reduced ops (so a peer without the model still converges the
+field map). TOFU key pinning (first key pinned; mismatch flagged). Group-scoped
+name records (signed by the group, resolvable only by members).
+Acceptance: in-process 3-peer over loopback with one relay-mediated hop; DHT
+provider lookup returns a model provider; a banned peer is refused.
+
+## Task 14 — Invites (one-shot handshake)
+
+`ph-reactor invite` (one-shot string: peer ID + signed challenge + granted
+groups) and `ph-reactor join <string>` (respond with peer ID + signed
+challenge). Both sides pin each other (TOFU); the signed `group` doc records
+the membership; per-topic gossip membership propagates. Local ban lists
+(`ph-reactor ban <peer>`).
+Acceptance: two fresh peers exchange an invite string and sync, the invite
+appearing as a signed action in the group doc; a banned peer is refused.
+
+## Task 15 — N-peer E2E + evidence
+
+E2E: N peers (>= 5) with a mix of direct and relay-mediated links, DHT
+discovery, per-process topics, and an invite-driven join; converge a model doc
++ a group doc; `doc verify` on a joining peer reproduces the report. Evidence
+under `docs/superpowers/evidence/native-reactor/`; SDD reports.

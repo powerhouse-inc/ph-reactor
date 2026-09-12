@@ -235,3 +235,109 @@ installs; Windows/macOS.
 | `src/` | + `doc.rs`, `store.rs`, `p2p/`; rewritten `daemon.rs`, `drives.rs`, `cli.rs`, `config.rs`, `status.rs`; deleted `bootstrap/`, `mcp.rs`, `registry.rs`, `supervisor.rs` (folded into daemon) |
 | `README.md` | architecture section rewritten (one process, p2p drives, multiaddr syntax, token gates, security notes) |
 | Omarchy plugin | contract unchanged; fixture/status cross-check in its test suite |
+
+## Extension: document models and full P2P (v1.1)
+
+This section supersedes the v1 "deferred scope" (DHT, registry-of-keys) with a
+deliberate full-P2P design, and adds a model layer that turns the store from a
+field-map sync engine into an auditable, model-governed document system.
+Motivated by rescuing the open-source project as a scalable,
+internet-connected network organization with distinct business processes.
+
+### Design invariants
+
+- **One mechanism.** Documents, groups, and models are all signed actions in
+  replicated, hash-chained logs. There is no separate "directory": a group is
+  a document, a model is a signed artifact, and membership is an action.
+- **Name = sugar, key = identity, action = signed.** No capability, group
+  membership, or doc state may be granted on the basis of a name. Names are
+  cosmetic labels over peer IDs; security comes from ed25519 keys.
+- **A model is a pure function.** `reduce(state, action) -> field-writes` has
+  no I/O, clock, or RNG, so a document's log replays identically on every
+  peer. State stays the v1 per-field LWW map; reducers are the audited gate in
+  front of it.
+- **A document is self-contained evidence.** It pins its model by
+  `name@version[#hash]`; a doc plus its action log verifies anywhere, against
+  exactly the model it was written under.
+
+### The action envelope (`action.rs`, `doc.rs`)
+
+`Action { doc_id, model: ModelRef, kind, payload, ts, clock, origin, cosig,
+prev_hash, sig }`. `model` is `name@version[#hash]`. `sig` is the origin's
+ed25519 signature over the canonical `message_bytes`, which — unlike the v1
+`Op` — includes the vector clock, the model ref (and its pinned hash), the
+payload, and the co-signers. `prev_hash` is the content hash of the previous
+action in the doc's log, chaining it so any insert/delete/reorder is
+detectable. `cosig` carries N-of-M co-signers for quorum-gated reducers. The
+per-doc action log is the durable WAL; replay reduces each action to
+field-writes and feeds them to the (unchanged) per-field LWW merge.
+
+### Models (`model/`)
+
+`Model` trait: `ref_`, `validate_payload`, `check_precondition`, `reduce`,
+`check_state`. A `ModelRegistry` holds loaded models by `(name, version)`.
+
+- **`open@1`** — the default and backward-compatible model: `set` / `delete`
+  reduce 1:1 to the v1 field-writes, so a pre-model doc behaves
+  byte-identically (a non-breaking rescue).
+- **L1 (declarative)** — one JSON interpreter for all declarative models:
+  `{ name, version, state: { fields }, reducers: { kind: { payload, writes,
+  pre } } }`, interpreted over a fixed, auditable vocabulary (a small type set;
+  write templates over `$actor`/`$ts`/`$payload.*`; a precondition DSL with
+  `actor-in-group`, `field-is|not`, named checks, and `quorum`). No lambdas,
+  no control flow, no I/O.
+- **`group`** — a built-in L1 model: `members` / `managers` with
+  `add-member` / `remove-member` / `add-manager` reducers. Membership is thus
+  a signed, hash-chained, replicated log — time-versioned for free and
+  `doc verify`-able like any document.
+
+### Quorum (N-of-M)
+
+A reducer's `pre` may include `{ "quorum": { "group": <group-ref-or-field>,
+"min": N } }`: the action is valid only if N distinct valid co-signers
+(`cosig`) are members of that group (and distinct from one another). This is
+the primitive behind two-person rules, dual control, and N-of-M approval
+committees — all data, all verified on replay.
+
+### `doc action` / `doc verify`
+
+- `doc action <name> <kind> --payload <json> [--cosign <peer> …]` — build,
+  sign (plus co-sign), and publish an action through the normal op path.
+- `doc verify <name>` — replay the action log: re-reduce every action, verify
+  every signature (origin + co-signers), every precondition, the hash chain,
+  and that the re-folded field map equals the stored one. Prints the
+  human-readable audit report (the legal artifact).
+
+### Full P2P (supersedes the v1 "no DHT" non-goal)
+
+- **Identity:** the ed25519 peer ID (v1). Names are group-scoped, signed, and
+  resolvable only by members — there is no global name namespace to squat.
+- **Discovery:** mDNS (LAN) + a bootstrap list + Kademlia DHT (peer routing,
+  provider records, name records). The bootstrap list is an address list, not
+  a trust authority.
+- **Connectivity:** relay v2 (any peer may run a relay, discovered via DHT
+  provider records) + circuit for NAT traversal; direct hole-punching when
+  NATs cooperate. Identity-only — no IP entry required.
+- **TOFU pinning:** the first key seen for a peer is pinned; a later mismatch
+  is flagged, never silently trusted.
+- **Anti-spam:** closed topics (join only what a signed group admits you to),
+  per-peer rate/relay quotas, and local ban lists (each peer is its own trust
+  authority). Names carry no power, so squatting degrades only the cosmetic
+  layer.
+
+### Invite / join (one-shot handshake)
+
+`invite` produces a one-shot string: the inviter's peer ID + a challenge
+signed by their key + the group(s) being granted. `join <string>` responds
+with the joiner's peer ID + a signed challenge. Both sides pin each other
+(TOFU); the signed `group` doc records the membership; per-topic gossip
+membership propagates. No directory; the string is single-use.
+
+### Phasing
+
+1. **Model core** (topology-independent; lands first): `open@1`, L1, group,
+   quorum, the action-log store, `doc action` / `doc verify`.
+2. **Full transport:** Kademlia + relay + bootstrap; action-aware wire;
+   provider + group-scoped name records; TOFU.
+3. **Invites:** one-shot handshake, per-topic membership, local ban lists.
+4. **Web of trust / B2B** (horizon): orgs sign each other's group-manager keys.

@@ -353,6 +353,149 @@ pub fn apply_op(doc: &mut Doc, clock: &mut VecClock, deleted: &mut bool, op: &Op
     }
 }
 
+
+// ---- content hashing & model references ----------------------------------
+//
+// Added for the model core: an action hashes its content (chaining the
+// per-document log) and references a model by `name@version[#hash]`.
+// These are pure data types shared by the action envelope, the model
+// layer, and the store.
+
+/// A 32-byte SHA-256 digest, serialized as lowercase hex.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub struct Hash32([u8; 32]);
+
+impl Hash32 {
+    /// SHA-256 of `bytes`.
+    pub fn of(bytes: &[u8]) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        let mut out = [0u8; 32];
+        out.copy_from_slice(h.finalize().as_slice());
+        Self(out)
+    }
+
+    pub fn from_hex(s: &str) -> Result<Self, String> {
+        let v = hex::decode(s).map_err(|e| format!("invalid hex: {e}"))?;
+        if v.len() != 32 {
+            return Err(format!("hash must be 32 bytes (got {})", v.len()));
+        }
+        Ok(Self(v.try_into().unwrap()))
+    }
+
+    pub fn as_bytes(&self) -> [u8; 32] {
+        self.0
+    }
+
+    pub fn is_zero(&self) -> bool {
+        self.0 == [0; 32]
+    }
+}
+
+impl Default for Hash32 {
+    fn default() -> Self {
+        Self([0; 32])
+    }
+}
+
+impl fmt::Display for Hash32 {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", hex::encode(self.0))
+    }
+}
+
+impl Serialize for Hash32 {
+    fn serialize<S: serde::Serializer>(&self, s: S) -> Result<S::Ok, S::Error> {
+        s.serialize_str(&hex::encode(self.0))
+    }
+}
+
+impl<'de> Deserialize<'de> for Hash32 {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(d)?;
+        Self::from_hex(&s).map_err(serde::de::Error::custom)
+    }
+}
+
+/// A model reference: `name@version`, optionally content-addressed with
+/// `#<hash>`. Pinned per document so a doc verifies against exactly the
+// model it was written under (a Wasm model pins its module hash; a
+/// declarative model pins the hash of its canonical definition).
+#[derive(Clone, Debug, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+pub struct ModelRef {
+    pub name: String,
+    pub version: String,
+    #[serde(default)]
+    pub hash: Option<Hash32>,
+}
+
+impl ModelRef {
+    pub fn new(name: &str, version: &str) -> Self {
+        Self {
+            name: name.to_string(),
+            version: version.to_string(),
+            hash: None,
+        }
+    }
+
+    /// Parse `name@version[#hash]`.
+    pub fn parse(s: &str) -> Result<Self, String> {
+        let (nv, hash) = match s.split_once('#') {
+            Some((nv, h)) => (
+                nv,
+                Some(Hash32::from_hex(h).map_err(|e| format!("'{s}': {e}"))?),
+            ),
+            None => (s, None),
+        };
+        let (name, version) = nv
+            .rsplit_once('@')
+            .ok_or_else(|| format!("model ref '{s}' must be name@version"))?;
+        if name.is_empty() || version.is_empty() {
+            return Err(format!("model ref '{s}' has an empty name or version"));
+        }
+        Ok(Self {
+            name: name.to_string(),
+            version: version.to_string(),
+            hash,
+        })
+    }
+}
+
+impl fmt::Display for ModelRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}@{}", self.name, self.version)?;
+        if let Some(h) = &self.hash {
+            write!(f, "#{h}")?;
+        }
+        Ok(())
+    }
+}
+
+impl DocId {
+    /// The 16-byte UUID form (for canonical signed/hashed bytes).
+    pub fn as_bytes(&self) -> [u8; 16] {
+        *self.0.as_bytes()
+    }
+}
+
+impl VecClock {
+    /// Build a clock from `(origin, count)` pairs (zero counts dropped).
+    pub fn from_pairs(pairs: &[(String, u64)]) -> Self {
+        let mut m = BTreeMap::new();
+        for (o, n) in pairs {
+            if *n > 0 {
+                m.insert(o.clone(), *n);
+            }
+        }
+        Self(m)
+    }
+
+    /// Entries in canonical (sorted-by-origin) order.
+    pub fn iter(&self) -> impl Iterator<Item = (&Origin, &u64)> {
+        self.0.iter()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;

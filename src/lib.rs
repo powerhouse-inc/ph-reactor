@@ -19,6 +19,7 @@
 //! - [`settings`] — loopback settings page + JSON API
 //! - [`logrotate`] — size-based log rotation
 
+pub mod action;
 pub mod cli;
 pub mod commands;
 pub mod config;
@@ -26,6 +27,7 @@ pub mod daemon;
 pub mod doc;
 pub mod drives;
 pub mod logrotate;
+pub mod model;
 pub mod p2p;
 pub mod paths;
 pub mod settings;
