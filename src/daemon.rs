@@ -56,11 +56,11 @@ pub async fn run(state_dir: Option<&Path>, daemonize: bool) -> Result<()> {
     run_inner(state_dir).await
 }
 
-/// The daemonized start: forks before any tokio runtime exists, so the
-/// child never shares the parent's epoll fd (forking inside a live
-/// runtime corrupts both sides' event loops). The parent waits
-/// synchronously for the child's ready file and exits; the child builds
-/// a fresh runtime and runs the daemon.
+/// The daemonized start. The parent's CLI tokio runtime is still alive
+/// when `fork()` runs; the child inherits its memory (copy-on-write) and
+/// its unused fds but must never touch that runtime — the child builds
+/// and runs an entirely fresh one. The parent waits synchronously for
+/// the child's ready file and exits; the child runs the daemon.
 pub fn run_daemonized(state_dir: Option<&Path>) -> Result<i32> {
     let paths = StatePaths::resolve(state_dir);
     paths
@@ -70,41 +70,55 @@ pub fn run_daemonized(state_dir: Option<&Path>) -> Result<i32> {
     let pid = unsafe { libc::fork() };
     match pid {
         0 => {
-            // Child: detach from the session and the controlling
-            // terminal; stdio goes to /dev/null (the daemon logs to its
-            // rotated file). The parent never started a runtime, so
-            // nothing is inherited that could corrupt a fresh one.
-            detach_stdio();
+            // Child: detach stdio. The daemon logs to its rotated file;
+            // stderr (panics, fatal errors) goes to logs/stderr.log so a
+            // forked daemon cannot fail silently into /dev/null.
+            detach_stdio(&paths.logs_dir.join("stderr.log"));
             let rt = tokio::runtime::Builder::new_multi_thread()
                 .enable_all()
                 .build()
                 .context("starting the daemon runtime")?;
-            let code = rt
-                .block_on(run_inner(state_dir))
-                .err()
-                .map(|_| 1)
-                .unwrap_or(0);
-            Ok(code)
+            match rt.block_on(run_inner(state_dir)) {
+                Ok(()) => Ok(0),
+                Err(err) => {
+                    // A daemonized child has no terminal: the fatal
+                    // error goes to stderr.log (and reactor.log when
+                    // the subscriber is up) or it is lost.
+                    eprintln!("ph-reactor: {err:#}");
+                    if let Some(cause) = err.source() {
+                        eprintln!("  caused by: {cause}");
+                    }
+                    tracing::error!("daemon failed to start: {err:#}");
+                    Ok(1)
+                }
+            }
         }
         child if child > 0 => {
-            // Parent: wait for the ready file while the child is alive.
+            // Parent: wait for the ready file. The child is reaped with
+            // a non-blocking waitpid — kill(pid, 0) would report a dead
+            // child (a zombie) as alive and hide startup failures.
             let ready = paths.run_dir.join("ready");
             let _ = std::fs::remove_file(&ready); // stale
             let deadline = Instant::now() + DAEMONIZE_TIMEOUT;
             while Instant::now() < deadline {
                 if let Ok(content) = std::fs::read_to_string(&ready) {
+                    let _ = reap_child(child);
                     println!("ph-reactor started (pid {})", content.trim());
                     return Ok(0);
                 }
-                if !process_alive(child) {
-                    eprintln!("ph-reactor exited during startup; last log lines:");
-                    if let Ok(tail) = crate::logrotate::tail(&paths.reactor_log(), Some(2048)) {
-                        print!("{tail}");
-                    }
+                if let Some(status) = reap_child(child) {
+                    print_startup_failure(
+                        &paths,
+                        &format!("ph-reactor exited during startup ({status})"),
+                    );
                     return Ok(1);
                 }
                 std::thread::sleep(Duration::from_millis(200));
             }
+            print_startup_failure(
+                &paths,
+                &format!("daemon did not become ready within {DAEMONIZE_TIMEOUT:?}"),
+            );
             bail!("daemon did not become ready within {DAEMONIZE_TIMEOUT:?}");
         }
         _ => bail!("fork failed"),
@@ -144,6 +158,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     let listen = Multiaddr::from_str(&config.instance.listen)
         .with_context(|| format!("config instance.listen ({})", config.instance.listen))?;
     check_listen_port(&listen)?;
+    check_settings_port(&config.settings.host, config.settings.port)?;
 
     // The doc store (snapshots + live logs under <state>/docs).
     let store =
@@ -710,14 +725,30 @@ fn degraded_snapshot(config: &ReactorConfig, settings_url: &str) -> StatusSnapsh
 // Daemonization + single-instance lock
 // ---------------------------------------------------------------------------
 
-/// Redirects stdin/stdout/stderr to /dev/null (daemon child).
-fn detach_stdio() {
-    let path = b"/dev/null\0";
-    let devnull = unsafe { libc::open(path.as_ptr() as *const i8, libc::O_RDWR) };
+/// Redirects the daemon child's stdio: stdin/stdout to /dev/null, stderr
+/// to `stderr_path` (appended), so panics and fatal errors stay readable.
+fn detach_stdio(stderr_path: &Path) {
+    let null_path = b"/dev/null\0";
+    let devnull = unsafe { libc::open(null_path.as_ptr() as *const i8, libc::O_RDWR) };
     if devnull < 0 {
         return;
     }
-    for fd in [0, 1, 2] {
+    let mut null_terminated = stderr_path.to_string_lossy().into_owned().into_bytes();
+    null_terminated.push(0);
+    let stderr = unsafe {
+        libc::open(
+            null_terminated.as_ptr() as *const i8,
+            libc::O_RDWR | libc::O_CREAT | libc::O_APPEND,
+            0o644,
+        )
+    };
+    if stderr >= 0 {
+        unsafe {
+            libc::dup2(stderr, 2);
+            libc::close(stderr);
+        }
+    }
+    for fd in [0, 1] {
         unsafe {
             libc::dup2(devnull, fd);
         }
@@ -727,11 +758,46 @@ fn detach_stdio() {
     }
 }
 
+/// Prints the tail of the reactor log and the child's stderr log when a
+/// daemonized start fails, so the failure is not lost in the fork.
+fn print_startup_failure(paths: &StatePaths, message: &str) {
+    eprintln!("{message}");
+    if let Ok(tail) = crate::logrotate::tail(&paths.reactor_log(), Some(2048)) {
+        eprintln!("-- last reactor log:");
+        print!("{tail}");
+    }
+    let stderr = paths.logs_dir.join("stderr.log");
+    if stderr.is_file() {
+        if let Ok(tail) = crate::logrotate::tail(&stderr, Some(2048)) {
+            eprintln!("-- last child stderr:");
+            print!("{tail}");
+        }
+    }
+}
+
 fn process_alive(pid: i32) -> bool {
     if pid <= 0 {
         return false;
     }
     unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Non-blocking `waitpid` for a child we forked: `Some(status)` with a
+/// human-readable exit status once the child is reaped, `None` while it
+/// still runs. Unlike kill(pid, 0), this distinguishes a dead child from
+/// a live one (a zombie still answers kill 0).
+fn reap_child(pid: i32) -> Option<String> {
+    let mut status: libc::c_int = 0;
+    if unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) } != pid {
+        return None;
+    }
+    if libc::WIFEXITED(status) {
+        Some(format!("exit code {}", libc::WEXITSTATUS(status)))
+    } else if libc::WIFSIGNALED(status) {
+        Some(format!("killed by signal {}", libc::WTERMSIG(status)))
+    } else {
+        Some("unknown".to_string())
+    }
 }
 
 /// Takes the single-instance lock (`flock`, exclusive, non-blocking) and
@@ -782,6 +848,19 @@ fn check_listen_port(addr: &Multiaddr) -> Result<()> {
         Err(e) => {
             bail!(
                 "listen port {port} is already in use: {e} (change instance.listen in the config)"
+            )
+        }
+    }
+}
+
+/// Fails fast when the configured settings port is already taken by
+/// another process (the common case: two daemons defaulting to 4002).
+fn check_settings_port(host: &str, port: u16) -> Result<()> {
+    match std::net::TcpListener::bind((host, port)) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            bail!(
+                "settings port {port} on {host} is already in use: {e} (change settings.port in the config)"
             )
         }
     }
