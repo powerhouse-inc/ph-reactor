@@ -83,11 +83,11 @@ impl Sni {
         "Communication"
     }
 
-    /// Active while the switchboard is healthy; Attention otherwise.
+    /// Active while the reactor is healthy; Attention otherwise.
     #[zbus(property)]
     fn status(&self) -> &str {
         let s = self.state.lock();
-        if s.snapshot.switchboard.healthy {
+        if s.snapshot.reactor.healthy {
             "Active"
         } else {
             "Attention"
@@ -98,7 +98,7 @@ impl Sni {
     #[zbus(property)]
     fn icon_name(&self) -> &str {
         let s = self.state.lock();
-        if s.snapshot.switchboard.healthy {
+        if s.snapshot.reactor.healthy {
             "network-server"
         } else {
             "dialog-warning"
@@ -124,11 +124,11 @@ impl Sni {
     #[zbus(property)]
     fn tool_tip(&self) -> String {
         let s = self.state.lock();
-        let sb = &s.snapshot.switchboard;
+        let r = &s.snapshot.reactor;
         format!(
-            "<b>ph-reactor</b> — switchboard {} (port {})",
-            if sb.healthy { "healthy" } else { "not ready" },
-            sb.port
+            "<b>ph-reactor</b> — {} ({} docs)",
+            if r.healthy { "syncing" } else { "not ready" },
+            r.docs
         )
     }
 
@@ -375,7 +375,7 @@ async fn run(
                     break;
                 }
                 let snap = rx_snap.borrow_and_update().clone();
-                let healthy = snap.switchboard.healthy;
+                let healthy = snap.reactor.healthy;
                 {
                     let mut st = state.lock();
                     st.snapshot = snap.clone();

@@ -1,40 +1,42 @@
-//! `ph-reactor` — run a local Powerhouse switchboard in the background.
+//! `ph-reactor` — the native Powerhouse reactor: an event-sourced
+//! document store with libp2p drive sync, running as a status-bar
+//! background daemon.
 //!
 //! Modules:
-//! - [`config`] — `~/.ph/reactor/config.json` load/save/defaults
+//! - [`config`] — `<state>/config.json` load/save/defaults
 //! - [`paths`] — state directory layout
 //! - [`cli`] — argument parsing
-//! - [`daemon`] — run/daemonize lifecycle, locking, shutdown
-//! - [`bootstrap`] — Node runtime + switchboard package installation
-//! - [`supervisor`] — switchboard process lifecycle (spawn, health, backoff)
-//! - [`mcp`] — Streamable-HTTP MCP client (the switchboard's `/mcp` endpoint)
-//! - [`drives`] — remote drive management (add/remove/pause/resume, status)
-//! - [`registry`] — Powerhouse package registry checks
+//! - [`daemon`] — run/daemonize lifecycle, locking, shutdown, CLI ops
+//! - [`store`] — the native doc store (snapshots + live logs, signed
+//!   ops, vector clocks)
+//! - [`doc`] — the doc/op/clock model (shared by the store and p2p)
+//! - [`p2p`] — the libp2p sync engine (gossipsub + hello/catch-up +
+//!   mDNS) and the daemon identity
+//! - [`drives`] — drive config + status vocabulary
+//! - [`status`] — the shared status snapshot (tray, settings, CLI)
+//! - [`commands`] — the daemon's command channel vocabulary
 //! - [`tray`] — StatusNotifierItem + DBusMenu (session bus, no GTK)
 //! - [`settings`] — loopback settings page + JSON API
 //! - [`logrotate`] — size-based log rotation
 
-pub mod bootstrap;
 pub mod cli;
-pub mod doc;
 pub mod commands;
 pub mod config;
 pub mod daemon;
+pub mod doc;
 pub mod drives;
 pub mod logrotate;
-pub mod mcp;
+pub mod p2p;
 pub mod paths;
-pub mod registry;
 pub mod settings;
 pub mod status;
 pub mod store;
-pub mod supervisor;
 pub mod tray;
 
 pub const APP_NAME: &str = "Powerhouse Reactor";
 
-/// The running binary's version (shared by the binary and the lib so the
-/// MCP `clientInfo` and the settings page agree).
+/// The running binary's version (shared by the binary and the lib so
+/// the settings page and `ph-reactor status` agree).
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Shared error type for library-level failures. App-level (`anyhow`)
@@ -44,17 +46,11 @@ pub enum Error {
     #[error("io: {0}")]
     Io(#[from] std::io::Error),
 
-    #[error("http {status} from {url}")]
-    Http { status: u16, url: String },
-
     #[error("json: {0}")]
     Json(#[from] serde_json::Error),
 
     #[error("config: {0}")]
     Config(#[from] config::ConfigError),
-
-    #[error("network: {0}")]
-    Network(String),
 
     #[error("{0}")]
     Other(String),

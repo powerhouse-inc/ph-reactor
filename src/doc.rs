@@ -130,7 +130,11 @@ impl Doc {
             .filter(|(_, f)| !f.deleted)
             .map(|(k, f)| (k.clone(), f.clone()))
             .collect();
-        Doc { id: self.id, name: self.name.clone(), fields }
+        Doc {
+            id: self.id,
+            name: self.name.clone(),
+            fields,
+        }
     }
 }
 
@@ -216,7 +220,8 @@ fn sig_ser<S: serde::Serializer>(sig: &[u8; 64], s: S) -> Result<S::Ok, S::Error
 fn sig_de<'de, D: serde::Deserializer<'de>>(d: D) -> Result<[u8; 64], D::Error> {
     let s = String::deserialize(d)?;
     let v = hex::decode(&s).map_err(serde::de::Error::custom)?;
-    v.try_into().map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))
+    v.try_into()
+        .map_err(|_| serde::de::Error::custom("signature must be 64 bytes"))
 }
 
 /// The canonical byte form an op is signed over:
@@ -299,16 +304,14 @@ fn field_from_op(op: &Op) -> Field {
 ///
 /// The doc-level [`VecClock`] is a running union of everything seen —
 /// used by the sync protocol, not for merge decisions.
-pub fn apply_op(
-    doc: &mut Doc,
-    clock: &mut VecClock,
-    deleted: &mut bool,
-    op: &Op,
-) -> ApplyResult {
+pub fn apply_op(doc: &mut Doc, clock: &mut VecClock, deleted: &mut bool, op: &Op) -> ApplyResult {
     clock.merge(&op.clock);
     if *deleted {
         // Terminal: ignore post-deletion work for this doc id.
-        return ApplyResult { applied: false, doc_deleted: true };
+        return ApplyResult {
+            applied: false,
+            doc_deleted: true,
+        };
     }
     let (applied, doc_deleted) = match &op.key {
         None => {
@@ -344,7 +347,10 @@ pub fn apply_op(
             (changed, false)
         }
     };
-    ApplyResult { applied, doc_deleted }
+    ApplyResult {
+        applied,
+        doc_deleted,
+    }
 }
 
 #[cfg(test)]
@@ -420,21 +426,13 @@ mod tests {
     #[test]
     fn op_signature_valid_wrong_key_tampered() {
         let (ka, a) = origin(1);
-        let (kb, b) = origin(2);
+        let (kb, _b) = origin(2);
         let id = DocId::new();
-        let mut op = make_op(
-            id,
-            &ka,
-            &a,
-            Some("title"),
-            Some("hello".into()),
-            1,
-            {
-                let mut c = VecClock::default();
-                c.tick(&a);
-                c
-            },
-        );
+        let mut op = make_op(id, &ka, &a, Some("title"), Some("hello".into()), 1, {
+            let mut c = VecClock::default();
+            c.tick(&a);
+            c
+        });
         assert!(op.verify(&ka.verifying_key()));
         assert!(!op.verify(&kb.verifying_key()));
         // tamper the value
@@ -449,7 +447,11 @@ mod tests {
         let mut c = VecClock::default();
         c.tick(&a);
         let op = make_op(id, &ka, &a, Some("k"), Some(1i64.into()), 1, c);
-        let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+        let mut doc = Doc {
+            id,
+            name: "n".into(),
+            fields: Default::default(),
+        };
         let mut rclock = VecClock::default();
         let mut deleted = false;
         let r1 = apply_op(&mut doc, &mut rclock, &mut deleted, &op);
@@ -474,7 +476,11 @@ mod tests {
         let op_b = make_op(id, &kb, &b, Some("f"), Some("from-b".into()), 7, cb);
 
         for order in [vec![&op_a, &op_b], vec![&op_b, &op_a]] {
-            let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+            let mut doc = Doc {
+                id,
+                name: "n".into(),
+                fields: Default::default(),
+            };
             let mut rclock = VecClock::default();
             let mut deleted = false;
             for op in order {
@@ -504,7 +510,11 @@ mod tests {
         let op_b = make_op(id, &kb, &b, Some("f"), Some("from-b".into()), 7, cb);
 
         for order in [vec![&op_a, &op_b], vec![&op_b, &op_a]] {
-            let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+            let mut doc = Doc {
+                id,
+                name: "n".into(),
+                fields: Default::default(),
+            };
             let mut rclock = VecClock::default();
             let mut deleted = false;
             for op in order {
@@ -525,15 +535,7 @@ mod tests {
         // Shared history: one op from a.
         let mut base = VecClock::default();
         base.tick(&a);
-        let shared = make_op(
-            id,
-            &ka,
-            &a,
-            Some("x"),
-            Some(1i64.into()),
-            1,
-            base,
-        );
+        let shared = make_op(id, &ka, &a, Some("x"), Some(1i64.into()), 1, base);
 
         // Fork A (origin a) and Fork B (origin b) diverge from the
         // same base and observe each other as they go (merged clocks).
@@ -596,7 +598,11 @@ mod tests {
         }
 
         let run = |first: &[Op], second: &[Op]| {
-            let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+            let mut doc = Doc {
+                id,
+                name: "n".into(),
+                fields: Default::default(),
+            };
             let mut clock = VecClock::default();
             let mut deleted = false;
             apply_op(&mut doc, &mut clock, &mut deleted, &shared);
@@ -651,11 +657,23 @@ mod tests {
         };
         let mut op4 = {
             rclock.tick(&a);
-            make_op(id, &ka, &a, Some("k"), Some(99i64.into()), 4, rclock.clone())
+            make_op(
+                id,
+                &ka,
+                &a,
+                Some("k"),
+                Some(99i64.into()),
+                4,
+                rclock.clone(),
+            )
         };
         let _ = (&mut op1, &mut op2, &mut op3, &mut op4);
 
-        let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+        let mut doc = Doc {
+            id,
+            name: "n".into(),
+            fields: Default::default(),
+        };
         let mut deleted = false;
         let r1 = apply_op(&mut doc, &mut rclock, &mut deleted, &op1);
         assert!(r1.applied);
@@ -689,7 +707,11 @@ mod tests {
         let op_b = make_op(id, &kb, &b, Some("f"), Some("b".into()), 5, cb);
 
         for order in [vec![&op_a, &op_b], vec![&op_b, &op_a]] {
-            let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+            let mut doc = Doc {
+                id,
+                name: "n".into(),
+                fields: Default::default(),
+            };
             let mut rclock = VecClock::default();
             let mut deleted = false;
             for op in order {
@@ -709,7 +731,9 @@ mod tests {
         let id = DocId::new();
         let mut rng = 0x1234_5678_u64;
         let mut next = || {
-            rng = rng.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            rng = rng
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
             (rng >> 33) as u32
         };
 
@@ -738,7 +762,11 @@ mod tests {
         let ops_b = mk_stream(&kb, &b, &a, 0);
 
         let run = |first: &[Op], second: &[Op]| {
-            let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+            let mut doc = Doc {
+                id,
+                name: "n".into(),
+                fields: Default::default(),
+            };
             let mut clock = VecClock::default();
             let mut deleted = false;
             for op in first.iter().chain(second.iter()) {

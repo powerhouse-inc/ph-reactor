@@ -4,7 +4,10 @@
 //! mutations to the daemon's command channel, so page actions cannot
 //! race the poller or the tray menu.
 
+use std::collections::BTreeMap;
+use std::str::FromStr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use axum::extract::Path;
@@ -14,7 +17,7 @@ use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Deserialize;
 use tokio::net::TcpListener;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::commands::Command;
 use crate::status::StatusSnapshot;
@@ -58,6 +61,7 @@ impl Settings {
             .route("/api/drives/:name/resync", post(resync_drive))
             .route("/api/config", post(set_config))
             .route("/api/quit", post(quit))
+            .route("/api/docs", post(add_doc))
             .with_state(Arc::new(self));
         let task = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
@@ -83,7 +87,7 @@ async fn status_api(
 struct AddBody {
     #[serde(default)]
     name: String,
-    url: String,
+    addr: String,
     #[serde(default, rename = "tokenEnv")]
     token_env: Option<String>,
     #[serde(default, rename = "availableOffline")]
@@ -107,12 +111,22 @@ async fn add_drive(
         )
             .into_response();
     }
-    if body.url.trim().is_empty() {
-        return (StatusCode::BAD_REQUEST, "drive url required").into_response();
+    if body.addr.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "drive addr required").into_response();
+    }
+    match libp2p::Multiaddr::from_str(body.addr.trim()) {
+        Ok(_) => {}
+        Err(e) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("not a valid multiaddr: {e}"),
+            )
+                .into_response();
+        }
     }
     let cmd = Command::AddDrive {
         name: body.name,
-        url: body.url.trim().into(),
+        addr: body.addr.trim().into(),
         token_env: body.token_env,
         offline: body.available_offline,
     };
@@ -195,6 +209,56 @@ async fn quit(state: axum::extract::State<Arc<Settings>>) -> Response {
     StatusCode::ACCEPTED.into_response()
 }
 
+#[derive(Deserialize)]
+struct DocBody {
+    name: String,
+    #[serde(default)]
+    fields: BTreeMap<String, serde_json::Value>,
+}
+
+/// Synchronous doc creation (unlike the drive mutations): the CLI awaits
+/// the outcome, so the daemon replies through a one-shot channel.
+async fn add_doc(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<DocBody>,
+) -> Response {
+    if !valid_name(&body.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "doc name may be any characters except '/' (max 64)",
+        )
+            .into_response();
+    }
+    let (reply, wait) = oneshot::channel();
+    let cmd = Command::CreateDoc {
+        name: body.name,
+        fields: body.fields,
+        reply,
+    };
+    if state.cmd_tx.send(cmd).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(Ok(Ok(()))) => (
+            StatusCode::CREATED,
+            axum::Json(serde_json::json!({ "ok": true })),
+        )
+            .into_response(),
+        Ok(Ok(Err(e))) => {
+            let status = if e.contains("already exists") {
+                StatusCode::CONFLICT
+            } else {
+                StatusCode::BAD_REQUEST
+            };
+            (status, e).into_response()
+        }
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "doc creation timed out").into_response(),
+    }
+}
 // ---------------------------------------------------------------------------
 // Single-page UI
 // ---------------------------------------------------------------------------
@@ -217,18 +281,18 @@ const PAGE: &str = r#"<!doctype html>
   h1 { font-size:16px; margin:0 0 4px; font-weight:600; }
   .sub { color:var(--dim); font-size:12px; }
   main { padding:24px; max-width:960px; }
-  .switchboard { background:var(--panel); border:1px solid var(--line); border-radius:8px;
-                 padding:12px 16px; margin-bottom:24px; }
-  .switchboard .state { font-weight:600; }
+  .reactor { background:var(--panel); border:1px solid var(--line); border-radius:8px;
+             padding:12px 16px; margin-bottom:24px; }
+  .reactor .state { font-weight:600; }
   .chip { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px;
           background:var(--line); color:var(--dim); }
   .chip.synced, .chip.ok { background:rgba(76,175,125,.15); color:var(--ok); }
-  .chip.error, .chip.paused { background:rgba(217,106,95,.15); color:var(--err); }
+  .chip.error, .chip.paused, .chip.requires-auth { background:rgba(217,106,95,.15); color:var(--err); }
   .chip.offline, .chip.connecting { background:rgba(217,164,65,.15); color:var(--warn); }
   table { width:100%; border-collapse:collapse; }
   th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
   th { color:var(--dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-  td.url { color:var(--dim); font-size:12px; word-break:break-all; max-width:340px; }
+  td.addr { color:var(--dim); font-size:12px; word-break:break-all; max-width:340px; }
   td.detail { color:var(--dim); font-size:12px; max-width:300px; }
   button { background:var(--panel); color:var(--fg); border:1px solid var(--line);
            border-radius:6px; padding:3px 10px; margin:0 4px 0 0; cursor:pointer; font-size:12px; }
@@ -237,7 +301,7 @@ const PAGE: &str = r#"<!doctype html>
   form.add { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
   input { background:var(--panel); border:1px solid var(--line); border-radius:6px;
           color:var(--fg); padding:6px 10px; font-size:13px; }
-  input[name=url] { flex:1; min-width:280px; }
+  input[name=addr] { flex:1; min-width:280px; }
   .hint { color:var(--dim); font-size:12px; margin-top:12px; }
   .toast { position:fixed; bottom:16px; left:16px; background:var(--panel);
            border:1px solid var(--line); border-radius:8px; padding:8px 14px;
@@ -251,28 +315,30 @@ const PAGE: &str = r#"<!doctype html>
   <div class="sub" id="settingsline"></div>
 </header>
 <main>
-  <div class="switchboard">
-    <span class="state" id="sbstate">…</span>
-    <span class="sub" id="sbdetail"></span>
+  <div class="reactor">
+    <span class="state" id="rxstate">…</span>
+    <span class="sub" id="rxdetail"></span>
   </div>
 
   <h2 style="font-size:14px; margin:0 0 8px;">Drives</h2>
   <table>
-    <thead><tr><th>Name</th><th>URL</th><th>Status</th><th></th></tr></thead>
+    <thead><tr><th>Name</th><th>Address</th><th>Status</th><th></th></tr></thead>
     <tbody id="drives"></tbody>
   </table>
 
   <h2 style="font-size:14px; margin:24px 0 8px;">Add a drive</h2>
   <form class="add" id="addform">
-    <input name="url" placeholder="https://&lt;switchboard&gt;/d/&lt;slug&gt;" required>
+    <input name="addr" placeholder="/ip4/10.0.0.2/tcp/4201/p2p/12D3Koo…" required>
     <input name="name" placeholder="name (optional)">
     <input name="tokenEnv" placeholder="token env (optional)" style="width:150px">
     <label class="sub" style="align-self:center;"><input type="checkbox" name="offline"> offline</label>
     <button type="submit">Add</button>
   </form>
   <div class="hint">
-    Tokens are read from the named environment variable; they are never stored.
-    Pausing deletes the local mirror (resuming re-syncs from the remote).
+    The address is a multiaddr of the remote ph-reactor (the peer part is
+    optional — it is resolved on connect). Tokens are read from the named
+    environment variable; they are never stored. Pausing stops syncing but
+    keeps the local docs.
   </div>
 </main>
 <div class="toast" id="toast"></div>
@@ -315,7 +381,7 @@ function renderDrive(d) {
   ];
   tr.innerHTML =
     `<td>${esc(d.name)}</td>` +
-    `<td class="url">${esc(d.url)}</td>` +
+    `<td class="addr">${esc(d.addr)}</td>` +
     `<td><span class="chip ${esc(d.status)}">${esc(d.status)}</span>` +
     `<div class="detail">${esc(d.detail)}</div></td>` +
     `<td>${actions
@@ -338,13 +404,13 @@ async function refresh() {
     $("ver").textContent = s.version;
     $("settingsline").textContent =
       "settings: " + s.settings.url + "  ·  updated " + s.updated_at;
-    const sb = s.switchboard;
-    const state = !sb.running ? "stopped" : sb.healthy ? "healthy" : "starting";
-    $("sbstate").textContent = "switchboard: " + state;
-    $("sbstate").className = "state";
-    $("sbdetail").textContent =
-      `port ${sb.port} · version ${sb.version ?? "?"} · restarts ${sb.restarts}` +
-      (sb.last_event ? ` · ${sb.last_event}` : "");
+    const r = s.reactor;
+    const state = !r.running ? "stopped" : r.healthy ? "healthy" : "starting";
+    $("rxstate").textContent = "reactor: " + state;
+    $("rxstate").className = "state";
+    $("rxdetail").textContent =
+      `peer ${r.peer_id ?? "?"} · listen ${r.listen} · ${r.docs} docs` +
+      (r.last_event ? ` · ${r.last_event}` : "");
     const tbody = $("drives");
     tbody.innerHTML = "";
     for (const d of s.drives) tbody.appendChild(renderDrive(d));
@@ -353,7 +419,7 @@ async function refresh() {
         `<tr><td colspan="4" class="detail">no drives configured</td></tr>`;
     }
   } catch (e) {
-    $("sbstate").textContent = "daemon unreachable";
+    $("rxstate").textContent = "daemon unreachable";
   }
 }
 
@@ -362,7 +428,7 @@ $("addform").addEventListener("submit", async (e) => {
   const f = new FormData(e.target);
   try {
     await post("/api/drives", {
-      url: f.get("url"),
+      addr: f.get("addr"),
       name: f.get("name") || "",
       tokenEnv: f.get("tokenEnv") || null,
       availableOffline: f.get("offline") === "on",

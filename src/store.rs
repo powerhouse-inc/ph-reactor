@@ -22,12 +22,12 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use ed25519_dalek::{Signer, SigningKey, VerifyingKey};
+use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::Mutex;
 use serde::{Deserialize, Serialize};
 use tracing::{debug, warn};
 
-use crate::doc::{apply_op, Doc, DocId, Op, Origin, VecClock, ApplyResult};
+use crate::doc::{apply_op, ApplyResult, Doc, DocId, Op, Origin, VecClock};
 
 /// Ops in a doc's live log before it is snapshot + truncated.
 pub const SNAPSHOT_OPS: u64 = 1024;
@@ -37,7 +37,7 @@ pub const MAX_NAME_LEN: usize = 64;
 const NAME_KEY: &str = "__name__";
 
 /// A document's full durable state (used for snapshots and catch-up).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct DocState {
     pub doc: Doc,
     pub clock: VecClock,
@@ -60,7 +60,11 @@ struct Entry {
 impl Entry {
     fn new(id: DocId) -> Self {
         Entry {
-            doc: Doc { id, name: String::new(), fields: Default::default() },
+            doc: Doc {
+                id,
+                name: String::new(),
+                fields: Default::default(),
+            },
             clock: VecClock::default(),
             deleted: false,
             log: Vec::new(),
@@ -116,11 +120,7 @@ struct Inner {
 impl Store {
     /// Open (or create) a store rooted at `docs_dir`. Replays
     /// snapshots + logs and rebuilds the name index.
-    pub fn open(
-        docs_dir: &Path,
-        key: &SigningKey,
-        origin: &str,
-    ) -> Result<Arc<Self>, String> {
+    pub fn open(docs_dir: &Path, key: &SigningKey, origin: &str) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(docs_dir).map_err(|e| e.to_string())?;
         let mut inner = Inner {
             docs_dir: docs_dir.to_path_buf(),
@@ -137,7 +137,9 @@ impl Store {
             .known_keys
             .insert(inner.origin.clone(), key.verifying_key().to_bytes());
         inner.replay();
-        Ok(Arc::new(Store { inner: Mutex::new(inner) }))
+        Ok(Arc::new(Store {
+            inner: Mutex::new(inner),
+        }))
     }
 
     pub fn origin(&self) -> String {
@@ -277,7 +279,7 @@ impl Store {
 
     /// Local ops not yet delivered to the sync layer.
     pub fn drain_outbound(&self) -> Vec<Op> {
-        self.inner.lock().outbound.drain(..).collect()
+        std::mem::take(&mut self.inner.lock().outbound)
     }
 
     /// Per-doc clocks of live docs (for `Summary` reconciliation).
@@ -330,12 +332,48 @@ impl Store {
         self.inner.lock().entries.keys().copied().collect()
     }
 
+    /// Adopt a peer's full doc state wholesale (crash-safe: the entry
+    /// is snapshotted immediately and the live log is truncated).
+    /// The caller is responsible for ensuring the peer's clock covers
+    /// ours before calling this.
+    pub fn adopt_state(&self, state: &DocState) -> Result<(), String> {
+        let mut g = self.inner.lock();
+        let entry = g
+            .entries
+            .entry(state.doc.id)
+            .or_insert_with(|| Entry::new(state.doc.id));
+        entry.doc = state.doc.clone();
+        entry.clock = state.clock.clone();
+        entry.deleted = state.deleted;
+        entry.log.clear();
+        lift_name(&mut entry.doc);
+        let (name, deleted) = (entry.doc.name.clone(), entry.deleted);
+        if !name.is_empty() && !deleted {
+            g.names.insert(name, state.doc.id);
+        }
+        g.persist_index();
+        g.snapshot(&state.doc.id);
+        Ok(())
+    }
+
+    /// The current name of a doc (empty when unnamed/deleted).
+    pub fn doc_name(&self, id: DocId) -> Option<String> {
+        let g = self.inner.lock();
+        g.entries
+            .get(&id)
+            .filter(|e| !e.deleted)
+            .map(|e| e.doc.name.clone())
+    }
+
     // -- internals --------------------------------------------------------
 
     /// Validate a doc name.
     pub fn validate_name(name: &str) -> Result<(), String> {
         if name.is_empty() || name.len() > MAX_NAME_LEN {
-            return Err(format!("name must be 1..={MAX_NAME_LEN} chars (got {})", name.len()));
+            return Err(format!(
+                "name must be 1..={MAX_NAME_LEN} chars (got {})",
+                name.len()
+            ));
         }
         if name == "." || name == ".." || name.starts_with('.') {
             return Err(format!("name '{name}' must not be '.' or start with '.'"));
@@ -393,7 +431,11 @@ impl Inner {
                 Err(e) => {
                     warn!(doc = %id, "corrupt snapshot ({e}); starting empty");
                     DocState {
-                        doc: Doc { id, name: String::new(), fields: Default::default() },
+                        doc: Doc {
+                            id,
+                            name: String::new(),
+                            fields: Default::default(),
+                        },
                         clock: VecClock::default(),
                         deleted: false,
                         log_ops: 0,
@@ -401,7 +443,11 @@ impl Inner {
                 }
             },
             Err(_) => DocState {
-                doc: Doc { id, name: String::new(), fields: Default::default() },
+                doc: Doc {
+                    id,
+                    name: String::new(),
+                    fields: Default::default(),
+                },
                 clock: VecClock::default(),
                 deleted: false,
                 log_ops: 0,
@@ -409,7 +455,7 @@ impl Inner {
         };
 
         let mut log_ops: Vec<Op> = Vec::new();
-        if let Ok(raw) = std::fs::read_to_string(&self.docs_dir.join(format!("{id}.log"))) {
+        if let Ok(raw) = std::fs::read_to_string(self.docs_dir.join(format!("{id}.log"))) {
             for line in raw.lines() {
                 if line.trim().is_empty() {
                     continue;
@@ -432,24 +478,11 @@ impl Inner {
         // rebuild the name index (last writer wins by create ts)
         if !state.doc.name.is_empty() && !state.deleted {
             let name = state.doc.name.clone();
-            let this_ts = state
-                .doc
-                .fields
-                .values()
-                .map(|f| f.ts)
-                .max()
-                .unwrap_or(0);
+            let this_ts = state.doc.fields.values().map(|f| f.ts).max().unwrap_or(0);
             let existing_id = self.names.get(&name).copied();
             let existing_ts = existing_id
                 .and_then(|eid| self.entries.get(&eid))
-                .map(|e| {
-                    e.doc
-                        .fields
-                        .values()
-                        .map(|f| f.ts)
-                        .max()
-                        .unwrap_or(0)
-                })
+                .map(|e| e.doc.fields.values().map(|f| f.ts).max().unwrap_or(0))
                 .unwrap_or(0);
             if existing_id != Some(id) && this_ts >= existing_ts {
                 self.names.insert(name, id);
@@ -467,9 +500,11 @@ impl Inner {
         );
     }
 
-
     fn persist_index(&mut self) {
-        let idx = Index { names: self.names.clone(), ts_hint: self.ts_hint };
+        let idx = Index {
+            names: self.names.clone(),
+            ts_hint: self.ts_hint,
+        };
         let raw = serde_json::to_string(&idx).expect("index serializes");
         let path = self.docs_dir.join("index.json");
         if std::fs::write(&path, raw).is_ok() {
@@ -489,12 +524,7 @@ impl Inner {
     }
 
     /// Build (tick, ts, sign) a single op for `id`.
-    fn build_op(
-        &mut self,
-        id: DocId,
-        key: Option<String>,
-        value: Option<serde_json::Value>,
-    ) -> Op {
+    fn build_op(&mut self, id: DocId, key: Option<String>, value: Option<serde_json::Value>) -> Op {
         let ts = self.next_ts();
         let origin = self.origin.clone();
         let entry = self.entries.entry(id).or_insert_with(|| Entry::new(id));
@@ -544,12 +574,12 @@ impl Inner {
         self.append_to_log(op)?;
 
         // 3. apply (entry borrow scoped to the block)
-        let name_before: Option<String> = self
-            .entries
-            .get(&op.doc_id)
-            .map(|e| e.doc.name.clone());
+        let name_before: Option<String> = self.entries.get(&op.doc_id).map(|e| e.doc.name.clone());
         let res = {
-            let entry = self.entries.entry(op.doc_id).or_insert_with(|| Entry::new(op.doc_id));
+            let entry = self
+                .entries
+                .entry(op.doc_id)
+                .or_insert_with(|| Entry::new(op.doc_id));
             let mut deleted = entry.deleted;
             let res = apply_op(&mut entry.doc, &mut entry.clock, &mut deleted, op);
             entry.deleted = deleted;
@@ -569,7 +599,10 @@ impl Inner {
         let (name, newly_named) = {
             let entry = self.entries.get_mut(&op.doc_id).expect("entry from step 3");
             let changed = name_before.as_deref() != Some(entry.doc.name.as_str());
-            (entry.doc.name.clone(), !entry.doc.name.is_empty() && changed)
+            (
+                entry.doc.name.clone(),
+                !entry.doc.name.is_empty() && changed,
+            )
         };
         if newly_named {
             self.names.insert(name, op.doc_id);
@@ -607,7 +640,9 @@ impl Inner {
 
     /// Snapshot a doc atomically and truncate its live log.
     fn snapshot(&mut self, id: &DocId) {
-        let Some(entry) = self.entries.get_mut(id) else { return };
+        let Some(entry) = self.entries.get_mut(id) else {
+            return;
+        };
         let state = DocState {
             doc: entry.doc.clone(),
             clock: entry.clock.clone(),
@@ -620,7 +655,10 @@ impl Inner {
         if std::fs::write(&tmp, raw).is_err() {
             return;
         }
-        if std::fs::File::open(&tmp).and_then(|f| f.sync_all()).is_err() {
+        if std::fs::File::open(&tmp)
+            .and_then(|f| f.sync_all())
+            .is_err()
+        {
             return;
         }
         if std::fs::rename(&tmp, &path).is_err() {
@@ -666,8 +704,7 @@ mod tests {
     }
 
     fn open_store(dir: &Path) -> Arc<Store> {
-        Store::open(dir, &identity(9), "test-origin")
-            .expect("store opens")
+        Store::open(dir, &identity(9), "test-origin").expect("store opens")
     }
 
     #[test]
@@ -678,14 +715,14 @@ mod tests {
         fields.insert("title".into(), "hello".into());
         let id = s.create_doc("note-1", fields).unwrap();
         assert_eq!(s.get("note-1").unwrap().fields["title"].value, "hello");
-        assert!(s.get("note-1").unwrap().fields.get("__name__").is_none());
+        assert!(!s.get("note-1").unwrap().fields.contains_key("__name__"));
         assert_eq!(s.list().len(), 1);
 
         s.update_field("note-1", "body", "world".into()).unwrap();
         assert_eq!(s.get("note-1").unwrap().fields["body"].value, "world");
 
         s.delete_field("note-1", "body").unwrap();
-        assert!(s.get("note-1").unwrap().fields.get("body").is_none());
+        assert!(!s.get("note-1").unwrap().fields.contains_key("body"));
 
         // duplicate name rejected
         assert!(s.create_doc("note-1", BM::new()).is_err());
@@ -737,10 +774,12 @@ mod tests {
         let s = open_store(dir.path());
         s.create_doc("big", BM::new()).unwrap();
         // push enough ops to cross the snapshot threshold
-        for i in 0..(SNAPSHOT_OPS as u64 + 50) {
+        for i in 0..(SNAPSHOT_OPS + 50) {
             s.update_field("big", &format!("f{i}"), i.into()).unwrap();
         }
-        let snap = dir.path().join(format!("{}.snap", s.get("big").unwrap().id));
+        let snap = dir
+            .path()
+            .join(format!("{}.snap", s.get("big").unwrap().id));
         assert!(snap.exists(), "snapshot should have been written");
         drop(s);
 
@@ -808,7 +847,7 @@ mod tests {
         op.sign(&identity(4));
         assert!(s.apply_remote(&op).is_err());
         assert_eq!(s.quarantined_count(), 1);
-        assert!(s.get("t").unwrap().fields.get("k").is_none());
+        assert!(!s.get("t").unwrap().fields.contains_key("k"));
         // unknown origin also rejected
         let mut op2 = op.clone();
         op2.origin = "ghost".into();
@@ -836,6 +875,9 @@ mod tests {
         let s2 = open_store(dir.path());
         s2.update_field("t", "x", 1i64.into()).unwrap();
         let ts2 = s2.drain_outbound().into_iter().map(|o| o.ts).max().unwrap();
-        assert!(ts2 > ts1, "ts must not go backwards across restart ({ts1} -> {ts2})");
+        assert!(
+            ts2 > ts1,
+            "ts must not go backwards across restart ({ts1} -> {ts2})"
+        );
     }
 }

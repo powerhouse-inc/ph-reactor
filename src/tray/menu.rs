@@ -40,7 +40,7 @@ pub fn build_menu(snap: &StatusSnapshot) -> MenuItem {
     items.push(MenuItem {
         id: next_id,
         kind: "text",
-        label: format!("ph-reactor {} — {}", snap.version, switchboard_line(snap)),
+        label: format!("ph-reactor {} — {}", snap.version, reactor_line(snap)),
         enabled: false,
         visible: true,
         checked: false,
@@ -167,11 +167,11 @@ pub fn build_menu(snap: &StatusSnapshot) -> MenuItem {
     }
 }
 
-fn switchboard_line(snap: &StatusSnapshot) -> String {
-    let sb = &snap.switchboard;
-    if !sb.running {
+fn reactor_line(snap: &StatusSnapshot) -> String {
+    let r = &snap.reactor;
+    if !r.running {
         "stopped".into()
-    } else if sb.healthy {
+    } else if r.healthy {
         "running".into()
     } else {
         "starting…".into()
@@ -251,17 +251,21 @@ mod tests {
     use crate::status::DriveStatusEntry;
 
     fn snap() -> StatusSnapshot {
-        let mut s = StatusSnapshot::empty("0.1.0".into(), 4001, "http://127.0.0.1:4002/".into());
+        let mut s = StatusSnapshot::empty(
+            "0.1.0".into(),
+            "/ip4/0.0.0.0/tcp/4201".into(),
+            "http://127.0.0.1:4002".into(),
+        );
         s.drives.push(DriveStatusEntry {
             name: "vault".into(),
-            url: "https://x.example/d/vault".into(),
+            addr: "/ip4/10.0.0.2/tcp/4201/p2p/12D3KooWg8111".into(),
             paused: false,
             status: "synced".into(),
             detail: "ok".into(),
         });
         s.drives.push(DriveStatusEntry {
             name: "cold".into(),
-            url: "https://x.example/d/cold".into(),
+            addr: "/ip4/10.0.0.3/tcp/4201/p2p/12D3KooWg8222".into(),
             paused: true,
             status: "paused".into(),
             detail: "paused".into(),

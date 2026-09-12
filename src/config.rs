@@ -1,13 +1,32 @@
 //! Daemon configuration (`<state>/config.json`).
 //!
-//! One file, schema version 1, camelCase on the wire. First run writes the
-//! defaults; a corrupt file is moved aside (`config.json.corrupt-<ts>`) and
-//! replaced by fresh defaults; unknown fields are preserved verbatim via a
-//! flattened map so future versions never lose operator input.
+//! One file, schema version 2, camelCase on the wire. First run writes
+//! the defaults; a corrupt file is moved aside (`config.json.corrupt-<ts>`)
+//! and replaced by fresh defaults; unknown fields are preserved
+//! verbatim via a flattened map so future versions never lose operator
+//! input.
+//!
+//! Schema:
+//! ```json
+//! {
+//!   "schemaVersion": 2,
+//!   "instance": { "name": "my-mac", "listen": "/ip4/0.0.0.0/tcp/4201" },
+//!   "p2p": { "mdns": true, "tokenEnv": null },
+//!   "drives": [
+//!     {
+//!       "name": "vault",
+//!       "addr": "/ip4/10.0.0.2/tcp/4201/p2p/12D3Koo...",
+//!       "tokenEnv": "VAULT_TOKEN",
+//!       "paused": false,
+//!       "availableOffline": true
+//!     }
+//!   ],
+//!   "settings": { "host": "127.0.0.1", "port": 4002 },
+//!   "logLevel": "info"
+//! }
+//! ```
 
 use std::collections::BTreeMap;
-use std::fs;
-use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 
 use serde::{Deserialize, Serialize};
@@ -16,29 +35,22 @@ use thiserror::Error;
 
 use crate::paths::StatePaths;
 
-pub const CONFIG_VERSION: u32 = 1;
-
-pub const DEFAULT_REGISTRY_URL: &str = "https://registry.dev.vetra.io";
-pub const DEFAULT_NPM_REGISTRY: &str = "https://registry.npmjs.org";
-pub const DEFAULT_SWITCHBOARD_SPEC: &str = "@powerhousedao/switchboard@latest";
-pub const DEFAULT_BOOT_PACKAGES: &[&str] = &["@powerhousedao/knowledge-note"];
+pub const CONFIG_VERSION: u32 = 2;
+/// Default libp2p listen address (all interfaces, TCP 4201).
+pub const DEFAULT_LISTEN: &str = "/ip4/0.0.0.0/tcp/4201";
+/// Default instance name (shown in handshakes and status pages).
+pub const DEFAULT_INSTANCE_NAME: &str = "reactor";
 
 pub const LOG_LEVELS: &[&str] = &["verbose", "debug", "info", "warn", "error", "silent"];
 
 #[derive(Debug, Error)]
 pub enum ConfigError {
     #[error("io: {0}")]
-    Io(#[source] std::io::Error),
-    #[error("invalid config JSON: {0}")]
-    Parse(String),
-    #[error("invalid value for {key}: {why}")]
-    InvalidValue { key: String, why: String },
-}
-
-impl From<std::io::Error> for ConfigError {
-    fn from(err: std::io::Error) -> Self {
-        Self::Io(err)
-    }
+    Io(#[from] std::io::Error),
+    #[error("json: {0}")]
+    Json(#[from] serde_json::Error),
+    #[error("config: {0}")]
+    Invalid(String),
 }
 
 // ---------------------------------------------------------------------------
@@ -47,44 +59,39 @@ impl From<std::io::Error> for ConfigError {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct NodeConfig {
-    /// Minimum Node major version (inclusive) the daemon will accept from
-    /// the system; below this it bootstraps a private runtime.
-    #[serde(rename = "minimumVersion")]
-    pub minimum_version: String,
-    #[serde(rename = "preferSystem")]
-    pub prefer_system: bool,
+pub struct InstanceConfig {
+    /// Human name of this instance (shown to peers in handshakes).
+    pub name: String,
+    /// The libp2p listen multiaddr.
+    pub listen: String,
 }
 
-impl Default for NodeConfig {
+impl Default for InstanceConfig {
     fn default() -> Self {
         Self {
-            minimum_version: "24".into(),
-            prefer_system: true,
+            name: DEFAULT_INSTANCE_NAME.into(),
+            listen: DEFAULT_LISTEN.into(),
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
-pub struct SwitchboardConfig {
-    pub port: u16,
-    /// npm spec for `@powerhousedao/switchboard` (name, name@tag, name@version).
-    #[serde(rename = "packageSpec")]
-    pub package_spec: String,
-    /// Registry the switchboard package itself is installed from.
-    #[serde(rename = "npmRegistry")]
-    pub npm_registry: String,
-    pub node: NodeConfig,
+pub struct P2pConfig {
+    /// Enable mDNS for LAN peer discovery.
+    pub mdns: bool,
+    /// Env var name of the global token gate: inbound hellos from
+    /// peers without a drive entry are rejected unless their token
+    /// matches this variable's value.
+    #[serde(rename = "tokenEnv")]
+    pub token_env: Option<String>,
 }
 
-impl Default for SwitchboardConfig {
+impl Default for P2pConfig {
     fn default() -> Self {
         Self {
-            port: 4001,
-            package_spec: DEFAULT_SWITCHBOARD_SPEC.into(),
-            npm_registry: DEFAULT_NPM_REGISTRY.into(),
-            node: NodeConfig::default(),
+            mdns: true,
+            token_env: None,
         }
     }
 }
@@ -93,25 +100,24 @@ impl Default for SwitchboardConfig {
 #[serde(default)]
 pub struct DriveConfig {
     pub name: String,
-    /// Drive REST URL, e.g. `https://<switchboard>/d/<slug>`.
-    pub url: String,
-    /// Name of the env var holding a Renown bearer token for this drive's
-    /// switchboard (the token itself is never stored here).
-    #[serde(rename = "tokenEnv", skip_serializing_if = "Option::is_none", default)]
+    /// Multiaddr of the remote peer (see `drives::Drive`).
+    pub addr: String,
+    /// Env var name holding the shared token (value never persisted).
+    #[serde(rename = "tokenEnv")]
     pub token_env: Option<String>,
+    pub paused: bool,
     #[serde(rename = "availableOffline")]
     pub available_offline: bool,
-    pub paused: bool,
 }
 
 impl Default for DriveConfig {
     fn default() -> Self {
         Self {
             name: String::new(),
-            url: String::new(),
+            addr: String::new(),
             token_env: None,
-            available_offline: true,
             paused: false,
+            available_offline: true,
         }
     }
 }
@@ -136,18 +142,15 @@ impl Default for SettingsConfig {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ReactorConfig {
+    #[serde(rename = "schemaVersion")]
     pub version: u32,
-    pub switchboard: SwitchboardConfig,
-    /// Powerhouse package registry (document models), e.g.
-    /// `https://registry.dev.vetra.io`.
-    pub registry: String,
-    /// Boot packages installed from the registry when the switchboard starts.
-    pub packages: Vec<String>,
+    pub instance: InstanceConfig,
+    pub p2p: P2pConfig,
     pub drives: Vec<DriveConfig>,
     pub settings: SettingsConfig,
     #[serde(rename = "logLevel")]
     pub log_level: String,
-    /// Unknown fields are preserved verbatim (forward compatibility).
+    /// Unknown fields, preserved verbatim (forward compatibility).
     #[serde(flatten)]
     pub extra: BTreeMap<String, Value>,
 }
@@ -156,12 +159,8 @@ impl Default for ReactorConfig {
     fn default() -> Self {
         Self {
             version: CONFIG_VERSION,
-            switchboard: SwitchboardConfig::default(),
-            registry: DEFAULT_REGISTRY_URL.into(),
-            packages: DEFAULT_BOOT_PACKAGES
-                .iter()
-                .map(|s| s.to_string())
-                .collect(),
+            instance: InstanceConfig::default(),
+            p2p: P2pConfig::default(),
             drives: Vec::new(),
             settings: SettingsConfig::default(),
             log_level: "info".into(),
@@ -171,102 +170,137 @@ impl Default for ReactorConfig {
 }
 
 impl ReactorConfig {
-    /// The subset of configuration that changes how the switchboard
-    /// process is spawned. When it changes, the daemon respawns the
-    /// switchboard; when only `drives` change, the running switchboard
-    /// is updated in place (no restart). The drives' `tokenEnv` names
-    /// are included because the generated boot wrapper bakes in the
-    /// matching `PH_DRIVE_TOKEN_<i>` environment variable names (the
-    /// values are resolved at spawn time and are deliberately not part
-    /// of the fingerprint).
-    pub fn process_fingerprint(&self) -> Value {
-        serde_json::json!({
-            "port": self.switchboard.port,
-            "packageSpec": self.switchboard.package_spec,
-            "npmRegistry": self.switchboard.npm_registry,
-            "node": self.switchboard.node,
-            "registry": self.registry,
-            "packages": self.packages,
-            "logLevel": self.log_level,
-            "settings": self.settings,
-            "driveTokenEnv": self
-                .drives
-                .iter()
-                .map(|d| d.token_env.clone())
-                .collect::<Vec<_>>(),
-        })
+    /// Fingerprint of the fields that require a daemon restart to take
+    /// effect (listen address, mdns, token gate, settings endpoint, log
+    /// level).
+    pub fn process_fingerprint(&self) -> u64 {
+        use std::hash::{Hash, Hasher};
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        self.instance.listen.hash(&mut h);
+        self.instance.name.hash(&mut h);
+        self.p2p.mdns.hash(&mut h);
+        self.p2p.token_env.hash(&mut h);
+        self.settings.host.hash(&mut h);
+        self.settings.port.hash(&mut h);
+        self.log_level.hash(&mut h);
+        h.finish()
+    }
+
+    /// Validate the whole document. Returns the first problem found.
+    pub fn validate(&self) -> Result<(), ConfigError> {
+        if self.instance.name.trim().is_empty() {
+            return Err(invalid("instance.name", "must be a non-empty string"));
+        }
+        if let Err(e) = libp2p::Multiaddr::from_str(&self.instance.listen) {
+            return Err(invalid(
+                "instance.listen",
+                &format!("not a valid multiaddr: {e}"),
+            ));
+        }
+        for d in &self.drives {
+            if d.name.trim().is_empty() {
+                return Err(invalid("drives[].name", "must be non-empty"));
+            }
+            if let Err(e) = libp2p::Multiaddr::from_str(&d.addr) {
+                return Err(invalid(
+                    &format!("drives[{}].addr", d.name),
+                    &format!("not a valid multiaddr: {e}"),
+                ));
+            }
+        }
+        if !LOG_LEVELS.contains(&self.log_level.as_str()) {
+            return Err(invalid(
+                "logLevel",
+                &format!("expected one of: {}", LOG_LEVELS.join(", ")),
+            ));
+        }
+        Ok(())
     }
 }
+
+use std::str::FromStr;
 
 // ---------------------------------------------------------------------------
 // Load / save
 // ---------------------------------------------------------------------------
 
 /// Loads the config. A missing file is created with defaults; a corrupt
-/// file is preserved as `<file>.corrupt-<unix-ts>` and replaced. The bool
-/// is true when the file was quarantined or freshly defaulted, so
+/// file is preserved as `<file>.corrupt-<unix-ts>` and replaced. The
+/// bool is true when the file was quarantined or freshly defaulted, so
 /// adopting callers can refuse to clobber a good in-memory config with
 /// replacement defaults.
 pub fn load_quiet(paths: &StatePaths) -> Result<(ReactorConfig, bool), ConfigError> {
-    match fs::read_to_string(&paths.config_file) {
-        Ok(text) => match serde_json::from_str::<ReactorConfig>(&text) {
-            Ok(mut config) => {
-                config.version = config.version.max(1);
+    let file = &paths.config_file;
+    match std::fs::read_to_string(file) {
+        Ok(raw) => match serde_json::from_str::<ReactorConfig>(&raw) {
+            Ok(config) => {
+                config.validate()?;
                 Ok((config, false))
             }
             Err(err) => {
-                quarantine(&paths.config_file, &err)?;
-                let fresh = ReactorConfig::default();
-                save(paths, &fresh)?;
-                tracing::warn!(
-                    "corrupt config at {} ({}); replaced with defaults",
-                    paths.config_file.display(),
-                    err
-                );
-                Ok((fresh, true))
+                quarantine(file, &err)?;
+                let config = default_with_version();
+                std::fs::write(file, render(&config))?;
+                set_config_mode(file, 0o600);
+                Ok((config, true))
             }
         },
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => {
-            let fresh = ReactorConfig::default();
-            save(paths, &fresh)?;
-            tracing::info!(
-                "no config at {}; wrote defaults",
-                paths.config_file.display()
-            );
-            Ok((fresh, false))
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            let config = default_with_version();
+            std::fs::write(file, render(&config))?;
+            set_config_mode(file, 0o600);
+            Ok((config, true))
         }
-        Err(err) => Err(err.into()),
+        Err(e) => Err(ConfigError::Io(e)),
     }
 }
 
 pub fn load(paths: &StatePaths) -> Result<ReactorConfig, ConfigError> {
-    let (config, _) = load_quiet(paths)?;
-    Ok(config)
+    Ok(load_quiet(paths)?.0)
+}
+
+/// The defaults a fresh state dir gets.
+fn default_with_version() -> ReactorConfig {
+    ReactorConfig {
+        version: CONFIG_VERSION,
+        ..Default::default()
+    }
 }
 
 /// Atomic write: tmp file in the same directory, `0600`, rename over.
 pub fn save(paths: &StatePaths, config: &ReactorConfig) -> Result<(), ConfigError> {
-    let text =
-        serde_json::to_string_pretty(config).map_err(|err| ConfigError::Parse(err.to_string()))?;
-    let mut text = text;
-    text.push('\n');
-    atomic_write(&paths.config_file, &text)?;
+    atomic_write(&paths.config_file, &render(config))?;
+    set_config_mode(&paths.config_file, 0o600);
     Ok(())
 }
 
 /// Shared atomic-write helper: tmp file in the same directory, `0600`,
-/// rename over the target. Used by `save` and by the switchboard's
-/// `powerhouse.config.json` writer.
+/// rename over the target.
 pub(crate) fn atomic_write(path: &Path, content: &str) -> std::io::Result<()> {
-    let name = path
-        .file_name()
-        .map(|n| n.to_string_lossy().into_owned())
-        .unwrap_or_default();
-    let tmp = path.with_file_name(format!("{name}.tmp"));
-    fs::write(&tmp, content)?;
-    let _ = fs::set_permissions(&tmp, fs::Permissions::from_mode(0o600));
-    fs::rename(&tmp, path)?;
-    Ok(())
+    let dir = path
+        .parent()
+        .ok_or_else(|| std::io::Error::new(std::io::ErrorKind::InvalidInput, "no parent"))?;
+    let tmp = dir.join(format!(
+        ".{}.tmp",
+        path.file_name().and_then(|f| f.to_str()).unwrap_or("f")
+    ));
+    std::fs::write(&tmp, content)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600));
+    }
+    std::fs::rename(&tmp, path)
+}
+
+fn set_config_mode(path: &Path, mode: u32) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode));
+    }
+    #[cfg(not(unix))]
+    let _ = mode;
 }
 
 fn quarantine(file: &Path, err: &serde_json::Error) -> Result<(), ConfigError> {
@@ -274,83 +308,81 @@ fn quarantine(file: &Path, err: &serde_json::Error) -> Result<(), ConfigError> {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0);
-    let bad = file.with_file_name(format!(
-        "{}.corrupt-{}",
+    let q = file.with_file_name(format!(
+        "{}.corrupt-{ts}",
         file.file_name()
-            .and_then(|n| n.to_str())
-            .unwrap_or("config"),
-        ts
+            .and_then(|f| f.to_str())
+            .unwrap_or("config")
     ));
-    if let Err(mv_err) = fs::rename(file, &bad) {
-        tracing::warn!("could not quarantine corrupt config: {mv_err}");
-    }
-    let _ = err;
+    let _ = std::fs::rename(file, &q);
+    tracing::warn!(
+        "quarantined corrupt config {} -> {} ({err})",
+        file.display(),
+        q.display()
+    );
     Ok(())
 }
 
 // ---------------------------------------------------------------------------
-// Dotted-key updates (CLI `config set`)
+// Dotted-key updates (CLI `config set`, settings API)
 // ---------------------------------------------------------------------------
 
-/// Sets a dotted key (`switchboard.port`, `registry`, `logLevel`, …) from a
-/// JSON value; validates the value before committing.
+/// Sets a dotted key (`instance.listen`, `p2p.mdns`, `logLevel`, …) from
+/// a JSON value; validates the value before committing. Drive list
+/// changes go through the drive commands.
 pub fn set(config: &mut ReactorConfig, key: &str, value: &Value) -> Result<(), ConfigError> {
     match key {
-        "switchboard.port" => set_port("switchboard.port", &mut config.switchboard.port, value)?,
-        "switchboard.packageSpec" => {
-            set_string(key, &mut config.switchboard.package_spec, value, |s| {
+        "instance.name" => {
+            set_string("instance.name", &mut config.instance.name, value, |s| {
                 !s.trim().is_empty()
-            })?
+            })?;
         }
-        "switchboard.npmRegistry" => set_url(key, &mut config.switchboard.npm_registry, value)?,
-        "switchboard.node.minimumVersion" => set_string(
-            key,
-            &mut config.switchboard.node.minimum_version,
-            value,
-            |s| {
-                s.split('.')
-                    .next()
-                    .and_then(|maj| maj.parse::<u32>().ok())
-                    .is_some()
-            },
-        )?,
-        "switchboard.node.preferSystem" => {
-            config.switchboard.node.prefer_system = bool_value(key, value)?
+        "instance.listen" => {
+            set_string("instance.listen", &mut config.instance.listen, value, |s| {
+                libp2p::Multiaddr::from_str(s).is_ok()
+            })?;
         }
-        "registry" => set_url(key, &mut config.registry, value)?,
-        "packages" => {
-            let list = value
-                .as_array()
-                .ok_or_else(|| invalid(key, "must be a JSON array of package name strings"))?;
-            let mut out = Vec::with_capacity(list.len());
-            for entry in list {
-                let s = entry
-                    .as_str()
-                    .ok_or_else(|| invalid(key, "entries must be strings"))?;
-                out.push(s.to_string());
+        "p2p.mdns" => {
+            config.p2p.mdns = bool_value("p2p.mdns", value)?;
+        }
+        "p2p.tokenEnv" => match value {
+            Value::Null => config.p2p.token_env = None,
+            Value::String(s) => config.p2p.token_env = Some(s.clone()),
+            _ => return Err(invalid("p2p.tokenEnv", "expected a string or null")),
+        },
+        "settings.host" => {
+            set_string("settings.host", &mut config.settings.host, value, |s| {
+                !s.is_empty()
+            })?;
+        }
+        "settings.port" => {
+            set_port("settings.port", &mut config.settings.port, value)?;
+        }
+        "logLevel" => {
+            let s = match value {
+                Value::String(s) => s.clone(),
+                _ => return Err(invalid("logLevel", "expected a string")),
+            };
+            if !LOG_LEVELS.contains(&s.as_str()) {
+                return Err(invalid(
+                    "logLevel",
+                    &format!("expected one of: {}", LOG_LEVELS.join(", ")),
+                ));
             }
-            config.packages = out;
+            config.log_level = s;
         }
-        "drives" => set_drives(key, &mut config.drives, value)?,
-        "settings.host" => set_string(key, &mut config.settings.host, value, |_| true)?,
-        "settings.port" => set_port("settings.port", &mut config.settings.port, value)?,
-        "logLevel" => set_string(key, &mut config.log_level, value, |s| {
-            LOG_LEVELS.contains(&s)
-        })?,
-        "version" => return Err(invalid(key, "cannot be changed")),
         _ => {
-            // Forward-compat: unknown keys land in the preserved map.
-            config.extra.insert(key.to_string(), value.clone());
+            return Err(invalid(
+                key,
+                "unknown key (allowed: instance.name, instance.listen, p2p.mdns, p2p.tokenEnv, settings.host, settings.port, logLevel)",
+            ))
         }
     }
-    Ok(())
+    config.validate()
 }
 
 fn invalid(key: &str, why: &str) -> ConfigError {
-    ConfigError::InvalidValue {
-        key: key.to_string(),
-        why: why.to_string(),
-    }
+    ConfigError::Invalid(format!("{key}: {why}"))
 }
 
 fn set_string(
@@ -359,33 +391,24 @@ fn set_string(
     value: &Value,
     valid: impl Fn(&str) -> bool,
 ) -> Result<(), ConfigError> {
-    let s = value
-        .as_str()
-        .ok_or_else(|| invalid(key, "must be a string"))?;
-    if !valid(s) {
-        return Err(invalid(key, "value rejected by validator"));
+    let s = match value {
+        Value::String(s) => s.clone(),
+        _ => return Err(invalid(key, "expected a string")),
+    };
+    if !valid(&s) {
+        return Err(invalid(key, "invalid value"));
     }
-    *target = s.to_string();
-    Ok(())
-}
-
-fn set_url(key: &str, target: &mut String, value: &Value) -> Result<(), ConfigError> {
-    let s = value
-        .as_str()
-        .ok_or_else(|| invalid(key, "must be a string"))?;
-    if url::Url::parse(s).is_err() || !s.starts_with("http") {
-        return Err(invalid(key, "must be an http(s) URL"));
-    }
-    *target = s.trim_end_matches('/').to_string();
+    *target = s;
     Ok(())
 }
 
 fn set_port(key: &str, target: &mut u16, value: &Value) -> Result<(), ConfigError> {
-    let n = value
-        .as_u64()
-        .ok_or_else(|| invalid(key, "must be an integer"))?;
+    let n = match value.as_u64() {
+        Some(n) => n,
+        None => return Err(invalid(key, "expected a number")),
+    };
     if !(1..=65535).contains(&n) {
-        return Err(invalid(key, "must be 1..=65535"));
+        return Err(invalid(key, "port must be 1..=65535"));
     }
     *target = n as u16;
     Ok(())
@@ -394,171 +417,118 @@ fn set_port(key: &str, target: &mut u16, value: &Value) -> Result<(), ConfigErro
 fn bool_value(key: &str, value: &Value) -> Result<bool, ConfigError> {
     value
         .as_bool()
-        .ok_or_else(|| invalid(key, "must be a boolean"))
+        .ok_or_else(|| invalid(key, "expected a boolean"))
 }
 
-fn set_drives(key: &str, target: &mut Vec<DriveConfig>, value: &Value) -> Result<(), ConfigError> {
-    let list = value
-        .as_array()
-        .ok_or_else(|| invalid(key, "must be a JSON array"))?;
-    let mut out = Vec::with_capacity(list.len());
-    for entry in list {
-        let drive: DriveConfig = serde_json::from_value(entry.clone())
-            .map_err(|err| invalid(key, &format!("drive entry: {err}")))?;
-        if drive.url.is_empty() {
-            return Err(invalid(key, "drive entries require a non-empty url"));
-        }
-        out.push(drive);
-    }
-    *target = out;
-    Ok(())
-}
-
-/// Renders the config as it would be written (pretty JSON, trailing newline).
+/// Renders the config as it would be written (pretty JSON, trailing
+/// newline).
 pub fn render(config: &ReactorConfig) -> String {
-    let mut text = serde_json::to_string_pretty(config).expect("config serializes");
-    text.push('\n');
-    text
+    let mut s = serde_json::to_string_pretty(config).expect("config serializes");
+    s.push('\n');
+    s
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::paths::StatePaths;
 
     fn temp_paths() -> (tempfile::TempDir, StatePaths) {
-        let dir = tempfile::TempDir::new().unwrap();
-        let paths = StatePaths::for_root(dir.path());
-        (dir, paths)
+        let t = tempfile::TempDir::new().unwrap();
+        let paths = StatePaths::for_root(t.path());
+        (t, paths)
     }
 
     #[test]
-    fn missing_file_creates_defaults() {
-        let (_tmp, paths) = temp_paths();
-        let config = load(&paths).unwrap();
-        assert_eq!(config, ReactorConfig::default());
+    fn load_creates_defaults_when_missing() {
+        let (_t, paths) = temp_paths();
+        let (config, fresh) = load_quiet(&paths).unwrap();
+        assert!(fresh);
+        assert_eq!(config.version, CONFIG_VERSION);
+        assert_eq!(config.instance.listen, DEFAULT_LISTEN);
         assert!(paths.config_file.exists());
-        // reload is stable
-        assert_eq!(load(&paths).unwrap(), config);
     }
 
     #[test]
-    fn corrupt_file_is_quarantined_and_replaced() {
-        let (_tmp, paths) = temp_paths();
-        fs::write(&paths.config_file, "{ not json").unwrap();
-        let config = load(&paths).unwrap();
-        assert_eq!(config, ReactorConfig::default());
-        let quarantined: Vec<_> = fs::read_dir(&paths.root)
-            .unwrap()
-            .filter_map(|e| e.ok())
-            .map(|e| e.file_name().to_string_lossy().into_owned())
-            .filter(|n| n.starts_with("config.json.corrupt-"))
-            .collect();
-        assert_eq!(quarantined.len(), 1);
+    fn load_quarantines_corrupt_file() {
+        let (_t, paths) = temp_paths();
+        std::fs::write(&paths.config_file, "{ not json").unwrap();
+        let (config, fresh) = load_quiet(&paths).unwrap();
+        assert!(fresh);
+        assert_eq!(config.version, CONFIG_VERSION);
+        let raw = std::fs::read_to_string(&paths.config_file).unwrap();
+        assert!(raw.starts_with('{'));
+        assert!(raw.contains("\"schemaVersion\": 2"));
     }
 
     #[test]
-    fn save_is_atomic_and_private() {
-        let (_tmp, paths) = temp_paths();
-        let config = ReactorConfig {
-            log_level: "debug".into(),
-            ..ReactorConfig::default()
-        };
+    fn unknown_fields_are_preserved() {
+        let (_t, paths) = temp_paths();
+        let mut config = load_quiet(&paths).unwrap().0;
+        config
+            .extra
+            .insert("future.thing".into(), Value::String("x".into()));
         save(&paths, &config).unwrap();
-        let meta = fs::metadata(&paths.config_file).unwrap();
-        assert_eq!(meta.permissions().mode() & 0o777, 0o600);
-        assert_eq!(load(&paths).unwrap(), config);
-    }
-
-    #[test]
-    fn unknown_fields_survive_round_trip() {
-        let (_tmp, paths) = temp_paths();
-        let raw = r#"{
-            "version": 1,
-            "logLevel": "warn",
-            "futureField": {"a": 1}
-        }"#;
-        fs::write(&paths.config_file, raw).unwrap();
-        let config = load(&paths).unwrap();
-        assert_eq!(config.log_level, "warn");
+        let re = load(&paths).unwrap();
         assert_eq!(
-            config.extra.get("futureField"),
-            Some(&Value::Object(serde_json::Map::from_iter(
-                [("a".into(), Value::from(1))].into_iter()
-            )))
+            re.extra.get("future.thing"),
+            Some(&Value::String("x".into()))
         );
-        save(&paths, &config).unwrap();
-        let reloaded = load(&paths).unwrap();
-        assert_eq!(reloaded.extra, config.extra);
     }
 
     #[test]
-    fn set_validates_and_updates() {
-        let mut config = ReactorConfig::default();
-        set(&mut config, "switchboard.port", &Value::from(4321)).unwrap();
-        assert_eq!(config.switchboard.port, 4321);
-        set(&mut config, "switchboard.port", &Value::from(0)).unwrap_err();
-        set(&mut config, "logLevel", &Value::from("verbose")).unwrap();
-        assert_eq!(config.log_level, "verbose");
-        set(&mut config, "logLevel", &Value::from("nope")).unwrap_err();
-        set(
-            &mut config,
-            "registry",
-            &Value::from("https://registry.dev.vetra.io/"),
-        )
-        .unwrap();
-        assert_eq!(config.registry, "https://registry.dev.vetra.io");
-        set(&mut config, "registry", &Value::from("not a url")).unwrap_err();
-        set(
-            &mut config,
-            "packages",
-            &serde_json::json!(["@powerhousedao/a", "@powerhousedao/b"]),
-        )
-        .unwrap();
-        assert_eq!(config.packages.len(), 2);
-        set(&mut config, "packages", &Value::from("nope")).unwrap_err();
-        set(&mut config, "version", &Value::from(2)).unwrap_err();
-    }
-
-    #[test]
-    fn set_drives_validates_url() {
+    fn set_validates_listen_as_multiaddr() {
         let mut config = ReactorConfig::default();
         set(
             &mut config,
-            "drives",
-            &serde_json::json!([
-                {
-                    "name": "Vault",
-                    "url": "https://light-colt-c497cfbd-switchboard.vetra.io/d/powerhouse-knowledge"
-                }
-            ]),
+            "instance.listen",
+            &Value::String("/ip4/0.0.0.0/tcp/4202".into()),
         )
         .unwrap();
-        assert_eq!(config.drives.len(), 1);
-        assert!(config.drives[0].available_offline);
-        assert!(!config.drives[0].paused);
-        set(&mut config, "drives", &serde_json::json!([{"name": "x"}])).unwrap_err();
+        assert_eq!(config.instance.listen, "/ip4/0.0.0.0/tcp/4202");
+        assert!(set(
+            &mut config,
+            "instance.listen",
+            &Value::String("nonsense".into())
+        )
+        .is_err());
     }
 
     #[test]
-    fn default_shape_matches_spec() {
-        let config = ReactorConfig::default();
-        let json = serde_json::to_value(&config).unwrap();
-        assert_eq!(json["version"], 1);
-        assert_eq!(json["switchboard"]["port"], 4001);
-        assert_eq!(
-            json["switchboard"]["packageSpec"],
-            "@powerhousedao/switchboard@latest"
-        );
-        assert_eq!(
-            json["switchboard"]["npmRegistry"],
-            "https://registry.npmjs.org"
-        );
-        assert_eq!(json["switchboard"]["node"]["minimumVersion"], "24");
-        assert_eq!(json["registry"], "https://registry.dev.vetra.io");
-        assert_eq!(json["packages"][0], "@powerhousedao/knowledge-note");
-        assert_eq!(json["settings"]["host"], "127.0.0.1");
-        assert_eq!(json["settings"]["port"], 4002);
-        assert_eq!(json["logLevel"], "info");
+    fn set_rejects_bad_loglevel_and_port() {
+        let mut config = ReactorConfig::default();
+        assert!(set(&mut config, "logLevel", &Value::String("loud".into())).is_err());
+        set(&mut config, "logLevel", &Value::String("debug".into())).unwrap();
+        assert!(set(&mut config, "settings.port", &Value::from(0)).is_err());
+        set(&mut config, "settings.port", &Value::from(9000)).unwrap();
+        assert_eq!(config.settings.port, 9000);
+    }
+
+    #[test]
+    fn set_token_env_accepts_string_and_null() {
+        let mut config = ReactorConfig::default();
+        set(&mut config, "p2p.tokenEnv", &Value::String("GATE".into())).unwrap();
+        assert_eq!(config.p2p.token_env.as_deref(), Some("GATE"));
+        set(&mut config, "p2p.tokenEnv", &Value::Null).unwrap();
+        assert!(config.p2p.token_env.is_none());
+    }
+
+    #[test]
+    fn fingerprint_changes_on_listen_and_token_env() {
+        let a = ReactorConfig::default();
+        let mut b = a.clone();
+        assert_eq!(a.process_fingerprint(), b.process_fingerprint());
+        b.instance.listen = "/ip4/0.0.0.0/tcp/4202".into();
+        assert_ne!(a.process_fingerprint(), b.process_fingerprint());
+        b = a.clone();
+        b.p2p.token_env = Some("X".into());
+        assert_ne!(a.process_fingerprint(), b.process_fingerprint());
+        // drive changes do not affect the fingerprint
+        b = a.clone();
+        b.drives.push(DriveConfig {
+            name: "v".into(),
+            addr: "/ip4/10.0.0.1/tcp/4201".into(),
+            ..Default::default()
+        });
+        assert_eq!(a.process_fingerprint(), b.process_fingerprint());
     }
 }

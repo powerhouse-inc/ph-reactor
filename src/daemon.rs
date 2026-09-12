@@ -1,39 +1,44 @@
-//! The daemon: assembles the switchboard supervisor, the settings
-//! server, the tray, and the status poller; and implements the CLI
-//! subcommands that talk to (or work around) a running daemon.
+//! The daemon: assembles the p2p sync engine, the local doc store, the
+//! settings server, the tray, and the status poller; and implements the
+//! CLI subcommands that talk to (or work around) a running daemon.
 //!
 //! Lifecycle:
-//! `run` → bootstrap (node + switchboard) → supervisor task + settings
-//! server + tray → event/command/poll loop → on SIGTERM/SIGINT: stop
-//! the tray, signal the supervisor (graceful child stop), close the
-//! settings server, release the lock, remove the pidfile.
+//! `run` → identity key → doc store → p2p engine task + settings
+//! server + tray → event/command/poll loop → on SIGTERM/SIGINT: shut
+//! down the engine, stop the tray and the settings server, release the
+//! lock, remove the pidfile.
+//!
+//! The engine runs on its own tokio task; the daemon's loop consumes
+//! its [`EngineEvent`] stream (drive status changes, doc changes, the
+//! identity announcement) and feeds the shared status snapshot.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
-use std::path::{Path, PathBuf};
+use std::path::Path;
+use std::str::FromStr;
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime};
 
 use anyhow::{bail, Context, Result};
+use libp2p::{Multiaddr, PeerId};
 use tokio::sync::{mpsc, watch};
 use tokio::time::interval;
 
-use crate::bootstrap::{node, switchboard};
 use crate::commands::{Command, DriveOp};
 use crate::config::{self, DriveConfig, ReactorConfig};
-use crate::drives;
+use crate::drives::{Drive, DriveStatus};
+use crate::p2p::{self, EngineCommand, EngineEvent, SyncEngine};
 use crate::paths::StatePaths;
-use crate::registry;
 use crate::settings::Settings;
-use crate::status::{self, DriveStatusEntry, StatusSnapshot, SwitchboardStatus};
-use crate::supervisor::{ShutdownSignal, StatusEvent, Supervisor, SupervisorState};
+use crate::status::{self, DriveStatusEntry, ReactorStatus, StatusSnapshot};
+use crate::store::Store;
 use crate::tray;
 
 /// How often the daemon refreshes the status snapshot.
 const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long `run --daemonize` waits for the child to become ready.
-const DAEMONIZE_TIMEOUT: Duration = Duration::from_secs(300);
+const DAEMONIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `stop` waits for a graceful exit before SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(15);
 
@@ -41,7 +46,8 @@ const STOP_GRACE: Duration = Duration::from_secs(15);
 // run
 // ---------------------------------------------------------------------------
 
-/// Runs the daemon in the foreground (used when `--daemonize` is not set).
+/// Runs the daemon in the foreground (used when `--daemonize` is not
+/// set).
 pub async fn run(state_dir: Option<&Path>, daemonize: bool) -> Result<()> {
     assert!(
         !daemonize,
@@ -105,8 +111,8 @@ pub fn run_daemonized(state_dir: Option<&Path>) -> Result<i32> {
     }
 }
 
-/// The daemon proper: bootstrap, supervisor, settings server, tray, and
-/// the status/command loop. Runs on a fresh runtime in both modes.
+/// The daemon proper: store, p2p engine, settings server, tray, and the
+/// status/command loop. Runs on a fresh runtime in both modes.
 async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     let paths = StatePaths::resolve(state_dir);
     paths
@@ -120,42 +126,68 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     std::fs::write(paths.daemon_pidfile(), pid.to_string())
         .with_context(|| format!("writing {}", paths.daemon_pidfile().display()))?;
 
-    // Channels: status fan-out, the single-writer command channel,
-    // supervisor events, shutdown, and the hot config.
+    // The identity: one ed25519 key per state dir (0600). The Keypair
+    // is the libp2p/gossipsub identity; the dalek SigningKey (same
+    // bytes) signs doc ops.
+    let kp = p2p::load_or_create_identity(&paths.key_file())
+        .map_err(anyhow::Error::msg)
+        .with_context(|| {
+            format!(
+                "loading the identity key from {}",
+                paths.key_file().display()
+            )
+        })?;
+    let peer_id = p2p::peer_id_of(&kp);
+    let signing = p2p::signing_key(&kp).map_err(anyhow::Error::msg)?;
+    let _pubkey = p2p::public_key_bytes(&kp).map_err(anyhow::Error::msg)?;
+
+    let listen = Multiaddr::from_str(&config.instance.listen)
+        .with_context(|| format!("config instance.listen ({})", config.instance.listen))?;
+    check_listen_port(&listen)?;
+
+    // The doc store (snapshots + live logs under <state>/docs).
+    let store =
+        Store::open(&paths.docs_dir, &signing, &peer_id.to_base58()).map_err(anyhow::Error::msg)?;
+    tracing::info!(
+        "store ready ({} live docs, peer {})",
+        store.live_doc_count(),
+        peer_id
+    );
+
+    // The p2p engine (its own task; talks to this loop through two
+    // unbounded channels).
+    let (eng_cmd_tx, eng_cmd_rx) = mpsc::unbounded_channel::<EngineCommand>();
+    let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<EngineEvent>();
+    let token = config
+        .p2p
+        .token_env
+        .as_deref()
+        .and_then(|n| std::env::var(n).ok())
+        .filter(|s| !s.is_empty());
+    let engine = SyncEngine::new(
+        &kp,
+        store.clone(),
+        &config.instance.name,
+        listen,
+        config.p2p.mdns,
+        token,
+        eng_cmd_rx,
+        evt_tx,
+    )
+    .context("building the p2p engine")?;
+    let mut engine_task = tokio::spawn(async move {
+        engine.run().await;
+    });
+
+    // Channels: status fan-out and the single-writer command channel
+    // (tray + settings + CLI all send here).
+    let settings_url = format!("http://{}:{}", config.settings.host, config.settings.port);
     let (snap_tx, snap_rx) = watch::channel(StatusSnapshot::empty(
         crate::VERSION.to_string(),
-        config.switchboard.port,
-        format!("http://{}:{}", config.settings.host, config.settings.port),
+        config.instance.listen.clone(),
+        settings_url.clone(),
     ));
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
-    let (evt_tx, mut evt_rx) = mpsc::unbounded_channel::<StatusEvent>();
-    let (shutdown, daemon_shutdown) = ShutdownSignal::new();
-    let (cfg_tx, cfg_rx) = watch::channel(config.clone());
-
-    // Bootstrap the node runtime and the switchboard package.
-    let node = node::resolve(
-        &config.switchboard.node.minimum_version,
-        config.switchboard.node.prefer_system,
-        &paths,
-    )
-    .await
-    .with_context(|| "resolving the Node runtime")?;
-    tracing::info!("using node {} at {}", node.version, node.path.display());
-    bootstrap_switchboard(&paths, &node, &config)
-        .await
-        .context("bootstrapping the switchboard")?;
-
-    // The supervision loop.
-    let sup = Supervisor::new(config.clone(), node, paths.clone(), evt_tx, cfg_rx);
-    let sup_status = sup.status.clone();
-    let mut supervisor_task = tokio::spawn({
-        let shutdown = daemon_shutdown;
-        async move {
-            if let Err(err) = sup.run(&shutdown).await {
-                tracing::error!("supervisor stopped: {err:#}");
-            }
-        }
-    });
 
     // The loopback settings server.
     let settings = Settings::new(cmd_tx.clone(), snap_rx.clone())
@@ -175,53 +207,70 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         tray::Tray::Running { .. } => tracing::info!("tray started"),
     }
 
-    // The daemonized parent is polling for this file.
-    let _ = std::fs::write(paths.run_dir.join("ready"), pid.to_string());
-
     let mut ctx = Ctx {
         paths: paths.clone(),
         config,
-        cfg_tx,
-        sup_status,
+        peer_id,
+        store,
+        eng_cmd_tx,
         last_save_mtime: std::fs::metadata(&paths.config_file)
             .and_then(|m| m.modified())
             .unwrap_or(SystemTime::UNIX_EPOCH),
-        drive_outcomes: HashMap::new(),
-        drive_attempt_urls: HashMap::new(),
+        engine_drives: Vec::new(),
+        drive_views: HashMap::new(),
+        reactor_healthy: false,
+        last_event: None,
+        stopping: false,
     };
+
+    // The daemonized parent is polling for this file.
+    let _ = std::fs::write(paths.run_dir.join("ready"), pid.to_string());
+    tracing::info!(
+        "ph-reactor {v} ready (settings {url}, peer {peer})",
+        v = crate::VERSION,
+        url = settings_url,
+        peer = peer_id,
+    );
+
+    // Seed the engine with the drives already in the config (a restart
+    // must not lose the user's drive list).
+    for d in &ctx.config.drives {
+        let addr = match Multiaddr::from_str(&d.addr) {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!("configured drive '{}' has a bad address: {e}", d.name);
+                continue;
+            }
+        };
+        ctx.engine_drives.push(d.name.clone());
+        let _ = ctx.eng_cmd_tx.send(EngineCommand::AddDrive(Drive {
+            name: d.name.clone(),
+            addr,
+            token_env: d.token_env.clone(),
+            paused: d.paused,
+            available_offline: d.available_offline,
+        }));
+    }
     let mut tick = interval(POLL_INTERVAL);
     tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
     let mut term = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())
         .context("installing the SIGTERM handler")?;
-    tracing::info!(
-        "ph-reactor {v} ready (settings http://{host}:{port})",
-        v = crate::VERSION,
-        host = ctx.config.settings.host,
-        port = ctx.config.settings.port,
-    );
 
-    while !shutdown.is_cancelled() {
+    while !ctx.stopping {
         tokio::select! {
             _ = tokio::signal::ctrl_c() => {
                 tracing::info!("SIGINT received; shutting down");
-                shutdown.trigger();
+                ctx.stopping = true;
                 break;
             }
             _ = term.recv() => {
                 tracing::info!("SIGTERM received; shutting down");
-                shutdown.trigger();
+                ctx.stopping = true;
                 break;
             }
             event = evt_rx.recv() => {
                 match event {
-                    Some(e) => {
-                        tracing::debug!("supervisor: {}", e.summary());
-                        if matches!(e, StatusEvent::Healthy { .. }) {
-                            readd_drives(&mut ctx).await;
-                            let snap = refresh_status(&ctx).await;
-                            let _ = snap_tx.send(snap);
-                        }
-                    }
+                    Some(ev) => on_engine_event(&mut ctx, ev),
                     None => break,
                 }
             }
@@ -229,10 +278,10 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
                 match command {
                     Some(cmd) => {
                         let label = format!("{cmd:?}");
-                        match execute_command(&mut ctx, cmd, &snap_tx).await {
+                        match execute_command(&mut ctx, cmd) {
                             Ok(quit) => {
                                 if quit {
-                                    shutdown.trigger();
+                                    ctx.stopping = true;
                                     break;
                                 }
                             }
@@ -246,17 +295,17 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
                 adopt_external(&mut ctx, false);
             }
         }
-        let snap = refresh_status(&ctx).await;
+        let snap = refresh_status(&ctx, &settings_url);
         let _ = snap_tx.send(snap);
     }
 
-    // Graceful shutdown.
-    shutdown.trigger();
+    // Graceful shutdown: stop the engine, then the services.
+    let _ = ctx.eng_cmd_tx.send(EngineCommand::Shutdown);
     tray.stop();
-    match tokio::time::timeout(Duration::from_secs(30), &mut supervisor_task).await {
-        Ok(Ok(())) => tracing::info!("supervisor stopped"),
-        Ok(Err(err)) => tracing::warn!("supervisor task: {err}"),
-        Err(_) => tracing::warn!("supervisor did not stop in time"),
+    match tokio::time::timeout(Duration::from_secs(30), &mut engine_task).await {
+        Ok(Ok(())) => tracing::info!("p2p engine stopped"),
+        Ok(Err(err)) => tracing::warn!("engine task: {err}"),
+        Err(_) => tracing::warn!("engine did not stop in time"),
     }
     settings.stop();
     remove_ready(&paths);
@@ -270,28 +319,245 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
 struct Ctx {
     paths: StatePaths,
     config: ReactorConfig,
-    cfg_tx: watch::Sender<ReactorConfig>,
-    sup_status: Arc<tokio::sync::Mutex<SupervisorState>>,
+    peer_id: PeerId,
+    store: Arc<Store>,
+    /// The engine's command channel.
+    eng_cmd_tx: mpsc::UnboundedSender<EngineCommand>,
     /// Mtime of `config.json` as of the daemon's last write (and at
     /// startup). Anything newer is an external edit.
     last_save_mtime: SystemTime,
-    /// Last registration attempt per configured drive (by name); feeds
-    /// the drive status views (`connecting` / `requires-auth` / `error`).
-    drive_outcomes: HashMap<String, drives::AddOutcome>,
-    /// The URL of the last add attempt per drive name — kept for drives
-    /// whose add failed (they never enter `config.drives`) so the status
-    /// view can show which remote was rejected.
-    drive_attempt_urls: HashMap<String, String>,
+    /// Drives currently known to the engine (by name).
+    engine_drives: Vec<String>,
+    /// Last reported status per drive name (from the engine).
+    drive_views: HashMap<String, (DriveStatus, Option<String>)>,
+    /// The engine announced a working identity/listen.
+    reactor_healthy: bool,
+    /// Most recent one-line event (status page + tray).
+    last_event: Option<String>,
+    /// Set on shutdown signals / Quit; ends the loop.
+    stopping: bool,
 }
 
+// ---------------------------------------------------------------------------
+// Engine events
+// ---------------------------------------------------------------------------
+
+/// Folds one engine event into the daemon's view of the world.
+fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
+    match ev {
+        EngineEvent::Identity { peer_id, listen } => {
+            ctx.reactor_healthy = true;
+            ctx.last_event = Some(format!("p2p listening on {listen}"));
+            tracing::info!("engine: listening ({peer_id})");
+        }
+        EngineEvent::DriveStatus {
+            name,
+            status,
+            detail,
+        } => {
+            ctx.drive_views
+                .insert(name.clone(), (status, detail.clone()));
+            ctx.last_event = Some(format!(
+                "drive {name}: {}{}",
+                status.as_str(),
+                detail
+                    .as_deref()
+                    .map(|d| format!(" ({d})"))
+                    .unwrap_or_default()
+            ));
+            tracing::debug!("engine: drive {name} -> {}", status.as_str());
+        }
+        EngineEvent::DocChanged { name } => {
+            ctx.last_event = Some(match name {
+                Some(n) => format!("doc updated: {n}"),
+                None => "remote doc change".into(),
+            });
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Commands
+// ---------------------------------------------------------------------------
+
+/// Executes one user command. Returns `Ok(true)` when the command asks
+/// the daemon to stop itself.
+fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
+    let pause_resume = matches!(&cmd, Command::PauseDrive { .. });
+    match cmd {
+        Command::AddDrive {
+            name,
+            addr,
+            token_env,
+            offline,
+        } => {
+            let addr = addr.trim().to_string();
+            let addr_ma = Multiaddr::from_str(&addr)
+                .with_context(|| format!("'{}' is not a valid multiaddr", addr))?;
+            let name = if name.trim().is_empty() {
+                default_drive_name(&addr_ma)
+            } else {
+                name.trim().to_string()
+            };
+            if ctx
+                .config
+                .drives
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&name))
+            {
+                bail!("a drive named '{name}' is already configured");
+            }
+            let drive = Drive {
+                name: name.clone(),
+                addr: addr_ma.clone(),
+                token_env,
+                paused: false,
+                available_offline: offline,
+            };
+            ctx.config.drives.push(DriveConfig {
+                name: name.clone(),
+                addr: addr_ma.to_string(),
+                token_env: drive.token_env.clone(),
+                paused: false,
+                available_offline: offline,
+            });
+            ctx.engine_drives.push(name.clone());
+            persist_config(ctx)?;
+            let _ = ctx.eng_cmd_tx.send(EngineCommand::AddDrive(drive));
+            ctx.last_event = Some(format!("added drive '{name}'"));
+            tracing::info!("added drive '{name}' ({addr})");
+        }
+        Command::RemoveDrive { name } => {
+            let Some(idx) = ctx
+                .config
+                .drives
+                .iter()
+                .position(|d| d.name.eq_ignore_ascii_case(&name))
+            else {
+                bail!("drive '{name}' is not configured");
+            };
+            ctx.config.drives.remove(idx);
+            let gone = ctx.engine_drives.clone();
+            ctx.engine_drives.retain(|n| !n.eq_ignore_ascii_case(&name));
+            for n in gone.iter().filter(|n| n.eq_ignore_ascii_case(&name)) {
+                let _ = ctx
+                    .eng_cmd_tx
+                    .send(EngineCommand::RemoveDrive { name: n.clone() });
+            }
+            ctx.drive_views.remove(&name);
+            persist_config(ctx)?;
+            ctx.last_event = Some(format!("removed drive '{name}'"));
+            tracing::info!("removed drive '{name}'");
+        }
+        Command::PauseDrive { name } | Command::ResumeDrive { name } => {
+            let paused = pause_resume;
+            let Some(d) = ctx
+                .config
+                .drives
+                .iter_mut()
+                .find(|d| d.name.eq_ignore_ascii_case(&name))
+            else {
+                bail!("drive '{name}' is not configured");
+            };
+            d.paused = paused;
+            persist_config(ctx)?;
+            let _ = ctx.eng_cmd_tx.send(EngineCommand::SetPaused {
+                name: name.clone(),
+                paused,
+            });
+            ctx.last_event = Some(format!(
+                "{} drive '{name}'",
+                if paused { "paused" } else { "resumed" }
+            ));
+        }
+        Command::ResyncDrive { name } => {
+            if !ctx
+                .config
+                .drives
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&name))
+            {
+                bail!("drive '{name}' is not configured");
+            }
+            let _ = ctx
+                .eng_cmd_tx
+                .send(EngineCommand::Resync { name: name.clone() });
+            ctx.last_event = Some(format!("re-syncing drive '{name}'"));
+        }
+        Command::SetConfig { key, value } => {
+            let before = ctx.config.process_fingerprint();
+            config::set(&mut ctx.config, &key, &value)?;
+            persist_config(ctx)?;
+            if ctx.config.process_fingerprint() != before {
+                ctx.last_event = Some(format!("config: set {key} (restart the daemon to apply)"));
+                tracing::info!("config: set {key} — a restart is needed to apply it");
+            } else {
+                ctx.last_event = Some(format!("config: set {key}"));
+            }
+        }
+        Command::CreateDoc {
+            name,
+            fields,
+            reply,
+        } => match ctx.store.create_doc(&name, fields) {
+            Ok(id) => {
+                tracing::info!("created doc '{name}' ({id})");
+                ctx.last_event = Some(format!("created doc '{name}'"));
+                let _ = reply.send(Ok(()));
+            }
+            Err(e) => {
+                tracing::warn!("doc create '{name}' failed: {e}");
+                let _ = reply.send(Err(e));
+            }
+        },
+        Command::Quit => {
+            tracing::info!("quit requested");
+            ctx.stopping = true;
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
+
+/// A default name for an unnamed drive: the peer id when the multiaddr
+/// carries one, else the port.
+fn default_drive_name(addr: &Multiaddr) -> String {
+    for p in addr.iter() {
+        if let libp2p::multiaddr::Protocol::P2p(pid) = p {
+            let b58 = pid.to_base58();
+            return format!("peer-{}", &b58[..8.min(b58.len())]);
+        }
+    }
+    for p in addr.iter() {
+        if let libp2p::multiaddr::Protocol::Tcp(port) = p {
+            return format!("drive-{port}");
+        }
+    }
+    "drive".into()
+}
+
+/// Saves the daemon config. External edits are adopted first so they
+/// are not clobbered.
+fn persist_config(ctx: &mut Ctx) -> Result<()> {
+    adopt_external(ctx, true);
+    config::save(&ctx.paths, &ctx.config)?;
+    ctx.last_save_mtime = std::fs::metadata(&ctx.paths.config_file)
+        .and_then(|m| m.modified())
+        .unwrap_or(SystemTime::UNIX_EPOCH);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// External config edits
+// ---------------------------------------------------------------------------
+
 /// Picks up out-of-band edits to `config.json` (e.g. a separate
-/// `ph-reactor config set` from another terminal): adopts the file and,
-/// when the process-relevant fields changed, tells the supervisor to
-/// respawn the switchboard.
+/// `ph-reactor config set` from another terminal): adopts the file and
+/// syncs the engine's drive set to the new config.
 ///
 /// With `preserve_drives` the daemon keeps its in-memory drive list
-/// (used before persisting: the running command owns the drives, and
-/// only the other fields are adopted, so a concurrent edit is not
+/// (used right before persisting: the running command owns the drives,
+/// and only the other fields are adopted, so a concurrent edit is not
 /// clobbered). Between commands the file is fully authoritative.
 fn adopt_external(ctx: &mut Ctx, preserve_drives: bool) {
     let mtime = match std::fs::metadata(&ctx.paths.config_file).and_then(|m| m.modified()) {
@@ -313,399 +579,59 @@ fn adopt_external(ctx: &mut Ctx, preserve_drives: bool) {
         ctx.last_save_mtime = mtime;
         return;
     }
-    let respawn = reloaded.process_fingerprint() != ctx.config.process_fingerprint();
+    let restart_needed = reloaded.process_fingerprint() != ctx.config.process_fingerprint();
     if preserve_drives {
         reloaded.drives = std::mem::take(&mut ctx.config.drives);
     }
     ctx.config = reloaded;
     ctx.last_save_mtime = mtime;
-    if respawn {
-        tracing::info!("config changed; restarting the switchboard");
-        let _ = ctx.cfg_tx.send(ctx.config.clone());
+    if restart_needed {
+        tracing::info!("config changed; restart ph-reactor to apply it");
+        ctx.last_event = Some("config changed (restart to apply)".into());
     } else {
         tracing::debug!("config reloaded");
     }
-}
-
-/// How long a drive command may wait for the switchboard to be ready
-/// (covers daemon startup and config-triggered respawns).
-const WAIT_READY_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Drive commands need the local switchboard's MCP endpoint. `/health`
-/// can pass before the MCP server is mounted (it registers after the
-/// document model packages load), so the gate verifies the actual MCP
-/// handshake. Actions that arrive while the child is starting up or
-/// being respawned wait for it instead of failing.
-async fn wait_switchboard_ready(ctx: &Ctx) -> Result<()> {
-    let deadline = Instant::now() + WAIT_READY_TIMEOUT;
-    loop {
-        let healthy = ctx.sup_status.lock().await.healthy;
-        // Short-circuits: the MCP probe only runs when the switchboard
-        // is up (its /health answered).
-        let mcp_ok = healthy
-            && crate::mcp::Mcp::new(ctx.config.switchboard.port, None)
-                .session()
-                .await
-                .is_ok();
-        if mcp_ok {
-            return Ok(());
-        }
-        if Instant::now() >= deadline {
-            bail!("switchboard is not ready (yet); try again in a moment");
-        }
-        tokio::time::sleep(Duration::from_secs(2)).await;
-    }
-}
-
-/// Every (re)start of the child rebuilds the in-memory sync channels;
-/// the registered drives themselves live in the reactor's persisted
-/// store and are restored at boot. This hook re-runs the (idempotent)
-/// registration for every configured, non-paused drive once the child
-/// reports healthy: a fresh install or a restored registration that
-/// never completed (e.g. a remote that rejected the first attempt) is
-/// completed here, and the outcome of each attempt is recorded so the
-/// status view can explain what a non-materialized drive is waiting
-/// for. Paused drives stay out.
-async fn readd_drives(ctx: &mut Ctx) {
-    if !ctx.config.drives.iter().any(|d| !d.paused) {
-        return;
-    }
-    // `/health` can pass before the MCP endpoint is mounted; wait for
-    // the handshake before registering.
-    if wait_switchboard_ready(ctx).await.is_err() {
-        return;
-    }
-    for drive in ctx.config.drives.iter().filter(|d| !d.paused) {
-        let token = drive_token(&drive.token_env);
-        match drives::add_quiet(&ctx.config, drive, token).await {
-            Ok(id) => {
-                ctx.drive_outcomes
-                    .insert(drive.name.clone(), drives::AddOutcome::Added);
-                tracing::info!(
-                    "re-registered drive '{}' ({id}) after switchboard restart",
-                    drive.name
-                )
-            }
-            Err(err) => {
-                let outcome = drives::classify_add_error(&err);
-                ctx.drive_outcomes.insert(drive.name.clone(), outcome);
-                tracing::warn!("re-registering drive {} failed: {err:#}", drive.name);
-            }
-        }
-    }
-}
-/// Executes one user command. Returns `Ok(true)` when the command asks
-/// the daemon to stop itself.
-async fn execute_command(
-    ctx: &mut Ctx,
-    cmd: Command,
-    snap_tx: &watch::Sender<StatusSnapshot>,
-) -> Result<bool> {
-    if matches!(
-        cmd,
-        Command::AddDrive { .. }
-            | Command::RemoveDrive { .. }
-            | Command::PauseDrive { .. }
-            | Command::ResumeDrive { .. }
-            | Command::ResyncDrive { .. }
-    ) {
-        wait_switchboard_ready(ctx).await?;
-    }
-    match cmd {
-        Command::AddDrive {
-            name,
-            url,
-            token_env,
-            offline,
-        } => {
-            // Record the attempted URL before the op consumes it, so a
-            // failed add (drive never enters the config) still shows in
-            // the status view with the rejected remote.
-            ctx.drive_attempt_urls.insert(name.clone(), url.clone());
-            let op = DriveOp::Add {
-                name,
-                url,
-                token_env,
-                offline,
-            };
-            let detail = {
-                let outcomes = &mut ctx.drive_outcomes;
-                apply_drive_change(&mut ctx.config, op, outcomes).await
-            }?;
-            persist_config(ctx, false).await?;
-            push_status(ctx, snap_tx).await;
-            tracing::info!("{detail}");
-        }
-        Command::RemoveDrive { name } => {
-            ctx.drive_attempt_urls.remove(&name);
-            let op = DriveOp::Remove { name };
-            let detail = {
-                let outcomes = &mut ctx.drive_outcomes;
-                apply_drive_change(&mut ctx.config, op, outcomes).await
-            }?;
-            persist_config(ctx, false).await?;
-            push_status(ctx, snap_tx).await;
-            tracing::info!("{detail}");
-        }
-        Command::PauseDrive { name } => {
-            let op = DriveOp::Pause { name };
-            let detail = {
-                let outcomes = &mut ctx.drive_outcomes;
-                apply_drive_change(&mut ctx.config, op, outcomes).await
-            }?;
-            persist_config(ctx, false).await?;
-            push_status(ctx, snap_tx).await;
-            tracing::info!("{detail}");
-        }
-        Command::ResumeDrive { name } => {
-            // Flip the flag and persist it first (visible in status and
-            // the tray immediately), then run the re-add, which may take
-            // a while (bounded materialization poll).
-            // A missing drive is reported by the op below.
-            if let Ok(d) = find_drive_mut(&mut ctx.config, &name) {
-                d.paused = false;
-            }
-            persist_config(ctx, false).await?;
-            push_status(ctx, snap_tx).await;
-            let op = DriveOp::Resume { name };
-            let detail = {
-                let outcomes = &mut ctx.drive_outcomes;
-                apply_drive_change(&mut ctx.config, op, outcomes).await
-            }?;
-            persist_config(ctx, false).await?;
-            push_status(ctx, snap_tx).await;
-            tracing::info!("{detail}");
-        }
-        Command::ResyncDrive { name } => {
-            let op = DriveOp::Resync { name };
-            let detail = {
-                let outcomes = &mut ctx.drive_outcomes;
-                apply_drive_change(&mut ctx.config, op, outcomes).await
-            }?;
-            persist_config(ctx, false).await?;
-            push_status(ctx, snap_tx).await;
-            tracing::info!("{detail}");
-        }
-        Command::SetConfig { key, value } => {
-            config::set(&mut ctx.config, &key, &value)?;
-            persist_config(ctx, true).await?;
-            push_status(ctx, snap_tx).await;
-            tracing::info!("config: set {key}");
-        }
-        Command::Quit => {
-            tracing::info!("quit requested");
-            let mut s = ctx.sup_status.lock().await;
-            s.last_event = Some(StatusEvent::Stopped);
-            return Ok(true);
-        }
-    }
-    Ok(false)
-}
-
-/// Pushes a fresh snapshot. Drive ops can be long (the bounded
-/// materialization poll); the loop's own refresh only runs between
-/// commands, so the status and tray would otherwise sit stale.
-async fn push_status(ctx: &Ctx, snap_tx: &watch::Sender<StatusSnapshot>) {
-    let snap = refresh_status(ctx).await;
-    let _ = snap_tx.send(snap);
-}
-
-/// Saves the daemon config, rewrites the switchboard's config file, and
-/// pushes the new config to the supervisor. Drives live in the switchboard's
-/// own store, so drive mutations must not respawn the child (that would
-/// abort the in-flight sync); process-affecting keys do.
-async fn persist_config(ctx: &mut Ctx, respawn: bool) -> Result<()> {
-    // A concurrent external edit (another `ph-reactor config set`) is
-    // adopted before writing, so it is not clobbered. The daemon stays
-    // authoritative over the drive list.
-    adopt_external(ctx, true);
-    config::save(&ctx.paths, &ctx.config)?;
-    switchboard::write_runtime_files(&ctx.paths, &ctx.config)?;
-    ctx.last_save_mtime = std::fs::metadata(&ctx.paths.config_file)
-        .and_then(|m| m.modified())
-        .unwrap_or(SystemTime::UNIX_EPOCH);
-    if respawn {
-        let _ = ctx.cfg_tx.send(ctx.config.clone());
-    }
-    Ok(())
-}
-
-// ---------------------------------------------------------------------------
-// Drive operations (shared by the daemon command loop and the CLI)
-// ---------------------------------------------------------------------------
-
-/// Resolves a drive by name (case-insensitive).
-fn find_drive<'a>(config: &'a ReactorConfig, name: &str) -> Result<&'a DriveConfig> {
-    config
+    // Sync the engine's drive set with the new config.
+    let wanted: Vec<Drive> = ctx
+        .config
         .drives
         .iter()
-        .find(|d| d.name.eq_ignore_ascii_case(name))
-        .with_context(|| format!("drive '{name}' not configured (see `ph-reactor drive list`)"))
-}
-
-fn find_drive_mut<'a>(config: &'a mut ReactorConfig, name: &str) -> Result<&'a mut DriveConfig> {
-    config
-        .drives
-        .iter_mut()
-        .find(|d| d.name.eq_ignore_ascii_case(name))
-        .with_context(|| format!("drive '{name}' not configured (see `ph-reactor drive list`)"))
-}
-
-/// The bearer token for a drive: the value of its `tokenEnv`, when set
-/// and non-empty. Never stored, never logged.
-fn drive_token(token_env: &Option<String>) -> Option<String> {
-    match token_env {
-        Some(var) => std::env::var(var).ok().filter(|t| !t.is_empty()),
-        None => None,
-    }
-}
-
-/// Applies a drive mutation: the live MCP call against the running
-/// switchboard plus the persisted config update. Returns a one-line
-/// summary. `config` is updated in place (the caller persists); every
-/// registration attempt is recorded in `outcomes` (keyed by drive name)
-/// so the status view can explain a drive that never materialized.
-pub async fn apply_drive_change(
-    config: &mut ReactorConfig,
-    op: DriveOp,
-    outcomes: &mut HashMap<String, drives::AddOutcome>,
-) -> Result<String> {
-    match op {
-        DriveOp::Add {
-            name,
-            url,
-            token_env,
-            offline,
-        } => {
-            let url = url.trim().to_string();
-            let token = drive_token(&token_env);
-            let info = match drives::fetch_drive_info(&url, token.as_deref()).await {
-                Ok(info) => info,
-                Err(err) => {
-                    let outcome = drives::classify_add_error(&err);
-                    outcomes.insert(name.trim().to_string(), outcome);
-                    bail!(add_failure_message(&err));
-                }
-            };
-            let name = if name.trim().is_empty() {
-                info.name
-                    .filter(|n| !n.trim().is_empty())
-                    .unwrap_or_else(|| {
-                        drives::parse_drive_url(&url)
-                            .map(|(_, _, slug)| slug)
-                            .unwrap_or_else(|_| "drive".into())
-                    })
-            } else {
-                name.trim().to_string()
-            };
-            if find_drive(config, &name).is_ok() {
-                bail!("a drive named '{name}' is already configured");
-            }
-            let drive = DriveConfig {
-                name: name.clone(),
-                url: url.clone(),
-                token_env,
-                available_offline: offline,
-                paused: false,
-            };
-            match drives::add(config, &drive, token).await {
-                Ok(id) => {
-                    outcomes.insert(name.clone(), drives::AddOutcome::Added);
-                    config.drives.push(drive);
-                    Ok(format!("added drive '{name}' ({url}) as {id}"))
-                }
-                Err(err) => {
-                    let outcome = drives::classify_add_error(&err);
-                    outcomes.insert(name.clone(), outcome);
-                    Err(anyhow::anyhow!(add_failure_message(&err)))
-                }
-            }
-        }
-        DriveOp::Remove { name } => {
-            let drive = find_drive(config, &name)
-                .cloned()
-                .context("no such drive")?;
-            drives::remove(config, &drive, drive_token(&drive.token_env))
-                .await
-                .with_context(|| format!("removing drive {name}"))?;
-            outcomes.remove(&drive.name);
-            config.drives.retain(|d| d.name != name);
-            Ok(format!("removed drive '{name}'"))
-        }
-        DriveOp::Pause { name } => {
-            let drive = find_drive(config, &name)
-                .cloned()
-                .context("no such drive")?;
-            if drive.paused {
-                return Ok(format!("drive '{name}' is already paused"));
-            }
-            drives::remove(config, &drive, drive_token(&drive.token_env))
-                .await
-                .with_context(|| format!("pausing drive {name}"))?;
-            let d = find_drive_mut(config, &name)?;
-            d.paused = true;
-            outcomes.remove(&drive.name);
-            Ok(format!(
-                "paused drive '{name}' (local mirror deleted; resume to re-sync)"
-            ))
-        }
-        DriveOp::Resume { name } => {
-            let mut drive = find_drive(config, &name)
-                .cloned()
-                .context("no such drive")?;
-            if drive.paused {
-                drive.paused = false;
-                find_drive_mut(config, &name)?.paused = false;
-            }
-            let token = drive_token(&drive.token_env);
-            match drives::add(config, &drive, token).await {
-                Ok(_id) => {
-                    outcomes.insert(drive.name.clone(), drives::AddOutcome::Added);
-                    Ok(format!("resumed drive '{}'", drive.name))
-                }
-                Err(err) => {
-                    let outcome = drives::classify_add_error(&err);
-                    outcomes.insert(drive.name.clone(), outcome);
-                    Err(anyhow::anyhow!(add_failure_message(&err)))
-                }
-            }
-        }
-        DriveOp::Resync { name } => {
-            let mut drive = find_drive(config, &name)
-                .cloned()
-                .context("no such drive")?;
-            let token = drive_token(&drive.token_env);
-            // Delete the local mirror first (ignored when absent),
-            // then re-add: the re-add re-syncs from the remote.
-            let _ = drives::remove(config, &drive, token.clone()).await;
-            drive.paused = false;
-            match drives::add(config, &drive, token).await {
-                Ok(_id) => {
-                    let d = find_drive_mut(config, &name)?;
-                    *d = drive;
-                    outcomes.insert(name.clone(), drives::AddOutcome::Added);
-                    Ok(format!("re-synced drive '{name}'"))
-                }
-                Err(err) => {
-                    let outcome = drives::classify_add_error(&err);
-                    outcomes.insert(name.clone(), outcome);
-                    let d = find_drive_mut(config, &name)?;
-                    *d = drive;
-                    Err(anyhow::anyhow!(add_failure_message(&err)))
-                }
-            }
+        .filter_map(|d| {
+            let addr = Multiaddr::from_str(&d.addr).ok()?;
+            Some(Drive {
+                name: d.name.clone(),
+                addr,
+                token_env: d.token_env.clone(),
+                paused: d.paused,
+                available_offline: d.available_offline,
+            })
+        })
+        .collect();
+    let wanted_names: Vec<String> = wanted.iter().map(|d| d.name.clone()).collect();
+    for d in wanted {
+        if !ctx.engine_drives.contains(&d.name) {
+            ctx.engine_drives.push(d.name.clone());
+            let _ = ctx.eng_cmd_tx.send(EngineCommand::AddDrive(d));
         }
     }
-}
-
-/// Formats a failed registration for the user: a permission rejection
-/// gets the remedy (a per-drive token); anything else passes through.
-fn add_failure_message(err: &anyhow::Error) -> String {
-    match drives::classify_add_error(err) {
-        drives::AddOutcome::RequiresAuth(_msg) => format!(
-            "{err:#}; the remote requires authentication for its sync endpoint. Add the drive again with --token-env NAME and set NAME to a token the remote accepts (the value is read from the environment and never written to disk)"
-        ),
-        _ => err.to_string(),
+    let stale = ctx.engine_drives.clone();
+    ctx.engine_drives
+        .retain(|n| wanted_names.iter().any(|w| w == n));
+    for name in stale
+        .into_iter()
+        .filter(|n| !wanted_names.iter().any(|w| w == n))
+    {
+        ctx.drive_views.remove(&name);
+        let _ = ctx
+            .eng_cmd_tx
+            .send(EngineCommand::RemoveDrive { name: name.clone() });
+    }
+    // paused flag drift
+    for d in &ctx.config.drives {
+        let _ = ctx.eng_cmd_tx.send(EngineCommand::SetPaused {
+            name: d.name.clone(),
+            paused: d.paused,
+        });
     }
 }
 
@@ -713,127 +639,71 @@ fn add_failure_message(err: &anyhow::Error) -> String {
 // Status refresh
 // ---------------------------------------------------------------------------
 
-/// Builds the next snapshot: supervisor state + one live view per drive.
-async fn refresh_status(ctx: &Ctx) -> StatusSnapshot {
-    let sup = ctx.sup_status.lock().await;
-    let sb = SwitchboardStatus {
-        running: sup.running,
-        healthy: sup.healthy,
-        version: switchboard::current_meta(&ctx.paths, &ctx.config.switchboard.package_spec)
-            .map(|m| m.version),
-        port: ctx.config.switchboard.port,
-        restarts: sup.restarts,
-        last_event: sup.last_event.as_ref().map(|e| e.summary()),
+/// Builds the next snapshot: engine view + one entry per configured
+/// drive.
+fn refresh_status(ctx: &Ctx, settings_url: &str) -> StatusSnapshot {
+    let reactor = ReactorStatus {
+        running: true,
+        healthy: ctx.reactor_healthy,
+        peer_id: Some(ctx.peer_id.to_base58()),
+        listen: ctx.config.instance.listen.clone(),
+        docs: ctx.store.live_doc_count() as u64,
+        last_event: ctx.last_event.clone(),
     };
     let mut drives = Vec::with_capacity(ctx.config.drives.len());
     for d in &ctx.config.drives {
-        let entry = if d.paused {
-            DriveStatusEntry {
-                name: d.name.clone(),
-                url: d.url.clone(),
-                paused: true,
-                status: "paused".into(),
-                detail: "paused; resume to re-sync".into(),
-            }
-        } else if sb.healthy {
-            let view = drives::status_view(
-                &ctx.config,
-                d,
-                drive_token(&d.token_env),
-                ctx.drive_outcomes.get(&d.name),
-            )
-            .await;
-            DriveStatusEntry {
-                name: d.name.clone(),
-                url: d.url.clone(),
-                paused: false,
-                status: view.status.as_str().to_string(),
-                detail: view.detail,
-            }
+        let (status, detail) = ctx
+            .drive_views
+            .get(&d.name)
+            .cloned()
+            .unwrap_or((DriveStatus::Connecting, None));
+        let status = if d.paused && status != DriveStatus::Paused {
+            DriveStatus::Paused
         } else {
-            DriveStatusEntry {
-                name: d.name.clone(),
-                url: d.url.clone(),
-                paused: false,
-                status: "offline".into(),
-                detail: "switchboard not healthy".into(),
-            }
-        };
-        drives.push(entry);
-    }
-    // A failed add never enters `config.drives`; surface the recorded
-    // outcome so the user sees which remote was rejected and why.
-    for (name, outcome) in ctx.drive_outcomes.iter() {
-        if ctx.config.drives.iter().any(|d| &d.name == name) {
-            continue;
-        }
-        let (status, detail) = match outcome {
-            drives::AddOutcome::Added => continue,
-            drives::AddOutcome::RequiresAuth(msg) => (
-                "requires-auth",
-                format!(
-                    "the remote rejected the sync registration (authentication required): {msg}"
-                ),
-            ),
-            drives::AddOutcome::Failed(msg) => ("error", msg.clone()),
+            status
         };
         drives.push(DriveStatusEntry {
-            name: name.clone(),
-            url: ctx
-                .drive_attempt_urls
-                .get(name)
-                .cloned()
-                .unwrap_or_default(),
-            paused: false,
-            status: status.into(),
-            detail,
+            name: d.name.clone(),
+            addr: d.addr.clone(),
+            paused: d.paused,
+            status: status.as_str().to_string(),
+            detail: detail.unwrap_or_default(),
         });
     }
-    let settings_url = format!(
-        "http://{}:{}",
-        ctx.config.settings.host, ctx.config.settings.port
-    );
     StatusSnapshot {
         version: crate::VERSION.to_string(),
-        switchboard: sb,
+        reactor,
         drives,
-        settings: status::SettingsStatus { url: settings_url },
-        updated_at: switchboard::rfc3339_now(),
+        settings: status::SettingsStatus {
+            url: settings_url.into(),
+        },
+        updated_at: status::rfc3339_now(),
     }
 }
 
-// ---------------------------------------------------------------------------
-// Bootstrap
-// ---------------------------------------------------------------------------
-
-/// Installs the switchboard when the spec or installation changed, and
-/// (re)writes its `powerhouse.config.json`.
-async fn bootstrap_switchboard(
-    paths: &StatePaths,
-    node: &node::NodeRuntime,
-    config: &ReactorConfig,
-) -> Result<()> {
-    let spec = &config.switchboard.package_spec;
-    if switchboard::is_current(paths, spec) {
-        match switchboard::patch_sync_client(paths) {
-            Ok(outcome) => tracing::info!("sync-client patch: {outcome}"),
-            Err(err) => tracing::warn!("sync-client patch failed: {err:#}"),
-        }
-        switchboard::write_runtime_files(paths, config)?;
-        return Ok(());
-    }
-    tracing::info!(
-        "installing switchboard {spec} from {}",
-        config.switchboard.npm_registry
+/// A snapshot built from the config file when the daemon is not
+/// running.
+fn degraded_snapshot(config: &ReactorConfig, settings_url: &str) -> StatusSnapshot {
+    let drives = config
+        .drives
+        .iter()
+        .map(|d| DriveStatusEntry {
+            name: d.name.clone(),
+            addr: d.addr.clone(),
+            paused: d.paused,
+            status: if d.paused { "paused" } else { "offline" }.into(),
+            detail: "daemon not running".into(),
+        })
+        .collect();
+    let mut snap = StatusSnapshot::empty(
+        crate::VERSION.to_string(),
+        config.instance.listen.clone(),
+        settings_url.into(),
     );
-    let meta = switchboard::install(paths, node, spec, &config.switchboard.npm_registry).await?;
-    tracing::info!("switchboard {} installed", meta.version);
-    match switchboard::patch_sync_client(paths) {
-        Ok(outcome) => tracing::info!("sync-client patch: {outcome}"),
-        Err(err) => tracing::warn!("sync-client patch failed: {err:#}"),
-    }
-    switchboard::write_runtime_files(paths, config)?;
-    Ok(())
+    snap.reactor.running = false;
+    snap.reactor.last_event = Some("daemon not running".into());
+    snap.drives = drives;
+    snap
 }
 
 // ---------------------------------------------------------------------------
@@ -889,6 +759,32 @@ fn acquire_lock(paths: &StatePaths) -> Result<std::fs::File> {
 
 fn remove_ready(paths: &StatePaths) {
     let _ = std::fs::remove_file(paths.run_dir.join("ready"));
+}
+
+/// Fails fast when the configured TCP listen port is taken by another
+/// process (a better error than a bind failure deep in the stack).
+fn check_listen_port(addr: &Multiaddr) -> Result<()> {
+    let mut ip: Option<std::net::IpAddr> = None;
+    let mut port: Option<u16> = None;
+    for p in addr.iter() {
+        match p {
+            libp2p::multiaddr::Protocol::Ip4(i) => ip = Some(i.into()),
+            libp2p::multiaddr::Protocol::Ip6(i) => ip = Some(i.into()),
+            libp2p::multiaddr::Protocol::Tcp(n) => port = Some(n),
+            _ => {}
+        }
+    }
+    let (Some(ip), Some(port)) = (ip, port) else {
+        return Ok(()); // non-TCP address: the engine reports bind errors
+    };
+    match std::net::TcpListener::bind((ip, port)) {
+        Ok(_) => Ok(()),
+        Err(e) => {
+            bail!(
+                "listen port {port} is already in use: {e} (change instance.listen in the config)"
+            )
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -963,70 +859,27 @@ pub async fn status(state_dir: Option<&Path>, json: bool) -> Result<()> {
         Some(resp) => resp.json::<status::StatusSnapshot>().await.ok(),
         None => None,
     };
-    match live {
-        Some(snap) => {
-            if json {
-                println!("{}", serde_json::to_string(&snap)?);
-            } else {
-                print!("{}", status::render_text(&snap));
-            }
-            Ok(())
-        }
-        None => {
-            let snap = degraded_snapshot(&paths, &config);
-            if json {
-                println!("{}", serde_json::to_string(&snap)?);
-            } else {
-                print!("{}", status::render_text(&snap));
-            }
-            Ok(())
-        }
+    let snap = live.unwrap_or_else(|| {
+        degraded_snapshot(
+            &config,
+            &format!("http://{}:{}", config.settings.host, config.settings.port),
+        )
+    });
+    if json {
+        println!("{}", serde_json::to_string(&snap)?);
+    } else {
+        print!("{}", status::render_text(&snap));
     }
-}
-
-/// A snapshot built from the config file and a direct health probe when
-/// the daemon is not running.
-fn degraded_snapshot(paths: &StatePaths, config: &ReactorConfig) -> StatusSnapshot {
-    let sb = SwitchboardStatus {
-        running: false,
-        healthy: false,
-        version: switchboard::current_meta(paths, &config.switchboard.package_spec)
-            .map(|m| m.version),
-        port: config.switchboard.port,
-        restarts: 0,
-        last_event: Some("daemon not running".into()),
-    };
-    let drives = config
-        .drives
-        .iter()
-        .map(|d| DriveStatusEntry {
-            name: d.name.clone(),
-            url: d.url.clone(),
-            paused: d.paused,
-            status: if d.paused {
-                "paused".into()
-            } else {
-                "offline".into()
-            },
-            detail: "daemon not running".into(),
-        })
-        .collect();
-    let settings_url = format!("http://{}:{}", config.settings.host, config.settings.port);
-    StatusSnapshot {
-        version: crate::VERSION.to_string(),
-        switchboard: sb,
-        drives,
-        settings: status::SettingsStatus { url: settings_url },
-        updated_at: switchboard::rfc3339_now(),
-    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // drive subcommand
 // ---------------------------------------------------------------------------
 
-/// The `drive` CLI: goes through the running daemon (single writer) when
-/// one is up, or works directly against a manually running switchboard.
+/// The `drive` CLI: goes through the running daemon (single writer)
+/// when one is up, or edits the config directly (the daemon picks it
+/// up on its next poll).
 pub async fn drive_command(state_dir: Option<&Path>, cmd: crate::cli::DriveCommand) -> Result<()> {
     use crate::cli::DriveCommand;
     let paths = StatePaths::resolve(state_dir);
@@ -1035,13 +888,14 @@ pub async fn drive_command(state_dir: Option<&Path>, cmd: crate::cli::DriveComma
 
     match cmd {
         DriveCommand::List => {
-            let snap = live_drive_views(&config).await;
+            let settings_url = format!("http://{}:{}", config.settings.host, config.settings.port);
+            let snap = live_drive_views(&config, &settings_url).await;
             if snap.is_empty() {
-                println!("no drives configured (add one: ph-reactor drive add <url>)");
+                println!("no drives configured (add one: ph-reactor drive add <multiaddr>)");
                 return Ok(());
             }
             for (i, d) in snap.iter().enumerate() {
-                println!("{:>2}  {:<24} [{:<10}] {}", i + 1, d.name, d.status, d.url);
+                println!("{:>2}  {:<24} [{:<14}] {}", i + 1, d.name, d.status, d.addr);
                 if !d.detail.is_empty() {
                     println!("    {}", d.detail);
                 }
@@ -1049,14 +903,14 @@ pub async fn drive_command(state_dir: Option<&Path>, cmd: crate::cli::DriveComma
             Ok(())
         }
         DriveCommand::Add {
-            url,
+            addr,
             name,
             token_env,
             offline,
         } => {
             let op = DriveOp::Add {
                 name: name.unwrap_or_default(),
-                url,
+                addr,
                 token_env,
                 offline,
             };
@@ -1092,12 +946,19 @@ fn resolve_target(config: &ReactorConfig, target: &str) -> Result<String> {
             config.drives.len()
         );
     }
-    let drive = find_drive(config, target)?;
+    let drive = config
+        .drives
+        .iter()
+        .find(|d| d.name.eq_ignore_ascii_case(target))
+        .with_context(|| {
+            format!("drive '{target}' not configured (see `ph-reactor drive list`)")
+        })?;
     Ok(drive.name.clone())
 }
 
 /// Routes the operation through the daemon's settings API when the
-/// daemon is running (single writer); otherwise executes it directly.
+/// daemon is running (single writer); otherwise applies it to the
+/// config file directly (the daemon adopts it on its next poll).
 async fn dispatch_drive_op(
     paths: &StatePaths,
     config: &mut ReactorConfig,
@@ -1123,48 +984,195 @@ async fn dispatch_drive_op(
             }
             Ok(r) => bail!("daemon rejected the request: {}", r.status()),
             Err(err) => {
-                eprintln!("daemon is not reachable; falling back to a direct operation ({err})");
-                direct_drive_op(paths, config, op).await
+                eprintln!("daemon is not reachable; updating the config directly ({err})");
+                direct_drive_op(paths, config, op)
             }
         }
     } else {
-        direct_drive_op(paths, config, op).await
+        direct_drive_op(paths, config, op)
     }
 }
 
-/// Runs the operation in-process (no daemon): the live MCP call plus
-/// the config file update. Requires a switchboard running on the
-/// configured port.
-async fn direct_drive_op(
-    paths: &StatePaths,
-    config: &mut ReactorConfig,
-    op: DriveOp,
-) -> Result<()> {
-    let name = match &op {
-        DriveOp::Add { name, .. } if name.trim().is_empty() => String::new(),
-        DriveOp::Add { name, .. } => name.clone(),
-        DriveOp::Remove { name }
-        | DriveOp::Pause { name }
-        | DriveOp::Resume { name }
-        | DriveOp::Resync { name } => name.clone(),
-    };
-    if let Some(existing) = config
-        .drives
-        .iter()
-        .find(|d| !name.is_empty() && d.name.eq_ignore_ascii_case(&name))
-    {
-        if matches!(op, DriveOp::Add { .. }) {
-            bail!("a drive named '{}' is already configured", existing.name);
+/// The `doc` CLI. `list`/`get` read the store directly (safe with or
+/// without a running daemon — reads never write); `add` must go
+/// through the running daemon (the single writer) so the new doc is
+/// published to the sync mesh as it is created.
+pub async fn doc_command(state_dir: Option<&Path>, cmd: crate::cli::DocCommand) -> Result<()> {
+    use crate::cli::DocCommand;
+    let paths = StatePaths::resolve(state_dir);
+    paths.ensure_dirs()?;
+    match cmd {
+        DocCommand::List => {
+            let store = open_local_store(&paths)?;
+            let docs = store.list();
+            if docs.is_empty() {
+                println!("no local docs (add one: ph-reactor doc add <name> [--field k=v])");
+                return Ok(());
+            }
+            for d in docs {
+                let live = d.fields.values().filter(|f| !f.deleted).count();
+                println!("{:<32} {} ({} fields)", d.name, d.id, live);
+            }
+            Ok(())
+        }
+        DocCommand::Get { name } => {
+            let store = open_local_store(&paths)?;
+            let Some(doc) = store.get(&name) else {
+                bail!("no such doc: '{name}'");
+            };
+            let mut out = serde_json::Map::new();
+            for (k, f) in &doc.fields {
+                out.insert(
+                    k.clone(),
+                    if f.deleted {
+                        serde_json::Value::Null
+                    } else {
+                        f.value.clone()
+                    },
+                );
+            }
+            println!("{}", serde_json::to_string_pretty(&out)?);
+            Ok(())
+        }
+        DocCommand::Add { name, fields } => {
+            if !daemon_is_running(&paths.daemon_pidfile()) {
+                bail!("the daemon is not running — start it (ph-reactor) and retry: docs are created through the daemon so they reach the sync mesh");
+            }
+            let config = config::load(&paths)?;
+            let mut map = BTreeMap::new();
+            for kv in &fields {
+                let (k, v) = kv
+                    .split_once('=')
+                    .with_context(|| format!("--field expects KEY=VALUE (got '{kv}')"))?;
+                let k = k.trim();
+                let v = v.trim();
+                if k.is_empty() {
+                    bail!("--field name may not be empty");
+                }
+                let value: serde_json::Value = match serde_json::from_str(v) {
+                    Ok(val) => val,
+                    Err(_) => serde_json::Value::String(v.to_string()),
+                };
+                map.insert(k.to_string(), value);
+            }
+            let url = format!(
+                "http://{}:{}/api/docs",
+                config.settings.host, config.settings.port
+            );
+            let client = reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()?;
+            let body = serde_json::json!({ "name": name, "fields": map });
+            let r = client.post(&url).json(&body).send().await?;
+            let status = r.status();
+            if status.is_success() {
+                println!("created doc '{name}'");
+                Ok(())
+            } else {
+                let text = r.text().await.unwrap_or_default();
+                bail!("daemon rejected the doc: {status} {text}")
+            }
         }
     }
-    // One-shot process: the outcome map exists only to shape the error
-    // message (there is no long-lived status view to feed).
-    let mut outcomes: HashMap<String, drives::AddOutcome> = HashMap::new();
-    let detail = apply_drive_change(config, op, &mut outcomes).await?;
-    config::save(paths, config)?;
-    switchboard::write_runtime_files(paths, config)?;
-    println!("{detail}");
-    Ok(())
+}
+
+/// Opens the local store from disk for read-only CLI use. The daemon
+/// may be running concurrently; this instance only reads, so the two
+/// views never contend on the files.
+fn open_local_store(paths: &StatePaths) -> Result<Arc<Store>> {
+    let kp = p2p::load_or_create_identity(&paths.key_file())
+        .map_err(anyhow::Error::msg)
+        .with_context(|| {
+            format!(
+                "loading the identity key from {}",
+                paths.key_file().display()
+            )
+        })?;
+    let signing = p2p::signing_key(&kp).map_err(anyhow::Error::msg)?;
+    let origin = p2p::peer_id_of(&kp).to_base58();
+    Store::open(&paths.docs_dir, &signing, &origin).map_err(anyhow::Error::msg)
+}
+
+/// Applies the operation to the config file (no daemon running; the
+/// daemon will pick it up on start or on its next config poll).
+fn direct_drive_op(paths: &StatePaths, config: &mut ReactorConfig, op: DriveOp) -> Result<()> {
+    let pause_resume = matches!(&op, DriveOp::Pause { .. });
+    match op {
+        DriveOp::Add {
+            name,
+            addr,
+            token_env,
+            offline,
+        } => {
+            let addr = addr.trim().to_string();
+            let addr_ma = Multiaddr::from_str(&addr)
+                .with_context(|| format!("'{addr}' is not a valid multiaddr"))?;
+            let name = if name.trim().is_empty() {
+                default_drive_name(&addr_ma)
+            } else {
+                name.trim().to_string()
+            };
+            if config
+                .drives
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&name))
+            {
+                bail!("a drive named '{name}' is already configured");
+            }
+            config.drives.push(DriveConfig {
+                name: name.clone(),
+                addr: addr_ma.to_string(),
+                token_env,
+                paused: false,
+                available_offline: offline,
+            });
+            config::save(paths, config)?;
+            println!("added drive '{name}' ({addr})");
+            Ok(())
+        }
+        DriveOp::Remove { name } => {
+            let before = config.drives.len();
+            config
+                .drives
+                .retain(|d| !d.name.eq_ignore_ascii_case(&name));
+            if config.drives.len() == before {
+                bail!("drive '{name}' is not configured");
+            }
+            config::save(paths, config)?;
+            println!("removed drive '{name}'");
+            Ok(())
+        }
+        DriveOp::Pause { name } | DriveOp::Resume { name } => {
+            let paused = pause_resume;
+            let Some(d) = config
+                .drives
+                .iter_mut()
+                .find(|d| d.name.eq_ignore_ascii_case(&name))
+            else {
+                bail!("drive '{name}' is not configured");
+            };
+            d.paused = paused;
+            config::save(paths, config)?;
+            println!(
+                "{} drive '{name}'",
+                if paused { "paused" } else { "resumed" }
+            );
+            Ok(())
+        }
+        DriveOp::Resync { name } => {
+            if !config
+                .drives
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&name))
+            {
+                bail!("drive '{name}' is not configured");
+            }
+            println!(
+                "drive '{name}' will re-sync on the next daemon start (it is not running now)"
+            );
+            Ok(())
+        }
+    }
 }
 
 fn api_target(
@@ -1178,13 +1186,13 @@ fn api_target(
     Ok(match op {
         DriveOp::Add {
             name,
-            url,
+            addr,
             token_env,
             offline,
         } => {
             let body = serde_json::json!({
                 "name": name,
-                "url": url,
+                "addr": addr,
                 "tokenEnv": token_env,
                 "availableOffline": offline,
             });
@@ -1213,8 +1221,8 @@ fn api_target(
     })
 }
 
-/// Percent-encodes a drive name for use as a URL path segment (names may
-/// contain spaces).
+/// Percent-encodes a drive name for use as a URL path segment (names
+/// may contain spaces).
 fn encode_path_segment(s: &str) -> String {
     s.bytes()
         .map(|b| match b {
@@ -1226,41 +1234,41 @@ fn encode_path_segment(s: &str) -> String {
         .collect()
 }
 
-/// One live view per configured drive (for `drive list`).
-async fn live_drive_views(config: &ReactorConfig) -> Vec<status::DriveStatusEntry> {
-    let base = format!("http://127.0.0.1:{}", config.switchboard.port);
-    let sb_healthy = switchboard::health(&base).await.unwrap_or(false);
-    let mut out = Vec::new();
-    for d in &config.drives {
-        let entry = if d.paused {
-            status::DriveStatusEntry {
-                name: d.name.clone(),
-                url: d.url.clone(),
-                paused: true,
-                status: "paused".into(),
-                detail: "paused; resume to re-sync".into(),
+/// One live view per configured drive (for `drive list`): from the
+/// running daemon's `/api/status` when it is up, from the config file
+/// otherwise.
+async fn live_drive_views(
+    config: &ReactorConfig,
+    settings_url: &str,
+) -> Vec<status::DriveStatusEntry> {
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+        .ok();
+    if let Some(client) = &client {
+        if let Some(resp) = client
+            .get(format!("{settings_url}/api/status"))
+            .send()
+            .await
+            .ok()
+            .filter(|r| r.status().is_success())
+        {
+            if let Ok(snap) = resp.json::<status::StatusSnapshot>().await {
+                return snap.drives;
             }
-        } else if sb_healthy {
-            let view = drives::status_view(config, d, drive_token(&d.token_env), None).await;
-            status::DriveStatusEntry {
-                name: d.name.clone(),
-                url: d.url.clone(),
-                paused: false,
-                status: view.status.as_str().to_string(),
-                detail: view.detail,
-            }
-        } else {
-            status::DriveStatusEntry {
-                name: d.name.clone(),
-                url: d.url.clone(),
-                paused: false,
-                status: "offline".into(),
-                detail: "switchboard not healthy".into(),
-            }
-        };
-        out.push(entry);
+        }
     }
-    out
+    config
+        .drives
+        .iter()
+        .map(|d| status::DriveStatusEntry {
+            name: d.name.clone(),
+            addr: d.addr.clone(),
+            paused: d.paused,
+            status: if d.paused { "paused" } else { "offline" }.into(),
+            detail: "daemon not running".into(),
+        })
+        .collect()
 }
 
 fn daemon_is_running(pidfile: &Path) -> bool {
@@ -1296,61 +1304,77 @@ pub async fn doctor(state_dir: Option<&Path>) -> Result<()> {
     let dirs_ok = paths.ensure_dirs().is_ok();
     check("state dir", dirs_ok, &format!("{}", paths.root.display()));
 
-    // Node.
-    match node::resolve(
-        &config.switchboard.node.minimum_version,
-        config.switchboard.node.prefer_system,
-        &paths,
-    )
-    .await
-    {
-        Ok(n) => check(
-            "node",
-            true,
-            &format!("{} at {}", n.version, n.path.display()),
-        ),
-        Err(err) => check("node", false, &err.to_string()),
-    }
-
-    // Switchboard installation.
-    let spec = &config.switchboard.package_spec;
-    match switchboard::current_meta(&paths, spec) {
-        Some(m) => check("switchboard", true, &format!("{} ({spec})", m.version)),
-        None => check(
-            "switchboard",
-            false,
-            &format!("not installed for spec {spec} (run `ph-reactor` to bootstrap)"),
-        ),
-    }
-
-    // Registry.
-    if let Some(first) = config.packages.first() {
-        match registry::check_package(&config.registry, first).await {
-            Ok(p) => check(
-                "registry",
+    // Identity key.
+    match p2p::load_or_create_identity(&paths.key_file()) {
+        Ok(kp) => {
+            let peer = p2p::peer_id_of(&kp);
+            let b58 = peer.to_base58();
+            check(
+                "identity",
                 true,
-                &format!(
-                    "{} ({} {})",
-                    config.registry,
-                    p.name,
-                    p.latest.as_deref().unwrap_or("?")
-                ),
-            ),
-            Err(err) => check("registry", false, &err.to_string()),
+                &format!("peer {}", &b58[..16.min(b58.len())]),
+            );
         }
+        Err(err) => check("identity", false, &err),
     }
 
-    // MCP (only meaningful when the switchboard is up).
-    let base = format!("http://127.0.0.1:{}", config.switchboard.port);
-    let healthy = switchboard::health(&base).await.unwrap_or(false);
-    if healthy {
-        let mcp = crate::mcp::Mcp::new(config.switchboard.port, None);
-        match (mcp.session().await, mcp.tools_list().await) {
-            (Ok(_), Ok(tools)) => check("mcp", true, &format!("{} tools", tools.len())),
-            (Ok(_), Err(err)) | (Err(err), _) => check("mcp", false, &err.to_string()),
-        }
+    // Doc store (opens read-write but performs no writes).
+    let store_check: Result<String> = (|| {
+        let kp =
+            p2p::load_or_create_identity(&paths.key_file()).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let signing = p2p::signing_key(&kp).map_err(|e| anyhow::anyhow!("{e}"))?;
+        let peer = p2p::peer_id_of(&kp);
+        let store = Store::open(&paths.docs_dir, &signing, &peer.to_base58())
+            .map_err(|e| anyhow::anyhow!("{e}"))?;
+        Ok(format!("{} live docs", store.live_doc_count()))
+    })();
+    match store_check {
+        Ok(detail) => check("store", true, &detail),
+        Err(err) => check("store", false, &err.to_string()),
+    }
+
+    // Listen address (valid multiaddr + free TCP port).
+    let listen = config.instance.listen.clone();
+    match Multiaddr::from_str(&listen) {
+        Ok(ma) => match check_listen_port(&ma) {
+            Ok(()) => check("listen", true, &listen),
+            Err(err) => check("listen", false, &err.to_string()),
+        },
+        Err(err) => check("listen", false, &err.to_string()),
+    }
+
+    // Settings server (only meaningful when the daemon is up).
+    let settings_url = format!(
+        "http://{}:{}/api/status",
+        config.settings.host, config.settings.port
+    );
+    if daemon_is_running(&paths.daemon_pidfile()) {
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(2))
+            .build()
+            .ok();
+        let ok = if let Some(c) = &client {
+            c.get(&settings_url)
+                .send()
+                .await
+                .ok()
+                .is_some_and(|r| r.status().is_success())
+        } else {
+            false
+        };
+        check("settings", ok, &settings_url);
     } else {
-        check("mcp", true, "skipped (switchboard not running)");
+        check("settings", true, "daemon not running (skipped)");
+    }
+
+    // Session bus (needed for the tray).
+    match std::env::var("DBUS_SESSION_BUS_ADDRESS") {
+        Ok(addr) if !addr.is_empty() => check("session bus", true, &addr),
+        _ => check(
+            "session bus",
+            false,
+            "no session bus (the tray will not appear; headless is fine)",
+        ),
     }
 
     if failed > 0 {
@@ -1363,15 +1387,11 @@ pub async fn doctor(state_dir: Option<&Path>) -> Result<()> {
 // logs
 // ---------------------------------------------------------------------------
 
-/// Prints the last lines of the daemon or switchboard log; follows the
-/// file on growth when `follow`.
-pub async fn logs(state_dir: Option<&Path>, follow: bool, switchboard_log: bool) -> Result<()> {
+/// Prints the last lines of the daemon log; follows the file on growth
+/// when `follow`.
+pub async fn logs(state_dir: Option<&Path>, follow: bool) -> Result<()> {
     let paths = StatePaths::resolve(state_dir);
-    let path = if switchboard_log {
-        paths.switchboard_log()
-    } else {
-        paths.reactor_log()
-    };
+    let path = paths.reactor_log();
     let mut offset: u64 = 0;
     loop {
         match std::fs::read(&path) {
@@ -1402,11 +1422,11 @@ pub async fn logs(state_dir: Option<&Path>, follow: bool, switchboard_log: bool)
 // ---------------------------------------------------------------------------
 
 struct DaemonLogWriter {
-    path: PathBuf,
+    path: std::path::PathBuf,
 }
 
 struct LogAppend {
-    path: PathBuf,
+    path: std::path::PathBuf,
 }
 
 impl Write for LogAppend {
@@ -1428,7 +1448,8 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for DaemonLogWriter {
     }
 }
 
-/// File appender (rotated) plus, when running in the foreground, stderr.
+/// File appender (rotated) plus, when running in the foreground,
+/// stderr.
 fn init_logging(paths: &StatePaths, config: &ReactorConfig, to_stderr: bool) -> Result<()> {
     let level = match config.log_level.as_str() {
         "verbose" => "debug",
@@ -1475,33 +1496,19 @@ fn init_logging(paths: &StatePaths, config: &ReactorConfig, to_stderr: bool) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{NodeConfig, SettingsConfig, SwitchboardConfig};
-    use crate::status::SettingsStatus;
     use clap::Parser;
-    use std::collections::BTreeMap;
 
     fn test_config() -> ReactorConfig {
-        ReactorConfig {
-            version: 1,
-            switchboard: SwitchboardConfig {
-                port: 4001,
-                package_spec: "@powerhousedao/switchboard".into(),
-                npm_registry: "https://registry.dev.vetra.io".into(),
-                node: NodeConfig::default(),
-            },
-            registry: "https://registry.dev.vetra.io".into(),
-            packages: Vec::new(),
-            drives: vec![DriveConfig {
-                name: "vault".into(),
-                url: "https://demo.invalid/d/vault".into(),
-                token_env: None,
-                available_offline: false,
-                paused: false,
-            }],
-            settings: SettingsConfig::default(),
-            log_level: "info".into(),
-            extra: BTreeMap::new(),
-        }
+        let mut c = ReactorConfig::default();
+        c.instance.listen = "/ip4/127.0.0.1/tcp/4101".into();
+        c.drives.push(DriveConfig {
+            name: "vault".into(),
+            addr: "/ip4/10.0.0.2/tcp/4201/p2p/12D3KooWg8111".into(),
+            token_env: None,
+            paused: false,
+            available_offline: true,
+        });
+        c
     }
 
     #[test]
@@ -1513,49 +1520,46 @@ mod tests {
         }
     }
 
-    /// The exact JSON shape the shell plugin (ph-reactor-omarchy) consumes
-    /// from `status --json` while the daemon is not running.
+    /// The exact JSON shape the shell plugin consumes from
+    /// `status --json` while the daemon is not running.
     #[test]
     fn degraded_snapshot_matches_the_shell_contract() {
-        let t = tempfile::TempDir::new().unwrap();
-        let paths = StatePaths::for_root(t.path());
-        let snap = degraded_snapshot(&paths, &test_config());
+        let settings_url = "http://127.0.0.1:4002".to_string();
+        let snap = degraded_snapshot(&test_config(), &settings_url);
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
 
-        for key in ["version", "switchboard", "drives", "settings", "updated_at"] {
+        for key in ["version", "reactor", "drives", "settings", "updated_at"] {
             assert!(v.get(key).is_some(), "missing top-level key {key}");
         }
 
-        let sb = &v["switchboard"];
+        let r = &v["reactor"];
         for key in [
             "running",
             "healthy",
-            "version",
-            "port",
-            "restarts",
+            "peer_id",
+            "listen",
+            "docs",
             "last_event",
         ] {
-            assert!(sb.get(key).is_some(), "missing switchboard key {key}");
+            assert!(r.get(key).is_some(), "missing reactor key {key}");
         }
-        assert_eq!(sb["running"], false);
-        assert_eq!(sb["healthy"], false);
-        assert_eq!(sb["version"], serde_json::Value::Null);
-        assert_eq!(sb["port"], 4001);
-        assert_eq!(sb["restarts"], 0);
-        assert_eq!(sb["last_event"], "daemon not running");
+        assert_eq!(r["running"], false);
+        assert_eq!(r["healthy"], false);
+        assert_eq!(r["listen"], "/ip4/127.0.0.1/tcp/4101");
+        assert_eq!(r["last_event"], "daemon not running");
 
         let d = &v["drives"][0];
-        for key in ["name", "url", "paused", "status", "detail"] {
+        for key in ["name", "addr", "paused", "status", "detail"] {
             assert!(d.get(key).is_some(), "missing drive key {key}");
         }
         assert_eq!(d["name"], "vault");
-        assert_eq!(d["url"], "https://demo.invalid/d/vault");
+        assert_eq!(d["addr"], "/ip4/10.0.0.2/tcp/4201/p2p/12D3KooWg8111");
         assert_eq!(d["paused"], false);
         assert_eq!(d["status"], "offline");
         assert_eq!(d["detail"], "daemon not running");
 
-        assert_eq!(v["settings"]["url"], "http://127.0.0.1:4002");
+        assert_eq!(v["settings"]["url"], settings_url);
         assert_eq!(v["version"], crate::VERSION);
 
         let ts = v["updated_at"].as_str().unwrap();
@@ -1566,38 +1570,49 @@ mod tests {
     }
 
     /// The daemon's `/api/status` serves the same struct; the live shape
-    /// (healthy switchboard, paused drive) must carry the same keys and the
+    /// (healthy engine, synced drive) must carry the same keys and the
     /// documented drive-status vocabulary.
     #[test]
     fn live_snapshot_shape_is_the_same_contract() {
         let snap = StatusSnapshot {
             version: crate::VERSION.to_string(),
-            switchboard: SwitchboardStatus {
+            reactor: ReactorStatus {
                 running: true,
                 healthy: true,
-                version: Some("6.2.2".into()),
-                port: 4001,
-                restarts: 1,
-                last_event: Some("switchboard healthy".into()),
+                peer_id: Some("12D3KooWg8111".into()),
+                listen: "/ip4/0.0.0.0/tcp/4201".into(),
+                docs: 4,
+                last_event: Some("drive vault: synced".into()),
             },
             drives: vec![DriveStatusEntry {
                 name: "vault".into(),
-                url: "https://demo.invalid/d/vault".into(),
+                addr: "/ip4/10.0.0.2/tcp/4201/p2p/12D3KooWg8111".into(),
                 paused: true,
                 status: "paused".into(),
                 detail: String::new(),
             }],
-            settings: SettingsStatus {
+            settings: status::SettingsStatus {
                 url: "http://127.0.0.1:4002".into(),
             },
             updated_at: "2026-09-12T00:00:00Z".into(),
         };
         let v: serde_json::Value =
             serde_json::from_str(&serde_json::to_string(&snap).unwrap()).unwrap();
-        assert_eq!(v["switchboard"]["running"], true);
-        assert_eq!(v["switchboard"]["healthy"], true);
-        assert_eq!(v["switchboard"]["version"], "6.2.2");
+        assert_eq!(v["reactor"]["running"], true);
+        assert_eq!(v["reactor"]["healthy"], true);
+        assert_eq!(v["reactor"]["peer_id"], "12D3KooWg8111");
         assert_eq!(v["drives"][0]["paused"], true);
         assert_eq!(v["drives"][0]["status"], "paused");
+    }
+
+    #[test]
+    fn default_drive_name_prefers_peer_id() {
+        let ma: Multiaddr = format!("/ip4/10.0.0.2/tcp/4201/p2p/{}", crate::p2p::test_peer_id())
+            .parse()
+            .unwrap();
+        let name = default_drive_name(&ma);
+        assert!(name.starts_with("peer-"), "{name}");
+        let no_peer: Multiaddr = "/ip4/10.0.0.2/tcp/4242".parse().unwrap();
+        assert_eq!(default_drive_name(&no_peer), "drive-4242");
     }
 }

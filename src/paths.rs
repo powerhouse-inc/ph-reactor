@@ -6,11 +6,10 @@
 //! ```text
 //! <state>/
 //!   config.json      daemon configuration
-//!   node/            private Node runtime (only when bootstrapped)
-//!   switchboard/     npm install tree + generated powerhouse.config.json
-//!   data/            PGlite store backing the local reactor
-//!   logs/            reactor.log, switchboard.log (rotating)
-//!   run/             pidfiles and the single-instance lock
+//!   key              the daemon's ed25519 identity (0600)
+//!   docs/            the native doc store (snapshots + live logs)
+//!   logs/            reactor.log (rotating)
+//!   run/             pidfile, single-instance lock, ready marker
 //! ```
 //!
 //! The root resolves to `$PH_REACTOR_STATE_DIR` when set (the snap sets it
@@ -50,9 +49,8 @@ pub fn root(state_dir: Option<&Path>) -> PathBuf {
 #[derive(Debug, Clone)]
 pub struct StatePaths {
     pub root: PathBuf,
-    pub node_dir: PathBuf,
-    pub switchboard_dir: PathBuf,
-    pub data_dir: PathBuf,
+    /// The doc store (snapshots + live op logs + index).
+    pub docs_dir: PathBuf,
     pub logs_dir: PathBuf,
     pub run_dir: PathBuf,
     pub config_file: PathBuf,
@@ -63,9 +61,7 @@ impl StatePaths {
         let root = root.to_path_buf();
         Self {
             config_file: root.join("config.json"),
-            node_dir: root.join("node"),
-            switchboard_dir: root.join("switchboard"),
-            data_dir: root.join("data"),
+            docs_dir: root.join("docs"),
             logs_dir: root.join("logs"),
             run_dir: root.join("run"),
             root,
@@ -82,13 +78,7 @@ impl StatePaths {
         use std::os::unix::fs::PermissionsExt;
         fs::create_dir_all(&self.root)?;
         let _ = fs::set_permissions(&self.root, fs::Permissions::from_mode(0o700));
-        for dir in [
-            &self.node_dir,
-            &self.switchboard_dir,
-            &self.data_dir,
-            &self.logs_dir,
-            &self.run_dir,
-        ] {
+        for dir in [&self.docs_dir, &self.logs_dir, &self.run_dir] {
             fs::create_dir_all(dir)?;
             let _ = fs::set_permissions(dir, fs::Permissions::from_mode(0o755));
         }
@@ -99,16 +89,13 @@ impl StatePaths {
         self.logs_dir.join("reactor.log")
     }
 
-    pub fn switchboard_log(&self) -> PathBuf {
-        self.logs_dir.join("switchboard.log")
+    /// The daemon's ed25519 identity key (32 bytes, 0600).
+    pub fn key_file(&self) -> PathBuf {
+        self.root.join("key")
     }
 
     pub fn daemon_pidfile(&self) -> PathBuf {
         self.run_dir.join("ph-reactor.pid")
-    }
-
-    pub fn switchboard_pidfile(&self) -> PathBuf {
-        self.run_dir.join("switchboard.pid")
     }
 
     pub fn lock_file(&self) -> PathBuf {
@@ -124,35 +111,28 @@ mod tests {
     fn layout_under_root() {
         let paths = StatePaths::for_root(Path::new("/srv/state"));
         assert_eq!(paths.config_file, PathBuf::from("/srv/state/config.json"));
-        assert_eq!(paths.node_dir, PathBuf::from("/srv/state/node"));
-        assert_eq!(
-            paths.switchboard_dir,
-            PathBuf::from("/srv/state/switchboard")
-        );
-        assert_eq!(paths.data_dir, PathBuf::from("/srv/state/data"));
+        assert_eq!(paths.docs_dir, PathBuf::from("/srv/state/docs"));
         assert_eq!(paths.logs_dir, PathBuf::from("/srv/state/logs"));
         assert_eq!(paths.run_dir, PathBuf::from("/srv/state/run"));
         assert_eq!(
             paths.reactor_log(),
             PathBuf::from("/srv/state/logs/reactor.log")
         );
-        assert_eq!(
-            paths.switchboard_log(),
-            PathBuf::from("/srv/state/logs/switchboard.log")
-        );
+        assert_eq!(paths.key_file(), PathBuf::from("/srv/state/key"));
     }
 
     #[test]
     fn ensure_dirs_creates_tree() {
-        let dir = std::env::temp_dir().join(format!(
-            "ph-reactor-test-{}-{}",
-            std::process::id(),
-            rand::random::<u32>()
-        ));
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or_default();
+        let dir =
+            std::env::temp_dir().join(format!("ph-reactor-test-{}-{}", std::process::id(), nanos));
         std::fs::remove_dir_all(&dir).ok();
         let paths = StatePaths::for_root(&dir);
         paths.ensure_dirs().unwrap();
-        for sub in ["node", "switchboard", "data", "logs", "run"] {
+        for sub in ["docs", "logs", "run"] {
             assert!(
                 paths.root.join(sub).is_dir(),
                 "{sub} missing from {}",
