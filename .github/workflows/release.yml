@@ -1,0 +1,45 @@
+# Release builds for ph-reactor.
+#
+# On tag `ph-reactor-v<semver>`: build a static (musl) binary for
+# x86_64, upload it (plus sha256) to the GitHub release. The snap package
+# wraps this same binary; build it locally with snapcraft (see
+# README.md, "Build the snap") and push to the snap store by hand when
+# the release looks good.
+name: Release
+
+on:
+  push:
+    tags:
+      - "ph-reactor-v*"
+
+permissions:
+  contents: write
+
+jobs:
+  build-x86_64:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Rust (stable, musl target)
+        run: |
+          rustup toolchain install stable
+          rustup target add x86_64-unknown-linux-musl
+
+      - name: Build
+        run: |
+          cargo build --release --target x86_64-unknown-linux-musl
+          mkdir -p dist
+          cp target/x86_64-unknown-linux-musl/release/ph-reactor dist/ph-reactor
+          ./dist/ph-reactor --version
+
+      - name: Hash
+        run: sha256sum dist/ph-reactor > dist/ph-reactor.sha256
+
+      - name: Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/ph-reactor
+            dist/ph-reactor.sha256
+          name: ${{ github.ref_name }}

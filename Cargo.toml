@@ -1,0 +1,59 @@
+[package]
+name = "ph-reactor"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.80"
+description = "Run a local Powerhouse switchboard in the background with a status-bar tray icon and configurable remote-drive sync"
+license = "SEE LICENSE IN LICENSE"
+
+[lib]
+name = "ph_reactor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "ph-reactor"
+path = "src/main.rs"
+
+[dependencies]
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "process",
+  "signal",
+  "time",
+  "fs",
+  "io-util",
+  "sync",
+] }
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+reqwest = { version = "0.12", default-features = false, features = [
+  "rustls-tls",
+  "json",
+  "stream",
+] }
+zbus = "4"
+axum = "0.7"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "local-time", "registry"] }
+dirs = "5"
+thiserror = "1"
+anyhow = "1"
+flate2 = "1"
+tar = "0.4"
+sha2 = "0.10"
+futures-util = "0.3"
+rand = "0.8"
+parking_lot = "0.12"
+hex = "0.4"
+libc = "0.2"
+url = "2"
+semver = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+strip = "symbols"
+lto = "thin"
