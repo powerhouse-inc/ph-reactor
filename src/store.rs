@@ -19,7 +19,7 @@
 //! path. The per-field merge itself ([`apply_op`]) is unchanged — it is the
 //! convergence primitive; the action log is the auditable layer on top.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -142,7 +142,7 @@ impl Store {
             ts_hint: 0,
             outbound: Vec::new(),
             quarantined: 0,
-            models: ModelRegistry::seeded_with_open(),
+            models: ModelRegistry::seeded_with_builtins(),
         };
         inner
             .known_keys
@@ -598,6 +598,63 @@ impl Inner {
         if let Err(r) = model.validate_payload(action.kind.as_str(), &action.payload) {
             return self.reject(action, &r.describe());
         }
+
+        // 3b. Quorum (declared by the model; checked here because it needs
+        //     the group's state — a different document). Runs before step 4,
+        //     so a failed quorum never mutates the entry.
+        if let Some(spec) = model.quorum(action.kind.as_str()) {
+            let group_name = if spec.group == "$self" {
+                let n = self
+                    .entries
+                    .get(&action.doc_id)
+                    .map(|e| e.doc.name.clone())
+                    .unwrap_or_default();
+                if n.is_empty() {
+                    return self.reject(action, "quorum group '$self' has no name");
+                }
+                n
+            } else {
+                spec.group.clone()
+            };
+            let group_doc = self
+                .names
+                .get(&group_name)
+                .and_then(|id| self.entries.get(id).map(|e| e.doc.live()));
+            let members: HashSet<String> = match group_doc {
+                Some(gd) => gd
+                    .fields
+                    .get(&spec.field)
+                    .map(|f| f.value.clone())
+                    .unwrap_or(serde_json::Value::Null)
+                    .as_array()
+                    .map(|a| {
+                        a.iter()
+                            .filter_map(|v| v.as_str().map(String::from))
+                            .collect()
+                    })
+                    .unwrap_or_default(),
+                None => {
+                    return self.reject(action, &format!("quorum group '{group_name}' not found"))
+                }
+            };
+            let mut seen: HashSet<&str> = HashSet::new();
+            let mut in_group = 0usize;
+            for cs in &action.cosig {
+                if seen.insert(cs.origin.as_str()) && members.contains(&cs.origin) {
+                    in_group += 1;
+                }
+            }
+            if in_group < spec.min {
+                return self.reject(
+                    action,
+                    &format!(
+                        "quorum: {in_group} of {} co-signers are members of '{group_name}' (need {})",
+                        action.cosig.len(),
+                        spec.min
+                    ),
+                );
+            }
+        }
         // 4. Precondition + reduce + per-field merge (one entries borrow).
         let (applied_any, deleted) = {
             let entry = self
@@ -747,6 +804,8 @@ fn persist_action(docs_dir: &Path, action: &Action) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::action::CoSig;
+    use ed25519_dalek::Signer;
     use std::collections::BTreeMap as BM;
 
     fn identity(seed: u8) -> SigningKey {
@@ -783,6 +842,54 @@ mod tests {
         };
         a.sign(key);
         a
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    /// Build a signed `group` action with co-signers. Each co-signer signs
+    /// the same canonical message (the co-signatures are excluded from it).
+    fn make_group_action(
+        id: DocId,
+        kind: &str,
+        payload: serde_json::Value,
+        origin: &str,
+        key: &SigningKey,
+        cosigners: &[(String, &SigningKey)],
+        clock: VecClock,
+        ts: u64,
+    ) -> Action {
+        let mut a = Action {
+            doc_id: id,
+            model: ModelRef::new("group", "1"),
+            kind: kind.into(),
+            payload,
+            ts,
+            clock,
+            origin: origin.into(),
+            cosig: cosigners
+                .iter()
+                .map(|(o, _)| CoSig {
+                    origin: o.clone(),
+                    sig: [0; 64],
+                })
+                .collect(),
+            sig: [0; 64],
+            prev_hash: None,
+        };
+        let mb = a.message_bytes();
+        a.sig = key.sign(&mb).to_bytes();
+        for (i, (_, ck)) in cosigners.iter().enumerate() {
+            a.cosig[i].sig = ck.sign(&mb).to_bytes();
+        }
+        a
+    }
+
+    /// A single-origin clock at counter `n` (empty when `n == 0`).
+    fn clock1(origin: &str, n: u64) -> VecClock {
+        let mut c = VecClock::default();
+        for _ in 0..n {
+            c.tick(origin);
+        }
+        c
     }
 
     #[test]
@@ -946,6 +1053,156 @@ mod tests {
         assert!(
             ts2 > ts1,
             "ts must not go backwards across restart ({ts1} -> {ts2})"
+        );
+    }
+
+    #[test]
+    fn group_add_manager_two_person_rule() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let s = open_store(dir.path());
+        let k_alice = identity(1);
+        let k_bob = identity(2);
+        let k_carol = identity(3);
+        let k_mallory = identity(4);
+        for (name, k) in [
+            ("alice", &k_alice),
+            ("bob", &k_bob),
+            ("carol", &k_carol),
+            ("mallory", &k_mallory),
+        ] {
+            s.register_peer_key(name, k.verifying_key().to_bytes());
+        }
+
+        // Bootstrap: members [alice bob carol], managers [alice].
+        let id = DocId::new();
+        let init = make_group_action(
+            id,
+            "init",
+            serde_json::json!({
+                "name": "core",
+                "members": ["alice", "bob", "carol"],
+                "managers": ["alice"],
+            }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 1),
+            1000,
+        );
+        assert!(s.apply_remote_action(&init).is_ok(), "init applies");
+        let g = s.get("core").expect("group doc created");
+        assert_eq!(
+            g.fields.get("members").expect("members").value,
+            serde_json::json!(["alice", "bob", "carol"])
+        );
+
+        // Two distinct member co-signers meet the quorum -> manager added.
+        let ok = make_group_action(
+            id,
+            "add-manager",
+            serde_json::json!({ "member": "dave" }),
+            "alice",
+            &k_alice,
+            &[("bob".into(), &k_bob), ("carol".into(), &k_carol)],
+            clock1("alice", 2),
+            2000,
+        );
+        assert!(s.apply_remote_action(&ok).is_ok(), "quorum met");
+        let managers = s
+            .get("core")
+            .unwrap()
+            .fields
+            .get("managers")
+            .unwrap()
+            .value
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert!(managers.iter().any(|v| v == &serde_json::json!("dave")));
+
+        // One co-signer is below quorum.
+        let one = make_group_action(
+            id,
+            "add-manager",
+            serde_json::json!({ "member": "eve" }),
+            "alice",
+            &k_alice,
+            &[("bob".into(), &k_bob)],
+            clock1("alice", 3),
+            3000,
+        );
+        assert!(
+            s.apply_remote_action(&one).is_err(),
+            "one co-signer < quorum"
+        );
+
+        // Two co-signers but the same origin are not distinct.
+        let dup = make_group_action(
+            id,
+            "add-manager",
+            serde_json::json!({ "member": "eve" }),
+            "alice",
+            &k_alice,
+            &[("bob".into(), &k_bob), ("bob".into(), &k_bob)],
+            clock1("alice", 4),
+            4000,
+        );
+        assert!(
+            s.apply_remote_action(&dup).is_err(),
+            "duplicate co-signers are not distinct"
+        );
+
+        // One member + one outsider: only one counts.
+        let outsider = make_group_action(
+            id,
+            "add-manager",
+            serde_json::json!({ "member": "eve" }),
+            "alice",
+            &k_alice,
+            &[("bob".into(), &k_bob), ("mallory".into(), &k_mallory)],
+            clock1("alice", 5),
+            5000,
+        );
+        assert!(
+            s.apply_remote_action(&outsider).is_err(),
+            "an outsider co-signer does not count"
+        );
+
+        // The rejected actions never added eve.
+        let members = s
+            .get("core")
+            .unwrap()
+            .fields
+            .get("members")
+            .unwrap()
+            .value
+            .as_array()
+            .cloned()
+            .unwrap();
+        assert!(
+            !members.iter().any(|v| v == &serde_json::json!("eve")),
+            "rejected actions must not mutate the group"
+        );
+
+        // Tamper: a wrong-key origin signature is rejected and quarantined.
+        let mut tampered = make_group_action(
+            id,
+            "add-manager",
+            serde_json::json!({ "member": "eve" }),
+            "alice",
+            &k_alice,
+            &[("bob".into(), &k_bob), ("carol".into(), &k_carol)],
+            clock1("alice", 6),
+            6000,
+        );
+        tampered.sig = k_bob.sign(&tampered.message_bytes()).to_bytes();
+        assert!(
+            s.apply_remote_action(&tampered).is_err(),
+            "a wrong-key signature is rejected"
+        );
+        assert!(
+            s.quarantined_count() > 0,
+            "rejections are counted as quarantined"
         );
     }
 }

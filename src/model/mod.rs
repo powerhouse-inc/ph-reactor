@@ -24,6 +24,8 @@ use crate::action::Action;
 use crate::doc::{Doc, ModelRef, Op};
 use crate::model::open::Open;
 
+pub mod group;
+pub mod l1;
 pub mod open;
 
 /// Why a model rejected an action or a state.
@@ -51,6 +53,21 @@ impl Reject {
     }
 }
 
+/// A quorum requirement declared by a reducer: the action needs `min`
+/// distinct, valid co-signers whose origins are members of the `group`
+/// document's `field` (default `members`). The store checks it (it needs
+/// the group's state); the model only declares it so `reduce` and
+/// `check_precondition` stay pure.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuorumSpec {
+    /// The group document: a doc name, or `$self` for the action's own doc.
+    pub group: String,
+    /// The minimum number of distinct valid co-signers required.
+    pub min: usize,
+    /// The group's membership field. Defaults to `members`.
+    pub field: String,
+}
+
 /// A document model.
 ///
 /// Every method is a pure function of its arguments (no I/O, clock, or
@@ -73,6 +90,12 @@ pub trait Model: Send + Sync {
 
     /// Validate that a state satisfies the model's state schema.
     fn check_state(&self, state: &Doc) -> Result<(), Reject>;
+
+    /// The quorum requirement for a reducer kind, if any. Declared by the
+    /// model; checked by the store (which has the group doc). Default: none.
+    fn quorum(&self, _kind: &str) -> Option<QuorumSpec> {
+        None
+    }
 }
 
 /// Loaded models, keyed by `(name, version)`.
@@ -90,6 +113,13 @@ impl ModelRegistry {
     pub fn seeded_with_open() -> Self {
         let mut r = Self::default();
         r.insert(Arc::new(Open::new()));
+        r
+    }
+
+    /// A registry seeded with all built-in models (`open@1` + `group@1`).
+    pub fn seeded_with_builtins() -> Self {
+        let mut r = Self::seeded_with_open();
+        r.insert(Arc::new(group::group()));
         r
     }
 
