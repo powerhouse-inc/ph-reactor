@@ -93,6 +93,10 @@ impl StatePaths {
     pub fn key_file(&self) -> PathBuf {
         self.root.join("key")
     }
+    /// The local ban list: a JSON array of refused peer ids (base58).
+    pub fn bans_file(&self) -> PathBuf {
+        self.root.join("bans.json")
+    }
 
     pub fn daemon_pidfile(&self) -> PathBuf {
         self.run_dir.join("ph-reactor.pid")

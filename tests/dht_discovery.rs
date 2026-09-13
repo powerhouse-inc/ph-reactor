@@ -12,6 +12,7 @@ fn init_log() {
 }
 
 use std::str::FromStr;
+use std::collections::HashSet;
 use std::time::Duration;
 
 use libp2p::identity::Keypair;
@@ -48,8 +49,10 @@ async fn spawn_dht_node(tag: &str) -> Node {
         &key, store, tag, listen, false, // no mDNS
         true,  // DHT enabled
         false, // no relay
-        None,  // no shared token
-        cmd_rx, evt_tx,
+        None,         // no shared token
+        HashSet::new(), // no banned peers
+        cmd_rx,
+        evt_tx,
     )
     .expect("engine");
     tokio::spawn(async move {

@@ -59,6 +59,17 @@ pub enum Command {
         /// The invite string (from the inviter's `ph-reactor invite`).
         invite: String,
     },
+    /// Ban a peer: its future handshakes are refused (it cannot sync with
+    /// this vault). Requires a running daemon.
+    Ban {
+        /// The peer to ban (base58 peer id, as shown by `ph-reactor status`).
+        peer: String,
+    },
+    /// Unban a previously banned peer.
+    Unban {
+        /// The peer to unban (base58 peer id).
+        peer: String,
+    },
     /// Diagnose the local setup (state dir, identity, store, listener,
     /// settings server).
     Doctor,

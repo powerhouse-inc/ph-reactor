@@ -65,6 +65,8 @@ impl Settings {
             .route("/api/docs/action", post(action_doc))
             .route("/api/invite", post(make_invite))
             .route("/api/join", post(join_invite))
+            .route("/api/ban", post(ban_peer))
+            .route("/api/unban", post(unban_peer))
             .with_state(Arc::new(self));
         let task = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
@@ -386,6 +388,67 @@ async fn join_invite(
             .into_response(),
         Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "join timed out").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct PeerBody {
+    peer: String,
+}
+
+/// Ban a peer: its future handshakes are refused (synchronous).
+async fn ban_peer(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<PeerBody>,
+) -> Response {
+    let (reply, wait) = oneshot::channel();
+    let cmd = Command::Ban {
+        peer: body.peer,
+        reply,
+    };
+    if state.cmd_tx.send(cmd).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(Ok(Ok(()))) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "ok": true })),
+        )
+            .into_response(),
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "ban timed out").into_response(),
+    }
+}
+
+/// Unban a peer: allow its handshakes again (synchronous).
+async fn unban_peer(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<PeerBody>,
+) -> Response {
+    let (reply, wait) = oneshot::channel();
+    let cmd = Command::Unban {
+        peer: body.peer,
+        reply,
+    };
+    if state.cmd_tx.send(cmd).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(Ok(Ok(()))) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "ok": true })),
+        )
+            .into_response(),
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "unban timed out").into_response(),
     }
 }
 // ---------------------------------------------------------------------------

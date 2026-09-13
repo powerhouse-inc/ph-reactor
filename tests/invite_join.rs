@@ -12,7 +12,7 @@ fn init_log() {
         .try_init();
 }
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -59,7 +59,8 @@ async fn spawn_node(tag: &str) -> Node {
         false, // no mDNS
         false, // no DHT
         false, // no relay
-        None,  // no shared token
+        None,          // no shared token
+        HashSet::new(), // no banned peers
         cmd_rx,
         evt_tx,
     )
@@ -195,4 +196,64 @@ async fn invite_join_then_sync() {
     .await
     .expect("doc propagation timed out");
     assert!(arrived, "alpha should have received beta's doc");
+}
+
+/// A vault (beta) that bans a peer (alpha) refuses its handshake: alpha
+/// dials beta, beta answers the hello with `HelloErr::Banned`, the drive
+/// ends in an error state, and no doc crosses the link.
+#[tokio::test]
+async fn banned_peer_is_refused() {
+    init_log();
+    let mut a = spawn_node("alpha").await; // the peer that will be banned
+    let b = spawn_node("beta").await; // the vault
+
+    // Beta holds a doc it would normally share.
+    let mut fields = BTreeMap::new();
+    fields.insert(
+        "title".to_string(),
+        serde_json::Value::String("secret".into()),
+    );
+    b.store
+        .create_doc("b-secret", fields)
+        .expect("beta creates the doc");
+
+    // Beta bans alpha before any link is established.
+    b.cmd_tx
+        .send(EngineCommand::Ban { peer: a.peer })
+        .unwrap();
+
+    // Alpha dials beta (adds a drive for it).
+    let drive = Drive {
+        name: "beta".into(),
+        addr: with_peer(&b.listen, b.peer),
+        token_env: None,
+        paused: false,
+        available_offline: true,
+    };
+    a.cmd_tx
+        .send(EngineCommand::AddDrive(drive))
+        .unwrap();
+
+    // Beta refuses the hello; alpha's drive ends in an error state.
+    wait_for(
+        &mut a.evt_rx,
+        |ev| matches!(
+            ev,
+            EngineEvent::DriveStatus {
+                name,
+                status,
+                ..
+            } if name == "beta" && *status == DriveStatus::Error
+        ),
+    )
+    .await;
+
+    // Give a moment for any (blocked) propagation, then assert none happened.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let leaked = a
+        .store
+        .doc_ids()
+        .iter()
+        .any(|id| a.store.doc_name(*id) == "b-secret");
+    assert!(!leaked, "alpha should not have received the banned peer's doc");
 }

@@ -79,6 +79,8 @@ pub enum HelloError {
     AuthRequired,
     BadToken,
     KeyMismatch,
+    /// The peer is on the local ban list.
+    Banned,
 }
 
 impl HelloError {
@@ -88,6 +90,7 @@ impl HelloError {
             HelloError::AuthRequired => "auth-required",
             HelloError::BadToken => "bad-token",
             HelloError::KeyMismatch => "key-mismatch",
+            HelloError::Banned => "banned",
         }
     }
 }

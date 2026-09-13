@@ -12,7 +12,7 @@ fn init_log() {
         .try_init();
 }
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashSet};
 use std::str::FromStr;
 use std::sync::Arc;
 use std::time::Duration;
@@ -53,7 +53,8 @@ async fn spawn_node(tag: &str) -> Node {
         false, // no mDNS in the test
         false, // no DHT in the test
         false, // no relay in the test
-        None,  // no shared token
+        None,          // no shared token
+        HashSet::new(), // no banned peers
         cmd_rx,
         evt_tx,
     )

@@ -61,6 +61,17 @@ pub enum Command {
         invite: String,
         reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
+    /// Ban a peer (base58): its future handshakes are refused. Synchronous,
+    /// like `Join`.
+    Ban {
+        peer: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Unban a peer (base58): allow its handshakes again.
+    Unban {
+        peer: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Update a dotted config key (validated by `config::set`).
     SetConfig { key: String, value: Value },
     /// Stop the daemon.

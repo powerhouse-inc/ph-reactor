@@ -158,6 +158,11 @@ pub enum EngineCommand {
         drive: Drive,
         accept: invite::InviteAccept,
     },
+    /// Ban a peer: its future handshakes are refused (it stays in the ban
+    /// list). `peer` is the verified connection peer id.
+    Ban { peer: PeerId },
+    /// Unban a peer: allow its handshakes again.
+    Unban { peer: PeerId },
     /// Shut the engine down (drain and return).
     Shutdown,
 }
@@ -224,6 +229,9 @@ pub struct SyncEngine {
     /// though no drive for them existed yet; a drive added later
     /// completes the handshake from this record.
     guests: HashSet<PeerId>,
+    /// Peers the user has explicitly refused: their handshakes are rejected
+    /// (no key registration, no drive added) even if their key is valid.
+    banned: HashSet<PeerId>,
     cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
     evt_tx: mpsc::UnboundedSender<EngineEvent>,
     running: bool,
@@ -260,6 +268,7 @@ impl SyncEngine {
         dht_enabled: bool,
         relay_enabled: bool,
         token: Option<String>,
+        banned: HashSet<PeerId>,
         cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
         evt_tx: mpsc::UnboundedSender<EngineEvent>,
     ) -> anyhow::Result<Self> {
@@ -341,6 +350,7 @@ impl SyncEngine {
             pub_name: pub_name.to_string(),
             listen,
             token,
+            banned,
             drives: HashMap::new(),
             guests: HashSet::new(),
             cmd_rx,
@@ -400,6 +410,16 @@ impl SyncEngine {
                 self.add_drive_internal(drive);
                 if let Some(rt) = self.drives.get_mut(&name) {
                     rt.accept = Some(accept);
+                }
+            }
+            EngineCommand::Ban { peer } => {
+                if self.banned.insert(peer) {
+                    tracing::info!(%peer, "peer banned: its handshakes will be refused");
+                }
+            }
+            EngineCommand::Unban { peer } => {
+                if self.banned.remove(&peer) {
+                    tracing::info!(%peer, "peer unbanned");
                 }
             }
             EngineCommand::RemoveDrive { name } => {
@@ -551,6 +571,11 @@ impl SyncEngine {
     /// echoes the invite's nonce; on success a drive named after the
     /// joiner is added, addressed by the transport-verified connection peer.
     fn handle_invite_accept(&mut self, peer: PeerId, accept: invite::InviteAccept) {
+        // A banned peer is refused even with a valid join-proof.
+        if self.banned.contains(&peer) {
+            tracing::warn!(%peer, "banned peer attempted to join; refusing");
+            return;
+        }
         if accept.verify().is_err() {
             tracing::warn!(%peer, "invite proof failed verification; ignoring");
             return;
@@ -853,6 +878,16 @@ impl SyncEngine {
     ) {
         match request {
             SyncMsg::Hello(mut h) => {
+                // Ban gate: a refused peer never completes a handshake here,
+                // regardless of version, token, or key validity.
+                if self.banned.contains(&peer) {
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .sync
+                        .send_response(channel, SyncMsg::HelloErr(HelloError::Banned));
+                    return;
+                }
                 // Version gate.
                 if h.version != PROTOCOL_VERSION {
                     let _ = self.swarm.behaviour_mut().sync.send_response(
@@ -1099,6 +1134,10 @@ impl SyncEngine {
                         DriveStatus::Error,
                         "TOFU key mismatch: the peer's key differs from the pinned key".to_string(),
                     ),
+                    HelloError::Banned => (
+                        DriveStatus::Error,
+                        "banned: the peer is refused by the remote (or is on our ban list)".to_string(),
+                    ),
                 };
                 if let Some(rt) = self.drives.get_mut(&name) {
                     rt.status = status;
@@ -1174,6 +1213,10 @@ impl SyncEngine {
             return;
         }
         let peer = self.drives.get(name).unwrap().peer;
+        if self.banned.contains(&peer) {
+            self.set_status(name, DriveStatus::Error, Some("banned by user".to_string()));
+            return;
+        }
         let accept = self.drives.get_mut(name).and_then(|rt| rt.accept.take());
         let pubkey = self.store.key().verifying_key().to_bytes();
         let hello = Hello {

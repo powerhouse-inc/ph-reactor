@@ -12,7 +12,7 @@
 //! its [`EngineEvent`] stream (drive status changes, doc changes, the
 //! identity announcement) and feeds the shared status snapshot.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::io::{self, Write};
 use std::os::fd::AsRawFd;
 use std::path::Path;
@@ -41,6 +41,24 @@ const POLL_INTERVAL: Duration = Duration::from_secs(5);
 const DAEMONIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `stop` waits for a graceful exit before SIGKILL.
 const STOP_GRACE: Duration = Duration::from_secs(15);
+
+/// Load the local ban list (base58 peer ids) from `bans.json`; empty when
+/// the file is missing or unparseable.
+fn load_bans(paths: &StatePaths) -> HashSet<String> {
+    let Ok(data) = std::fs::read_to_string(paths.bans_file()) else {
+        return HashSet::new();
+    };
+    serde_json::from_str(&data).unwrap_or_default()
+}
+
+/// Persist the local ban list to `bans.json`.
+fn save_bans(paths: &StatePaths, bans: &HashSet<String>) -> Result<()> {
+    let mut v: Vec<String> = bans.iter().cloned().collect();
+    v.sort();
+    let data = serde_json::to_string_pretty(&v)?;
+    std::fs::write(paths.bans_file(), data)?;
+    Ok(())
+}
 
 // ---------------------------------------------------------------------------
 // run
@@ -185,6 +203,12 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         .iter()
         .filter_map(|s| crate::p2p::parse_bootstrap(s))
         .collect();
+    // Peers on the local ban list are refused: the engine will not complete
+    // a handshake with them (even if their key is valid).
+    let banned: HashSet<PeerId> = load_bans(&paths)
+        .iter()
+        .filter_map(|s| PeerId::from_str(s).ok())
+        .collect();
     let engine = SyncEngine::new(
         &kp,
         store.clone(),
@@ -194,6 +218,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         config.p2p.dht,
         config.p2p.relay,
         token,
+        banned,
         eng_cmd_rx,
         evt_tx,
     )
@@ -240,6 +265,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         peer_id,
         listen: None,
         store,
+        bans: load_bans(&paths),
         eng_cmd_tx,
         last_save_mtime: std::fs::metadata(&paths.config_file)
             .and_then(|m| m.modified())
@@ -351,6 +377,8 @@ struct Ctx {
     /// The engine's resolved listen address (set by its Identity event).
     listen: Option<Multiaddr>,
     store: Arc<Store>,
+    /// The local ban list (base58 peer ids), mirrored from `bans.json`.
+    bans: HashSet<String>,
     /// The engine's command channel.
     eng_cmd_tx: mpsc::UnboundedSender<EngineCommand>,
     /// Mtime of `config.json` as of the daemon's last write (and at
@@ -705,6 +733,45 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
                     let _ = reply.send(Err(e.to_string()));
                 }
             }
+        }
+        Command::Ban { peer, reply } => {
+            let pid = match PeerId::from_str(&peer) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = reply.send(Err(format!("'{peer}' is not a valid peer id: {e}")));
+                    return Ok(false);
+                }
+            };
+            ctx.bans.insert(peer);
+            if let Err(e) = save_bans(&ctx.paths, &ctx.bans) {
+                let _ = reply.send(Err(format!("saving the ban list failed: {e}")));
+                return Ok(false);
+            }
+            if let Err(e) = ctx.eng_cmd_tx.send(EngineCommand::Ban { peer: pid }) {
+                let _ = reply.send(Err(e.to_string()));
+                return Ok(false);
+            }
+            ctx.last_event = Some("banned a peer".into());
+            let _ = reply.send(Ok(()));
+        }
+        Command::Unban { peer, reply } => {
+            let pid = match PeerId::from_str(&peer) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = reply.send(Err(format!("'{peer}' is not a valid peer id: {e}")));
+                    return Ok(false);
+                }
+            };
+            ctx.bans.remove(&peer);
+            if let Err(e) = save_bans(&ctx.paths, &ctx.bans) {
+                let _ = reply.send(Err(format!("saving the ban list failed: {e}")));
+                return Ok(false);
+            }
+            if let Err(e) = ctx.eng_cmd_tx.send(EngineCommand::Unban { peer: pid }) {
+                let _ = reply.send(Err(e.to_string()));
+                return Ok(false);
+            }
+            let _ = reply.send(Ok(()));
         }
         Command::Quit => {
             tracing::info!("quit requested");
@@ -1438,6 +1505,41 @@ pub async fn join_command(state_dir: Option<&Path>, invite: String) -> Result<()
     println!(
         "joined: the inviter is pinned and a drive was added (it syncs once the connection is up)"
     );
+    Ok(())
+}
+
+/// The `ban` / `unban` CLI: asks the running daemon to add to (or remove
+/// from) the local ban list. A banned peer's handshakes are refused, so it
+/// can no longer sync with this vault.
+pub async fn ban_command(state_dir: Option<&Path>, peer: String, unban: bool) -> Result<()> {
+    let paths = StatePaths::resolve(state_dir);
+    paths.ensure_dirs()?;
+    if !daemon_is_running(&paths.daemon_pidfile()) {
+        bail!("the daemon is not running — start it (ph-reactor) and retry: ban lists are enforced by the daemon's engine");
+    }
+    let config = config::load(&paths)?;
+    let endpoint = if unban { "api/unban" } else { "api/ban" };
+    let url = format!(
+        "http://{}:{}/{}",
+        config.settings.host,
+        config.settings.port,
+        endpoint
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let body = serde_json::json!({ "peer": peer });
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    if !status.is_success() {
+        let text = r.text().await.unwrap_or_default();
+        bail!("{} failed: {status} {text}", if unban { "unban" } else { "ban" });
+    }
+    if unban {
+        println!("unbanned {peer}");
+    } else {
+        println!("banned {peer} (its handshakes will be refused)");
+    }
     Ok(())
 }
 
