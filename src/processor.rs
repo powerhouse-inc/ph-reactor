@@ -73,20 +73,14 @@ impl ActionFilter {
 #[serde(tag = "kind", rename_all = "kebab-case")]
 pub enum Reaction {
     /// Append a templated message to the daemon log and the fire history.
-    Log {
-        message: String,
-    },
+    Log { message: String },
     /// Run a local command (a trusted, loopback-only capability) with a
     /// bounded timeout. The triggering document is exposed as `$PH_DOC` and
     /// the model as `$PH_MODEL`.
-    Run {
-        command: String,
-    },
+    Run { command: String },
     /// Record a named event (for a UI feed) — no side effect beyond the fire
     /// history.
-    Emit {
-        event: String,
-    },
+    Emit { event: String },
     /// Create a document of `model` with `fields` (values may template
     /// `$doc`/`$model`); skipped if the name already exists.
     CreateDoc {
@@ -188,7 +182,6 @@ pub fn reference_spec() -> ProcessorSpec {
         created: now_ms(),
     }
 }
-
 
 fn substitute(template: &str, doc: &str, model: &str) -> String {
     template
@@ -375,7 +368,11 @@ async fn perform(store: &Arc<Store>, spec: &ProcessorSpec, change: &DocChange) -
                 }
             }
         }
-        Reaction::CreateDoc { model, name, fields } => {
+        Reaction::CreateDoc {
+            model,
+            name,
+            fields,
+        } => {
             let doc_name = substitute(name, doc, model);
             if store.get(&doc_name).is_some() {
                 return format!("doc '{doc_name}' already exists (skipped)");
@@ -455,7 +452,12 @@ mod tests {
     use super::*;
     use crate::doc::DocId;
 
-    fn change(kind: Option<&str>, field: Option<&str>, value: Option<&str>, model: &str) -> DocChange {
+    fn change(
+        kind: Option<&str>,
+        field: Option<&str>,
+        value: Option<&str>,
+        model: &str,
+    ) -> DocChange {
         use crate::doc::ModelRef;
         use crate::store::DocState;
         let id = DocId::new();
@@ -485,13 +487,12 @@ mod tests {
     #[test]
     fn filter_matches_by_model_and_delta() {
         // any model, any change.
-        assert!(ActionFilter::default()
-            .matches(&change(
-                Some("set"),
-                Some("status"),
-                Some("accepted"),
-                "invoice"
-            )));
+        assert!(ActionFilter::default().matches(&change(
+            Some("set"),
+            Some("status"),
+            Some("accepted"),
+            "invoice"
+        )));
         // model must match.
         let f = ActionFilter {
             models: vec!["invoice".into()],
@@ -568,7 +569,9 @@ mod tests {
                 action_kind: None,
                 field: Some("status".into()),
                 value: Some(serde_json::json!("accepted")),
-                reaction: Reaction::Emit { event: "accepted $doc".into() },
+                reaction: Reaction::Emit {
+                    event: "accepted $doc".into(),
+                },
                 created: 1,
             }],
         );
@@ -576,8 +579,12 @@ mod tests {
         let handle = runner.handle();
         runner.spawn();
 
-        store.create_doc("inv", std::collections::BTreeMap::new()).unwrap();
-        store.update_field("inv", "status", serde_json::json!("accepted")).unwrap();
+        store
+            .create_doc("inv", std::collections::BTreeMap::new())
+            .unwrap();
+        store
+            .update_field("inv", "status", serde_json::json!("accepted"))
+            .unwrap();
 
         tokio::time::sleep(std::time::Duration::from_millis(150)).await;
 

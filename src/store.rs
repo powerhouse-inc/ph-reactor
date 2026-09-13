@@ -1026,24 +1026,23 @@ impl Inner {
         };
         let (action_kind, action_field, action_value) = match action {
             Some(a) => {
-                let (action_field, action_value) = if let Some(f) =
-                    a.payload.get("field").and_then(|v| v.as_str())
-                {
-                    // An explicit `field`/`value` action (the `open` model).
-                    (Some(f.to_string()), a.payload.get("value").cloned())
-                } else if let Some(obj) = a.payload.as_object() {
-                    // A single-field reducer (e.g. `set-status`): the lone
-                    // payload key is the field being written, so a processor
-                    // can match a transition on the field + value.
-                    if obj.len() == 1 {
-                        let (k, v) = obj.iter().next().expect("len == 1");
-                        (Some(k.clone()), Some(v.clone()))
+                let (action_field, action_value) =
+                    if let Some(f) = a.payload.get("field").and_then(|v| v.as_str()) {
+                        // An explicit `field`/`value` action (the `open` model).
+                        (Some(f.to_string()), a.payload.get("value").cloned())
+                    } else if let Some(obj) = a.payload.as_object() {
+                        // A single-field reducer (e.g. `set-status`): the lone
+                        // payload key is the field being written, so a processor
+                        // can match a transition on the field + value.
+                        if obj.len() == 1 {
+                            let (k, v) = obj.iter().next().expect("len == 1");
+                            (Some(k.clone()), Some(v.clone()))
+                        } else {
+                            (None, None)
+                        }
                     } else {
                         (None, None)
-                    }
-                } else {
-                    (None, None)
-                };
+                    };
                 (Some(a.kind.clone()), action_field, action_value)
             }
             None => (None, None, None),
@@ -1456,9 +1455,15 @@ mod tests {
         let s2 = open_store(dir.path());
         let id = s2.get("devs").expect("the group survives a restart").id;
         let state = s2.full_state(id).expect("the group has a full state");
-        assert_eq!(state.model.name, "group", "replay must preserve the group model");
+        assert_eq!(
+            state.model.name, "group",
+            "replay must preserve the group model"
+        );
         assert_eq!(state.model.version, "1");
-        assert_eq!(state.doc.fields["members"].value, serde_json::json!(["alice", "bob"]));
+        assert_eq!(
+            state.doc.fields["members"].value,
+            serde_json::json!(["alice", "bob"])
+        );
         assert_eq!(s2.doc_count(), 1);
     }
 

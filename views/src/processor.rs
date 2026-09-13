@@ -32,7 +32,10 @@ pub trait Processor: Send + Sync {
     /// field / value change). Defaults to the model list only, so a
     /// processor that only declares `models()` is unchanged.
     fn filter(&self) -> ActionFilter {
-        ActionFilter { models: self.models(), ..Default::default() }
+        ActionFilter {
+            models: self.models(),
+            ..Default::default()
+        }
     }
 
     /// React to a doc's current snapshot.
