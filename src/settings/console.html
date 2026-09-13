@@ -502,7 +502,7 @@ async function viewGroupDetail(el, name, stale = () => false) {
         <table><tbody>${g.managers.map((m) => `<tr><td>${esc(m)}</td>
           <td style="text-align:right"><button class="danger" data-mg="${esc(m)}">remove</button></td></tr>`).join("")
           || '<tr><td class="empty">none</td></tr>'}</tbody></table>
-        <div class="hint">Adding a second manager requires a quorum (two existing managers).</div>
+        <div class="hint">Add manager is quorum-gated (the two-person rule): two distinct <em>member</em> co-signers, other than you, must sign it. A single node cannot do this by itself — use <strong>Create group</strong> to set a new group\u2019s initial managers, or have a second member peer co-sign.</div>
         <form class="form" id="gd-addm"><input name="m" placeholder="add manager" required style="flex:1">
           <button class="primary" type="submit">Add manager</button></form>
       </div>

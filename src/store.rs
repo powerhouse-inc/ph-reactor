@@ -1132,8 +1132,9 @@ impl Inner {
         }
         if in_group < spec.min {
             Some(format!(
-                "quorum: {in_group} of {} co-signers are members of '{group_name}' (need {})",
+                "quorum not met: {in_group} of {} co-signers are members of '{group_name}' (need {}). The two-person rule: {} distinct members *other than the proposer* must co-sign this action — a single node cannot satisfy it by itself.",
                 action.cosig.len(),
+                spec.min,
                 spec.min
             ))
         } else {
