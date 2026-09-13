@@ -13,8 +13,10 @@ use libp2p::swarm::StreamProtocol;
 use serde::{Deserialize, Serialize};
 
 use crate::action::Action;
-use crate::doc::{DocId, VecClock};
+use crate::doc::{DocId, ModelRef, VecClock};
 use crate::store::DocState;
+
+use serde_json::Value;
 
 /// Protocol version. Bumped for incompatible changes; mismatched majors
 /// are rejected in the hello handshake.
@@ -140,6 +142,22 @@ pub struct ActionMsg {
     pub name: Option<String>,
 }
 
+/// Model-definition request: "send me the definition for this model".
+/// Sent by a peer that received an action under a model it does not have.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelRequest {
+    pub ref_: ModelRef,
+}
+
+/// Model-definition reply. `def` is `None` when the responder does not
+/// have (a verifiable) definition for the requested model; the requester
+/// then keeps the action pending until some peer can provide it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ModelDef {
+    pub ref_: ModelRef,
+    pub def: Option<Value>,
+}
+
 /// All protocol messages in one tagged enum.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "t", content = "p")]
@@ -151,6 +169,8 @@ pub enum SyncMsg {
     CatchUpAck(CatchUpAck),
     Summary(Summary),
     SummaryAck(SummaryAck),
+    ModelRequest(ModelRequest),
+    ModelDef(ModelDef),
 }
 
 /// Length-prefixed JSON codec for the request-response behaviour.

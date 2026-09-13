@@ -256,6 +256,19 @@ impl Store {
         self.inner.lock().models.refs()
     }
 
+    /// Whether this peer can reduce actions under `ref_` (the model is
+    /// loaded). The mesh model-distribution path requests the definition
+    /// over the mesh when this is false.
+    pub fn model_available(&self, ref_: &ModelRef) -> bool {
+        self.inner.lock().models.find(ref_).is_some()
+    }
+
+    /// The loaded model's definition by reference, if it has one (for
+    /// answering a mesh model request).
+    pub fn model_definition(&self, ref_: &ModelRef) -> Option<serde_json::Value> {
+        self.inner.lock().models.definition(ref_)
+    }
+
     /// Subscribe to the doc-change feed: a [`DocChange`] is delivered here
     /// whenever a document's state changes on this store (a local or remote
     /// action applied, or a state adopted). The read-model layer consumes
@@ -511,7 +524,7 @@ impl Store {
             clock: entry.clock.clone(),
             deleted: entry.deleted,
             log_hash: entry.log.last().map(|a| a.hash()),
-            model: open_ref(),
+            model: entry.model.clone(),
         });
         let missing: Vec<Action> = entry
             .log
@@ -860,7 +873,7 @@ impl Inner {
             .and_then(|e| e.log.last().map(|a| a.hash()));
         let mut action = Action {
             doc_id: id,
-            model: model.clone(),
+            model: self.canonical_model_ref(model),
             kind: kind.to_string(),
             payload: payload.clone(),
             ts,
@@ -872,6 +885,17 @@ impl Inner {
         };
         action.sign(&self.key);
         Ok(action)
+    }
+
+    /// The loaded model's canonical reference (with its content hash) for
+    /// `ref_`, or `ref_` itself when the model is not loaded. Stamping the
+    /// hash on every action is what lets a peer verify a distributed model
+    /// definition against the exact model the doc was written under.
+    fn canonical_model_ref(&self, ref_: &ModelRef) -> ModelRef {
+        self.models
+            .find(ref_)
+            .map(|m| m.ref_().clone())
+            .unwrap_or_else(|| ref_.clone())
     }
 
     /// The single apply path (local and remote). Verify -> model -> validate

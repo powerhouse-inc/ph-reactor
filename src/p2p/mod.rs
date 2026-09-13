@@ -37,13 +37,17 @@ use libp2p::{mdns, noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBu
 use tokio::sync::mpsc;
 
 use crate::action::Action;
-use crate::doc::{DocId, VecClock};
+use crate::doc::{DocId, ModelRef, VecClock};
 use crate::drives::{Drive, DriveStatus};
+use crate::model::{l1::L1, model_def_hash};
 use crate::p2p::codec::{
-    ActionMsg, CatchUp, CatchUpAck, DocSummary, Hello, HelloAck, HelloError, Summary, SummaryAck,
-    SyncCodec, SyncMsg, CATCH_UP_MAX_ACTIONS, GOSSIPSUB_TOPIC, PROTOCOL_VERSION, SYNC_PROTOCOL,
+    ActionMsg, CatchUp, CatchUpAck, DocSummary, Hello, HelloAck, HelloError, ModelDef,
+    ModelRequest, Summary, SummaryAck, SyncCodec, SyncMsg, CATCH_UP_MAX_ACTIONS, GOSSIPSUB_TOPIC,
+    PROTOCOL_VERSION, SYNC_PROTOCOL,
 };
 use crate::store::Store;
+
+use serde_json::Value;
 
 type SyncProtocol = StreamProtocol;
 
@@ -252,6 +256,14 @@ pub struct SyncEngine {
     idle_notified: bool,
     /// Whether the resolved listen address has been announced yet.
     identity_sent: bool,
+
+    /// Remote actions that arrived under a model this peer does not have
+    /// yet, held for re-application once the definition is fetched over
+    /// the mesh (a missing model is a request, not a rejection).
+    pending_actions: Vec<(ModelRef, Action)>,
+    /// `(name, version)` of models already requested over the mesh (so a
+    /// missing model is not re-requested in a loop).
+    requested_models: HashSet<(String, String)>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -372,6 +384,8 @@ impl SyncEngine {
             running: true,
             idle_notified: false,
             identity_sent: false,
+            pending_actions: Vec::new(),
+            requested_models: HashSet::new(),
         })
     }
 
@@ -866,7 +880,7 @@ impl SyncEngine {
         let Ok(ActionMsg { action, .. }) = serde_json::from_slice(&message.data) else {
             return;
         };
-        self.apply_remote_action(&action);
+        self.apply_remote_action(message.source, &action);
     }
 
     // -- request/response ---------------------------------------------------
@@ -1083,11 +1097,23 @@ impl SyncEngine {
                     .sync
                     .send_response(channel, SyncMsg::SummaryAck(SummaryAck { clocks: own }));
             }
+            SyncMsg::ModelRequest(r) => {
+                // A peer wants a model definition it does not have. Answer
+                // with ours if we have one; the requester verifies the reply
+                // against the pinned hash before registering it.
+                let def = self.store.model_definition(&r.ref_);
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .sync
+                    .send_response(channel, SyncMsg::ModelDef(ModelDef { ref_: r.ref_, def }));
+            }
             // Rejections/acks we initiated on the outbound side.
             SyncMsg::HelloAck(_)
             | SyncMsg::CatchUpAck(_)
             | SyncMsg::SummaryAck(_)
-            | SyncMsg::HelloErr(_) => {}
+            | SyncMsg::HelloErr(_)
+            | SyncMsg::ModelDef(_) => {}
         }
     }
 
@@ -1209,7 +1235,7 @@ impl SyncEngine {
             SyncMsg::CatchUpAck(ack) => {
                 let mut applied = 0usize;
                 for action in &ack.actions {
-                    if self.apply_remote_action(action) {
+                    if self.apply_remote_action(Some(peer), action) {
                         applied += 1;
                     }
                 }
@@ -1239,15 +1265,73 @@ impl SyncEngine {
                     }
                 }
             }
+            // A model definition arrived over the mesh: verify it against
+            // the pinned hash, register it, and re-apply the actions that
+            // were held waiting for it.
+            SyncMsg::ModelDef(d) => {
+                let Some(def) = d.def else {
+                    return;
+                };
+                let name_ok = def.get("name").and_then(Value::as_str) == Some(d.ref_.name.as_str());
+                let ver_ok =
+                    def.get("version").and_then(Value::as_str) == Some(d.ref_.version.as_str());
+                if !(name_ok && ver_ok) {
+                    return;
+                }
+                if let Some(want) = d.ref_.hash {
+                    if model_def_hash(&def) != want {
+                        tracing::warn!(
+                            "model {} definition failed hash verification; dropped",
+                            d.ref_
+                        );
+                        return;
+                    }
+                }
+                let l1 = match L1::from_def(def) {
+                    Ok(l) => l,
+                    Err(e) => {
+                        tracing::warn!("model {} definition rejected: {e}", d.ref_);
+                        return;
+                    }
+                };
+                let key = (d.ref_.name.clone(), d.ref_.version.clone());
+                self.store.add_model(Arc::new(l1));
+                self.requested_models.remove(&key);
+                let to_apply: Vec<Action> = self
+                    .pending_actions
+                    .iter()
+                    .filter(|(m, _)| m.name == key.0 && m.version == key.1)
+                    .map(|(_, a)| a.clone())
+                    .collect();
+                self.pending_actions
+                    .retain(|(m, _)| !(m.name == key.0 && m.version == key.1));
+                for a in to_apply {
+                    self.apply_remote_action(Some(peer), &a);
+                }
+            }
             // We do not initiate these.
-            SyncMsg::Hello(_) | SyncMsg::CatchUp(_) | SyncMsg::Summary(_) => {}
+            SyncMsg::Hello(_)
+            | SyncMsg::CatchUp(_)
+            | SyncMsg::Summary(_)
+            | SyncMsg::ModelRequest(_) => {}
         }
     }
 
     // -- helpers ---------------------------------------------------------------
 
     /// Applies a remote action through the store (signature-verified).
-    fn apply_remote_action(&mut self, action: &Action) -> bool {
+    /// When the action's model is not loaded, the definition is requested
+    /// from `peer` over the mesh and the action is held pending until the
+    /// definition arrives (then re-applied). A `None` source is held
+    /// pending without a request.
+    fn apply_remote_action(&mut self, peer: Option<PeerId>, action: &Action) -> bool {
+        if !self.store.model_available(&action.model) {
+            if let Some(p) = peer {
+                self.request_model(p, &action.model);
+            }
+            self.note_pending(action);
+            return false;
+        }
         match self.store.apply_remote_action(action) {
             Ok(r) if r.applied => {
                 let name = self.store.doc_name(action.doc_id);
@@ -1262,6 +1346,29 @@ impl SyncEngine {
                 false
             }
         }
+    }
+
+    /// Ask `peer` for the definition of a model this peer lacks, once.
+    fn request_model(&mut self, peer: PeerId, ref_: &ModelRef) {
+        let key = (ref_.name.clone(), ref_.version.clone());
+        if self.requested_models.contains(&key) {
+            return;
+        }
+        self.requested_models.insert(key);
+        let _ = self.swarm.behaviour_mut().sync.send_request(
+            &peer,
+            SyncMsg::ModelRequest(ModelRequest { ref_: ref_.clone() }),
+        );
+    }
+
+    /// Hold a remote action pending until its model is available.
+    fn note_pending(&mut self, action: &Action) {
+        let h = action.hash();
+        if self.pending_actions.iter().any(|(_, a)| a.hash() == h) {
+            return;
+        }
+        self.pending_actions
+            .push((action.model.clone(), action.clone()));
     }
 
     /// Opens the hello handshake to the drive's peer (a no-op when the

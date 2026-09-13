@@ -42,6 +42,9 @@ use crate::model::{Model, QuorumSpec, Reject};
 /// it interprets.
 pub struct L1 {
     ref_: ModelRef,
+    /// The full JSON definition this interpreter was built from (kept so
+    /// the model can be distributed over the mesh and re-built elsewhere).
+    def: Value,
     fields: Value,
     reducers: Value,
     checks: Value,
@@ -63,11 +66,24 @@ impl L1 {
             .and_then(Value::as_str)
             .unwrap_or("1")
             .to_string();
+        // Pin the reference to the content hash of the canonical
+        // definition so a distributed copy is verifiable against the exact
+        // model the doc was written under.
+        let hash = crate::model::model_def_hash(&def);
+        let ref_ = ModelRef {
+            name,
+            version,
+            hash: Some(hash),
+        };
+        let fields = def.get("fields").cloned().unwrap_or(Value::Null);
+        let reducers = def.get("reducers").cloned().unwrap_or(Value::Null);
+        let checks = def.get("checks").cloned().unwrap_or(Value::Null);
         Ok(Self {
-            ref_: ModelRef::new(&name, &version),
-            fields: def.get("fields").cloned().unwrap_or(Value::Null),
-            reducers: def.get("reducers").cloned().unwrap_or(Value::Null),
-            checks: def.get("checks").cloned().unwrap_or(Value::Null),
+            ref_,
+            def,
+            fields,
+            reducers,
+            checks,
         })
     }
 
@@ -329,6 +345,10 @@ impl Model for L1 {
 
     fn quorum(&self, kind: &str) -> Option<QuorumSpec> {
         self.pre_list(kind).iter().copied().find_map(parse_quorum)
+    }
+
+    fn definition(&self) -> Option<Value> {
+        Some(self.def.clone())
     }
 }
 

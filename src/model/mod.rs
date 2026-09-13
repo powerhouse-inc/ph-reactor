@@ -20,8 +20,10 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
+use serde_json::Value;
+
 use crate::action::Action;
-use crate::doc::{Doc, ModelRef, Op};
+use crate::doc::{Doc, Hash32, ModelRef, Op};
 use crate::model::open::Open;
 
 pub mod group;
@@ -97,6 +99,25 @@ pub trait Model: Send + Sync {
     fn quorum(&self, _kind: &str) -> Option<QuorumSpec> {
         None
     }
+
+    /// The model's canonical definition, if it has a distributable form
+    /// (the JSON an [`L1`](l1::L1) interpreter is built from). Mesh
+    /// model-distribution uses this: a peer that lacks the model requests
+    /// it, verifies the reply against the [`ModelRef`](crate::doc::ModelRef)
+    /// hash, and registers it. Built-in models with no stored definition
+    /// return `None`.
+    fn definition(&self) -> Option<Value> {
+        None
+    }
+}
+
+/// SHA-256 of a model's canonical JSON definition. `serde_json`'s default
+/// `Map` is a sorted `BTreeMap`, so the serialization is canonical: the same
+/// definition hashes to the same digest on every peer, which is how a
+/// distributed model is verified against its [`ModelRef`] hash.
+pub fn model_def_hash(def: &Value) -> Hash32 {
+    let bytes = serde_json::to_vec(def).expect("model definition serializes");
+    Hash32::of(&bytes)
 }
 
 /// Loaded models, keyed by `(name, version)`.
@@ -154,5 +175,11 @@ impl ModelRegistry {
             .keys()
             .map(|(n, v)| ModelRef::new(n, v))
             .collect()
+    }
+
+    /// The model's definition by reference, if loaded and it has one.
+    /// Answers a mesh [`ModelRequest`](crate::p2p::codec::ModelRequest).
+    pub fn definition(&self, ref_: &ModelRef) -> Option<Value> {
+        self.find(ref_).and_then(|m| m.definition())
     }
 }
