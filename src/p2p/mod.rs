@@ -178,6 +178,9 @@ pub enum EngineEvent {
     DhtProvider { key: Vec<u8>, peer: PeerId },
     /// A connection to a peer was established (direct or relayed).
     PeerConnected { peer: PeerId },
+    /// A joiner was accepted on a valid join-proof; the daemon should persist
+    /// the resulting drive so it survives a restart.
+    DriveJoined { name: String, addr: Multiaddr },
 }
 
 // ---------------------------------------------------------------------------
@@ -565,14 +568,15 @@ impl SyncEngine {
             }
         };
         let drive = Drive {
-            name,
-            addr,
+            name: name.clone(),
+            addr: addr.clone(),
             token_env: None,
             paused: false,
             available_offline: true,
         };
         tracing::info!(%peer, "join proof accepted; adding a drive for the joiner");
         self.add_drive_internal(drive);
+        let _ = self.evt_tx.send(EngineEvent::DriveJoined { name, addr });
     }
 
     fn set_status(&self, name: &str, status: DriveStatus, detail: Option<String>) {

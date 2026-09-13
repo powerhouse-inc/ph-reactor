@@ -421,6 +421,24 @@ fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
         EngineEvent::PeerConnected { peer } => {
             tracing::debug!(%peer, "engine: peer connected");
         }
+        EngineEvent::DriveJoined { name, addr } => {
+            if !ctx.config.drives.iter().any(|d| d.name == name) {
+                ctx.config.drives.push(DriveConfig {
+                    name: name.clone(),
+                    addr: addr.to_string(),
+                    token_env: None,
+                    paused: false,
+                    available_offline: true,
+                });
+                ctx.engine_drives.push(name.clone());
+                if let Err(e) = persist_config(ctx) {
+                    tracing::warn!("persisting joined drive '{name}' failed: {e:#}");
+                } else {
+                    ctx.last_event = Some(format!("peer {name} joined"));
+                    tracing::info!("persisted a joined drive: {name}");
+                }
+            }
+        }
     }
 }
 
