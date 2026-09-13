@@ -46,6 +46,17 @@ pub enum Command {
     /// Manage the local documents of this vault.
     #[command(subcommand)]
     Doc(DocCommand),
+    /// Query the maintained read models: every live doc of a model, with an
+    /// optional field-equality filter. Reads the store directly (works with
+    /// or without a running daemon).
+    Query {
+        /// The model to query (omit to query every model).
+        #[arg(default_value = "")]
+        model: String,
+        /// A field-equality filter (K=V); V is JSON when it parses.
+        #[arg(long)]
+        filter: Option<String>,
+    },
     /// Generate a one-shot invite string for a peer to join this vault
     /// (`join` it on their machine). Requires a running daemon.
     Invite {

@@ -30,6 +30,7 @@ use crate::config::{self, DriveConfig, ReactorConfig};
 use crate::drives::{Drive, DriveStatus};
 use crate::p2p::{self, EngineCommand, EngineEvent, SyncEngine};
 use crate::paths::StatePaths;
+use crate::query::{parse_filter, query_docs};
 use crate::settings::Settings;
 use crate::status::{self, DriveStatusEntry, ReactorStatus, StatusSnapshot};
 use crate::store::Store;
@@ -242,7 +243,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
     // The loopback settings server.
-    let settings = Settings::new(cmd_tx.clone(), snap_rx.clone())
+    let settings = Settings::new(cmd_tx.clone(), snap_rx.clone(), store.clone())
         .start(&config.settings.host, config.settings.port)
         .await
         .with_context(|| {
@@ -1556,6 +1557,24 @@ pub async fn ban_command(state_dir: Option<&Path>, peer: String, unban: bool) ->
     Ok(())
 }
 
+/// The `query` CLI: a read-model projection over the store's documents.
+/// Works with or without a running daemon — it opens the store read-only
+/// (the store is the source of truth for every doc the vault has synced).
+pub async fn query_command(
+    state_dir: Option<&Path>,
+    model: &str,
+    filter: Option<&str>,
+) -> Result<()> {
+    let paths = StatePaths::resolve(state_dir);
+    paths.ensure_dirs()?;
+    let store = open_local_store(&paths)?;
+    let filter = filter.and_then(parse_filter);
+    let docs = query_docs(&store, model, filter.as_ref());
+    let rendered = serde_json::to_string_pretty(&serde_json::Value::Array(docs))
+        .unwrap_or_else(|_| "[]".into());
+    println!("{rendered}");
+    Ok(())
+}
 /// Opens the local store from disk for read-only CLI use. The daemon
 /// may be running concurrently; this instance only reads, so the two
 /// views never contend on the files.

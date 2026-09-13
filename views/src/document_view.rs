@@ -5,7 +5,7 @@
 //! is the SQL-backed snapshot index with `get`/`findByType`/`exists`).
 
 use parking_lot::Mutex;
-use std::collections::{BTreeMap, HashMap};
+use std::collections::HashMap;
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
@@ -201,6 +201,7 @@ impl DocumentView {
 mod tests {
     use super::*;
     use ph_reactor::doc::ModelRef;
+    use std::collections::BTreeMap;
 
     fn snap(name: &str, model: &str, field: &str, value: &str) -> DocSnapshot {
         DocSnapshot {

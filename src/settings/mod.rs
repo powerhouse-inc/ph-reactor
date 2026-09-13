@@ -20,11 +20,15 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
 use crate::commands::Command;
+use crate::query::{parse_filter, query_docs};
 use crate::status::StatusSnapshot;
+use crate::store::Store;
 
 pub struct Settings {
     cmd_tx: mpsc::UnboundedSender<Command>,
     snap_rx: watch::Receiver<StatusSnapshot>,
+    /// The doc store — the source of truth behind `/api/query`.
+    store: Arc<Store>,
 }
 
 pub struct SettingsHandle {
@@ -42,8 +46,13 @@ impl Settings {
     pub fn new(
         cmd_tx: mpsc::UnboundedSender<Command>,
         snap_rx: watch::Receiver<StatusSnapshot>,
+        store: Arc<Store>,
     ) -> Self {
-        Self { cmd_tx, snap_rx }
+        Self {
+            cmd_tx,
+            snap_rx,
+            store,
+        }
     }
 
     /// Binds the loopback listener and starts the server.
@@ -63,6 +72,7 @@ impl Settings {
             .route("/api/quit", post(quit))
             .route("/api/docs", post(add_doc))
             .route("/api/docs/action", post(action_doc))
+            .route("/api/query", get(query_api))
             .route("/api/invite", post(make_invite))
             .route("/api/join", post(join_invite))
             .route("/api/ban", post(ban_peer))
@@ -86,6 +96,35 @@ async fn status_api(
 ) -> Result<axum::response::Response, StatusCode> {
     let snap = state.snap_rx.borrow().clone();
     Ok(axum::Json(snap).into_response())
+}
+
+#[derive(Deserialize)]
+struct QueryParams {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+/// `GET /api/query?model=<m>&field=<k>&value=<v>` — answer a query against
+/// the maintained document set (the CQRS read model), as a JSON array of
+/// `{ name, model, fields }` objects.
+async fn query_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Query(params): axum::extract::Query<QueryParams>,
+) -> Result<axum::response::Response, StatusCode> {
+    let filter = match (&params.field, &params.value) {
+        (Some(f), Some(v)) => parse_filter(&format!("{f}={v}")),
+        _ => None,
+    };
+    let docs = query_docs(
+        &state.store,
+        params.model.as_deref().unwrap_or(""),
+        filter.as_ref(),
+    );
+    Ok(axum::Json(docs).into_response())
 }
 
 #[derive(Deserialize)]

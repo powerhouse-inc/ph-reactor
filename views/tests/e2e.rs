@@ -23,7 +23,7 @@ use std::time::Duration;
 use libp2p::identity::Keypair;
 use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::mpsc;
 
 use ph_reactor::doc::ModelRef;

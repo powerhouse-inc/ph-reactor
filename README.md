@@ -98,6 +98,7 @@ ph-reactor [--state-dir <dir>] <command>
   doc list                             local docs
   doc get <name>                       a doc's fields as JSON
   doc add <name> [--field K=V …]      create a local doc (daemon must be running)
+  query <model> [--filter K=V]        query the read models (omit model = all; V is JSON)
   doctor                     diagnostics (state dir, identity, store, listen, settings, session bus)
   config show | config set <dotted.key> <value>
   logs [--follow]
@@ -199,7 +200,9 @@ card, drives table with pause/resume/resync/remove, add-drive form
 (multiaddr). JSON API: `GET /api/status`, `POST /api/drives`, `POST
 /api/drives/<name>/pause|resume|resync`, `DELETE /api/drives/<name>`,
 `POST /api/docs` (synchronous doc creation, used by `ph-reactor doc
-add`), `POST /api/config` (key/value), `POST /api/quit`.
+add`), `GET /api/query?model=<m>&field=<k>&value=<v>` (the read-model
+query, answered from the live store), `POST /api/config` (key/value),
+`POST /api/quit`.
 
 ## Configuration
 

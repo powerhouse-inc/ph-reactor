@@ -55,6 +55,9 @@ async fn dispatch(
         ph::cli::Command::Status { json } => ph::daemon::status(state_dir, json).await,
         ph::cli::Command::Drive(cmd) => ph::daemon::drive_command(state_dir, cmd).await,
         ph::cli::Command::Doc(cmd) => ph::daemon::doc_command(state_dir, cmd).await,
+        ph::cli::Command::Query { model, filter } => {
+            ph::daemon::query_command(state_dir, &model, filter.as_deref()).await
+        }
         ph::cli::Command::Invite { groups } => ph::daemon::invite_command(state_dir, groups).await,
         ph::cli::Command::Join { invite } => ph::daemon::join_command(state_dir, invite).await,
         ph::cli::Command::Ban { peer } => ph::daemon::ban_command(state_dir, peer, false).await,
