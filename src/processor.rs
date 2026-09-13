@@ -166,7 +166,7 @@ pub fn save_specs(path: &Path, specs: &[ProcessorSpec]) {
     }
 }
 
-fn now_ms() -> u64 {
+pub fn now_ms() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_millis() as u64)
@@ -262,9 +262,11 @@ impl ProcessorRunner {
     }
 }
 
-fn set_spec(path: &Path, specs: &Mutex<Vec<ProcessorSpec>>, spec: ProcessorSpec) {
+fn set_spec(path: &Path, specs: &Mutex<Vec<ProcessorSpec>>, mut spec: ProcessorSpec) {
     let mut specs = specs.lock();
     if let Some(p) = specs.iter_mut().find(|s| s.name == spec.name) {
+        // Preserve the original creation time on an in-place update.
+        spec.created = p.created;
         *p = spec;
     } else {
         specs.push(spec);

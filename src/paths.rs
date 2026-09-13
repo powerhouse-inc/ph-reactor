@@ -98,6 +98,11 @@ impl StatePaths {
         self.root.join("bans.json")
     }
 
+    /// The user-configurable processor specs (the invoice -> payment engine).
+    pub fn processors_file(&self) -> PathBuf {
+        self.root.join("processors.json")
+    }
+
     pub fn daemon_pidfile(&self) -> PathBuf {
         self.run_dir.join("ph-reactor.pid")
     }

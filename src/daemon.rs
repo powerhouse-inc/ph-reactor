@@ -242,12 +242,20 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     ));
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
+    // The user-configurable processor engine (subscriptions on doc changes):
+    // it subscribes in its constructor and runs as a background task.
+    let processor_runner =
+        crate::processor::ProcessorRunner::new(store.clone(), paths.processors_file());
+    let processor_handle = processor_runner.handle();
+    processor_runner.spawn();
+
     // The loopback settings server.
     let settings = Settings::new(
         cmd_tx.clone(),
         snap_rx.clone(),
         store.clone(),
         paths.clone(),
+        processor_handle,
     )
     .start(&config.settings.host, config.settings.port)
     .await

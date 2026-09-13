@@ -13,7 +13,7 @@ use anyhow::{Context, Result};
 use axum::extract::Path;
 use axum::http::StatusCode;
 use axum::response::{Html, IntoResponse, Response};
-use axum::routing::{delete, get, post};
+use axum::routing::{delete, get, post, put};
 use axum::Router;
 use serde::Deserialize;
 use serde_json::{json, Value};
@@ -36,6 +36,8 @@ pub struct Settings {
     store: Arc<Store>,
     /// The state paths (config file, log file) — read by the API handlers.
     paths: StatePaths,
+    /// The user-configurable processor engine (subscriptions + reactions).
+    processor_handle: crate::processor::ProcessorHandle,
 }
 
 pub struct SettingsHandle {
@@ -55,12 +57,14 @@ impl Settings {
         snap_rx: watch::Receiver<StatusSnapshot>,
         store: Arc<Store>,
         paths: StatePaths,
+        processor_handle: crate::processor::ProcessorHandle,
     ) -> Self {
         Self {
             cmd_tx,
             snap_rx,
             store,
             paths,
+            processor_handle,
         }
     }
 
@@ -86,7 +90,16 @@ impl Settings {
             .route("/api/join", post(join_invite))
             .route("/api/ban", post(ban_peer))
             .route("/api/unban", post(unban_peer))
-            .route("/api/processors", get(processors_api))
+            .route("/api/overview", get(overview_api))
+            .route(
+                "/api/processors",
+                get(processor_list_api).post(processor_create_api),
+            )
+            .route(
+                "/api/processors/:name",
+                put(processor_update_api).delete(processor_remove_api),
+            )
+            .route("/api/processors/:name/fires", get(processor_fires_api))
             .route("/api/groups", get(groups_api).post(create_group))
             .route("/api/groups/:name/action", post(group_action))
             .route("/api/groups/:name/activity", get(group_activity))
@@ -525,8 +538,8 @@ async fn config_api(state: axum::extract::State<Arc<Settings>>) -> Response {
     }
 }
 
-/// `GET /api/processors` — the daemon's live background subsystems.
-async fn processors_api(state: axum::extract::State<Arc<Settings>>) -> Response {
+/// `GET /api/overview` — the daemon's live background subsystems.
+async fn overview_api(state: axum::extract::State<Arc<Settings>>) -> Response {
     let snap = state.snap_rx.borrow().clone();
     let cfg = config::load(&state.paths).unwrap_or_default();
     let log_path = state.paths.reactor_log();
@@ -570,6 +583,91 @@ async fn processors_api(state: axum::extract::State<Arc<Settings>>) -> Response 
 }
 
 /// `GET /api/groups` — every `group` document, with its membership.
+/// The request body for creating / editing a processor spec.
+#[derive(Deserialize)]
+struct ProcessorBody {
+    name: String,
+    #[serde(default)]
+    models: Vec<String>,
+    #[serde(default)]
+    action_kind: Option<String>,
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    value: Option<Value>,
+    reaction: crate::processor::Reaction,
+}
+
+fn processor_spec_from(body: &ProcessorBody) -> crate::processor::ProcessorSpec {
+    crate::processor::ProcessorSpec {
+        name: body.name.clone(),
+        models: body.models.clone(),
+        action_kind: body.action_kind.clone(),
+        field: body.field.clone(),
+        value: body.value.clone(),
+        reaction: body.reaction.clone(),
+        created: crate::processor::now_ms(),
+    }
+}
+
+/// `GET /api/processors` — the user-configurable processor specs.
+async fn processor_list_api(state: axum::extract::State<Arc<Settings>>) -> Response {
+    let specs: Vec<Value> = state
+        .processor_handle
+        .specs()
+        .into_iter()
+        .map(|s| serde_json::to_value(&s).unwrap_or_else(|_| json!({})))
+        .collect();
+    axum::Json(Value::Array(specs)).into_response()
+}
+
+/// `POST /api/processors` — create a processor spec.
+async fn processor_create_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<ProcessorBody>,
+) -> Response {
+    if !valid_name(&body.name) {
+        return (StatusCode::BAD_REQUEST, "bad processor name").into_response();
+    }
+    state.processor_handle.set(processor_spec_from(&body));
+    (StatusCode::CREATED, axum::Json(json!({ "ok": true }))).into_response()
+}
+
+/// `PUT /api/processors/:name` — edit a processor spec (the path name wins).
+async fn processor_update_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<ProcessorBody>,
+) -> Response {
+    let mut spec = processor_spec_from(&body);
+    spec.name = name;
+    state.processor_handle.set(spec);
+    (StatusCode::OK, axum::Json(json!({ "ok": true }))).into_response()
+}
+
+/// `DELETE /api/processors/:name` — remove a processor spec.
+async fn processor_remove_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    state.processor_handle.remove(&name);
+    (StatusCode::OK, axum::Json(json!({ "ok": true }))).into_response()
+}
+
+/// `GET /api/processors/:name/fires` — the spec's recent fire history.
+async fn processor_fires_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let fires: Vec<Value> = state
+        .processor_handle
+        .fires(&name)
+        .into_iter()
+        .map(|f| serde_json::to_value(&f).unwrap_or_else(|_| json!({})))
+        .collect();
+    axum::Json(Value::Array(fires)).into_response()
+}
+
 async fn groups_api(state: axum::extract::State<Arc<Settings>>) -> Response {
     let docs = query_docs(&state.store, "group", None);
     let mut groups = Vec::new();
