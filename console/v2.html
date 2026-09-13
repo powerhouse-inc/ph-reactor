@@ -262,7 +262,7 @@ const TITLES = {
   documents: ["Documents", "create, inspect, and organize documents"],
   types: ["Types", "draft, register, and use document model types"],
   folders: ["Folders", "membership containers that group documents"],
-  groups: ["Groups", "signed membership docs with the two-person rule"],
+  groups: ["Groups", "shared spaces — a channel and a drive, signed and synced over the mesh"],
   settings: ["Settings", "drive, identity, and LLM configuration"],
 };
 
@@ -710,73 +710,200 @@ async function renderFolders() {
 /* ============================ GROUPS ============================ */
 async function renderGroups() {
   const groups = await get("/api/groups").catch(() => []);
+  const shortPeer = (p) =>
+    !p ? "?" : p.length > 24 ? p.slice(0, 8) + "…" + p.slice(-6) : p;
   const el = document.createElement("div");
   el.innerHTML = head("groups") + `
-  <div class="grid g-2fr">
-    <div class="card"><h3>Groups</h3><div id="groups-list"></div></div>
-    <div style="display:flex;flex-direction:column;gap:14px">
-      <div class="card"><h3>Create group</h3>
-        <label class="field"><span>name</span><input id="grp-name" placeholder="core-team"></label>
-        <label class="field"><span>members (comma-separated)</span><input id="grp-members" placeholder="alice, bob, carol"></label>
-        <button class="btn primary" id="grp-create">+ Create group</button>
+  <div id="groups-main">
+    <div class="grid g-2fr">
+      <div class="card">
+        <h3>Groups <span class="muted" style="font-size:12px;font-weight:400">a channel to talk + a drive to share, replicated over the mesh</span></h3>
+        <div id="groups-list"></div>
       </div>
-      <div class="card" id="group-detail" style="display:none"></div>
-      <div class="card" id="quorum-note">
-        <h3>Two-person rule</h3>
-        <div class="muted" style="font-size:12.5px">Adding a <b>manager</b> to a group requires a quorum: at least <b>two distinct existing members</b> (other than the proposer) must co-sign the action. A single node cannot add a second manager by itself. This is the multi-sig guarantee.</div>
+      <div style="display:flex;flex-direction:column;gap:14px">
+        <div class="card"><h3>1 · Create a group</h3>
+          <div class="muted" style="font-size:12.5px;margin-bottom:10px">A group is a shared space: a channel and a drive. You become a manager; then share its invite link.</div>
+          <label class="field"><span>name</span><input id="grp-name" placeholder="core-team"></label>
+          <label class="field"><span>initial members (comma-separated peer ids — optional)</span><input id="grp-members" placeholder="peer-a, peer-b"></label>
+          <button class="btn primary" id="grp-create">+ Create group</button>
+        </div>
+        <div class="card"><h3>2 · Join a group</h3>
+          <div class="muted" style="font-size:12.5px;margin-bottom:10px">Paste an invite a member shared. It connects you to their node and adds you to the group.</div>
+          <label class="field"><span>invite link</span><textarea id="grp-join-invite" class="mono" rows="3" placeholder="paste the base64 invite" style="width:100%;box-sizing:border-box;font-size:11px"></textarea></label>
+          <button class="btn primary" id="grp-join">Join →</button>
+        </div>
       </div>
     </div>
-  </div>`;
+  </div>
+  <div id="group-detail" style="display:none"></div>`;
   $("#content").replaceChildren(el);
+
   const load = () => {
     const box = $("#groups-list");
     box.innerHTML = groups.length
-      ? `<table class="table"><thead><tr><th>name</th><th>members</th><th>managers</th></tr></thead><tbody>${groups.map((g) => `<tr class="rowclick" data-grp="${esc(g.name)}"><td class="doc-name">${esc(g.name)}</td><td>${g.memberCount}</td><td>${g.managerCount}</td></tr>`).join("")}</tbody></table>`
-      : `<div class="empty"><div class="big">⬡</div>No groups. Create one on the right.</div>`;
-    $$("#groups-list tr.rowclick").forEach((tr) => tr.onclick = () => showGroup(tr.dataset.grp));
+      ? `<table class="table"><thead><tr><th>name</th><th>members</th><th>managers</th><th>msgs</th><th>files</th></tr></thead><tbody>${groups.map((g) => `<tr class="rowclick" data-grp="${esc(g.name)}"><td class="doc-name">${esc(g.name)}</td><td>${g.memberCount}</td><td>${g.managerCount}</td><td>${g.msgCount}</td><td>${g.driveCount}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty"><div class="big">⬡</div>No groups yet. Create one, then share its invite link.</div>`;
+    $$("#groups-list tr.rowclick").forEach((tr) => (tr.onclick = () => showGroup(tr.dataset.grp)));
   };
   load();
+
   $("#grp-create").onclick = async () => {
     const name = $("#grp-name").value.trim();
-    if (!name) return toast("name required", true);
+    if (!name) return toast("a name is required", true);
     const members = $("#grp-members").value.split(",").map((s) => s.trim()).filter(Boolean);
     try {
       await post("/api/groups", { name, members, managers: [] });
-      toast("created group " + name + " (you are a manager)");
-      const fresh = await get("/api/groups"); groups.length = 0; fresh.forEach((g) => groups.push(g));
+      toast("created group " + name + " — you are a manager");
+      const fresh = await get("/api/groups");
+      groups.length = 0;
+      fresh.forEach((g) => groups.push(g));
+      load();
+      showGroup(name);
+    } catch (e) { toast(e.message, true); }
+  };
+
+  $("#grp-join").onclick = async () => {
+    const invite = $("#grp-join-invite").value.trim();
+    if (!invite) return toast("paste an invite link first", true);
+    try {
+      await post("/api/join", { invite });
+      toast("joined — syncing with the inviter; you're being added to the group(s) in the invite");
+      const fresh = await get("/api/groups");
+      groups.length = 0;
+      fresh.forEach((g) => groups.push(g));
       load();
     } catch (e) { toast(e.message, true); }
   };
+
   async function showGroup(name) {
-    const g = groups.find((x) => x.name === name);
-    const card = $("#group-detail"); card.style.display = "";
-    card.innerHTML = `<h3>${esc(name)}</h3>
-      <div class="kv"><span class="k">members</span><span class="v">${esc((g?.members || []).join(", ") || "—")}</span></div>
-      <div class="kv"><span class="k">managers</span><span class="v">${esc((g?.managers || []).join(", ") || "—")}</span></div>
-      <div class="divider"></div>
-      <div class="field"><span>add member</span><div class="field-row"><input id="grp-add" placeholder="name"><button class="btn sm" id="grp-add-go">add</button></div></div>
-      <div class="divider"></div>
-      <h3>Signed activity</h3><div class="term" id="grp-activity" style="height:280px"></div>`;
+    const g = await get(`/api/groups/${encodeURIComponent(name)}`).catch(() => null);
+    if (!g) return;
+    const drive = await get(`/api/groups/${encodeURIComponent(name)}/drive`).catch(() => []);
+    $("#groups-main").style.display = "none";
+    const card = $("#group-detail");
+    card.style.display = "";
+
+    const msgs = g.msgText || [];
+    const msgHtml = msgs.length
+      ? msgs.map((t, i) => {
+          const from = (g.msgFrom || [])[i] || "?";
+          const ts = (g.msgTs || [])[i];
+          const ch = (g.msgChannel || [])[i];
+          const chTag = ch && ch !== "general" ? `<span class="badge b-violet" style="margin-left:6px">#${esc(ch)}</span>` : "";
+          return `<div class="msg" style="margin-bottom:10px">
+            <div style="margin-bottom:3px"><span class="badge b-cyan mono">${esc(shortPeer(from))}</span><span class="dim mono" style="font-size:11px;margin-left:8px">${esc(fmtTs(ts))}</span>${chTag}</div>
+            <div style="font-size:13.5px;white-space:pre-wrap">${esc(t)}</div></div>`;
+        }).join("")
+      : `<div class="muted" style="font-size:12.5px">No messages yet — say something below.</div>`;
+
+    const driveHtml = drive.length
+      ? drive.map((d) =>
+          d.missing
+            ? `<div style="border:1px solid var(--line-2);border-radius:10px;padding:10px"><span class="doc-name">${esc(d.name)}</span> <span class="badge b-red">missing</span></div>`
+            : `<div style="border:1px solid var(--line-2);border-radius:10px;padding:10px">
+                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><span class="doc-name">${esc((d.fields && d.fields.title) || d.name)}</span><span class="dim mono" style="font-size:11px">${esc(d.name)}</span></div>
+                <div class="muted" style="font-size:12.5px;margin-top:6px;white-space:pre-wrap">${esc((d.fields && d.fields.body) || "")}</div></div>`
+        ).join("")
+      : `<div class="muted" style="font-size:12.5px">No files yet — add one below.</div>`;
+
+    const members = g.members || [];
+    const managers = g.managers || [];
+
+    card.innerHTML = `
+      <button class="btn ghost sm" id="grp-back" style="margin-bottom:12px">← all groups</button>
+      <div class="card" style="border-color:var(--line-2)">
+        <h3>${esc(name)}</h3>
+        <div class="muted" style="font-size:12.5px;margin-bottom:4px">${members.length} member(s) · ${managers.length} manager(s)</div>
+
+        <div style="background:linear-gradient(90deg,rgba(56,225,255,0.07),rgba(167,139,250,0.05));border:1px solid var(--line-2);border-radius:12px;padding:14px;margin-top:12px">
+          <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px"><h4 style="margin:0">⬡ Invite people</h4><span class="muted" style="font-size:12px">the one link that adds someone to this group</span></div>
+          <div id="grp-invite-out" style="display:none;margin-top:8px">
+            <textarea id="grp-invite-token" class="mono" readonly rows="3" style="width:100%;box-sizing:border-box;font-size:11px"></textarea>
+            <div style="display:flex;gap:8px;margin-top:8px"><button class="btn primary sm" id="grp-invite-copy">copy link</button></div>
+            <div class="muted" style="font-size:12px;margin-top:8px">Send this to a member. They paste it into <b>Groups → 2 · Join</b> (or run <span class="mono">ph-reactor join &lt;link&gt;</span>). They connect to your node and are added to this group — then they can use the channel and drive.</div>
+          </div>
+          <button class="btn primary" id="grp-invite" style="margin-top:10px">⬡ Generate invite link</button>
+        </div>
+
+        <div class="divider"></div>
+        <h4>Channel <span class="muted" style="font-weight:400;font-size:12px">shared conversation — signed + replicated</span></h4>
+        <div style="max-height:260px;overflow-y:auto;border:1px solid var(--line-2);border-radius:10px;padding:12px;margin:10px 0">${msgHtml}</div>
+        <div class="field-row" style="gap:8px">
+          <input id="grp-msg" placeholder="post to the channel…" style="flex:1">
+          <button class="btn primary sm" id="grp-msg-send">post</button>
+        </div>
+
+        <div class="divider"></div>
+        <h4>Drive <span class="muted" style="font-weight:400;font-size:12px">shared files</span></h4>
+        <div style="display:flex;flex-direction:column;gap:8px;margin:10px 0">${driveHtml}</div>
+        <details>
+          <summary class="muted" style="font-size:12.5px;cursor:pointer">add a file to the drive</summary>
+          <label class="field" style="margin-top:8px"><span>title</span><input id="grp-file-title" placeholder="Q3 plan"></label>
+          <label class="field"><span>body</span><textarea id="grp-file-body" class="mono" rows="3" style="width:100%;box-sizing:border-box"></textarea></label>
+          <button class="btn sm" id="grp-file-add">+ add file</button>
+        </details>
+
+        <div class="divider"></div>
+        <h4>Members</h4>
+        <div class="pill-row">${members.map((m) => `<span class="badge b-cyan mono">${esc(shortPeer(m))}</span>`).join("") || '<span class="muted">none</span>'}</div>
+        <h4>Managers</h4>
+        <div class="pill-row">${managers.map((m) => `<span class="badge b-violet mono">${esc(shortPeer(m))}</span>`).join("") || '<span class="muted">none</span>'}</div>
+        <div class="field" style="margin-top:10px"><div class="field-row"><input id="grp-add" placeholder="add a member (peer id)"><button class="btn sm" id="grp-add-go">add</button></div></div>
+        <div class="muted" style="font-size:11.5px;margin-top:8px">Adding a <b>second manager</b> needs a 2-member quorum — the two-person rule.</div>
+      </div>`;
+
+    $("#grp-back").onclick = () => {
+      card.style.display = "none";
+      $("#groups-main").style.display = "";
+    };
+    $("#grp-invite").onclick = async () => {
+      try {
+        const r = await post("/api/invite", { groups: [name] });
+        $("#grp-invite").style.display = "none";
+        $("#grp-invite-out").style.display = "";
+        $("#grp-invite-token").value = r.invite;
+        toast("invite link ready — copy it and share");
+      } catch (e) { toast(e.message, true); }
+    };
+    $("#grp-invite-copy").onclick = async () => {
+      const tok = $("#grp-invite-token").value;
+      try {
+        await navigator.clipboard.writeText(tok);
+        toast("invite copied to clipboard");
+      } catch {
+        $("#grp-invite-token").select();
+        document.execCommand("copy");
+        toast("invite selected");
+      }
+    };
+    const sendMsg = async () => {
+      const text = $("#grp-msg").value.trim();
+      if (!text) return;
+      try {
+        await post(`/api/groups/${encodeURIComponent(name)}/action`, { kind: "post", payload: { text, channel: "general" } });
+        showGroup(name);
+      } catch (e) { toast(e.message, true); }
+    };
+    $("#grp-msg-send").onclick = sendMsg;
+    $("#grp-msg").addEventListener("keydown", (e) => { if (e.key === "Enter") sendMsg(); });
+    $("#grp-file-add").onclick = async () => {
+      const title = $("#grp-file-title").value.trim();
+      const body = $("#grp-file-body").value;
+      try {
+        await post(`/api/groups/${encodeURIComponent(name)}/drive`, { title, body });
+        toast("added file to the drive");
+        showGroup(name);
+      } catch (e) { toast(e.message, true); }
+    };
     $("#grp-add-go").onclick = async () => {
       const m = $("#grp-add").value.trim();
       if (!m) return;
       try {
         await post(`/api/groups/${encodeURIComponent(name)}/action`, { kind: "add-member", payload: { member: m } });
         toast("added " + m);
-        const fresh = await get("/api/groups"); groups.length = 0; fresh.forEach((x) => groups.push(x));
         showGroup(name);
       } catch (e) { toast(e.message, true); }
     };
-    try {
-      const acts = await get(`/api/groups/${encodeURIComponent(name)}/activity`);
-      const term = $("#grp-activity");
-      term.innerHTML = acts.length
-        ? acts.map((a) => {
-            const cs = a.cosigners && a.cosigners.length ? `  <span class="t-notify">+${esc(a.cosigners.join(", "))} cosigned</span>` : "";
-            return `<div class="line"><span class="t-time">${esc(a.ts ?? "")}</span> <span class="t-fire">⬡</span> <span class="t-log">${esc(a.kind)}</span> <span class="dim">by ${esc(a.actor)}${cs}</span></div>`;
-          }).join("")
-        : `<div class="empty">no activity</div>`;
-    } catch {}
   }
 }
 
