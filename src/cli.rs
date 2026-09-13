@@ -46,6 +46,19 @@ pub enum Command {
     /// Manage the local documents of this vault.
     #[command(subcommand)]
     Doc(DocCommand),
+    /// Generate a one-shot invite string for a peer to join this vault
+    /// (`join` it on their machine). Requires a running daemon.
+    Invite {
+        /// Groups the joiner is granted (repeatable; default: the local group).
+        #[arg(long = "group")]
+        groups: Vec<String>,
+    },
+    /// Consume an invite string: pin the inviter (TOFU) and add a drive that
+    /// syncs with it. Requires a running daemon.
+    Join {
+        /// The invite string (from the inviter's `ph-reactor invite`).
+        invite: String,
+    },
     /// Diagnose the local setup (state dir, identity, store, listener,
     /// settings server).
     Doctor,

@@ -48,6 +48,19 @@ pub enum Command {
         payload: Value,
         reply: tokio::sync::oneshot::Sender<std::result::Result<crate::action::Action, String>>,
     },
+    /// Generate a signed invite (the daemon's identity + a challenge) for a
+    /// peer to join this vault. Synchronous: the sender awaits the encoded
+    /// token on `reply`.
+    Invite {
+        groups: Vec<String>,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
+    /// Consume an invite: verify it, pin the inviter (TOFU), and add a drive
+    /// for it (attaching a signed join-proof). Synchronous, like `Invite`.
+    Join {
+        invite: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Update a dotted config key (validated by `config::set`).
     SetConfig { key: String, value: Value },
     /// Stop the daemon.

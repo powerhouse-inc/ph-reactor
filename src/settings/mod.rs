@@ -63,6 +63,8 @@ impl Settings {
             .route("/api/quit", post(quit))
             .route("/api/docs", post(add_doc))
             .route("/api/docs/action", post(action_doc))
+            .route("/api/invite", post(make_invite))
+            .route("/api/join", post(join_invite))
             .with_state(Arc::new(self));
         let task = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
@@ -312,6 +314,74 @@ async fn action_doc(
         }
         Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
         _ => (StatusCode::SERVICE_UNAVAILABLE, "model action timed out").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct InviteBody {
+    #[serde(default)]
+    groups: Vec<String>,
+}
+
+/// Generate a signed invite (the daemon's identity + a challenge).
+async fn make_invite(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<InviteBody>,
+) -> Response {
+    let (reply, wait) = oneshot::channel();
+    let cmd = Command::Invite {
+        groups: body.groups,
+        reply,
+    };
+    if state.cmd_tx.send(cmd).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(Ok(Ok(token))) => (
+            StatusCode::OK,
+            axum::Json(serde_json::json!({ "invite": token })),
+        )
+            .into_response(),
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "invite generation timed out").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct JoinBody {
+    invite: String,
+}
+
+/// Consume an invite: verify it, pin the inviter (TOFU), add a drive with a
+/// signed join-proof.
+async fn join_invite(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<JoinBody>,
+) -> Response {
+    let (reply, wait) = oneshot::channel();
+    let cmd = Command::Join {
+        invite: body.invite,
+        reply,
+    };
+    if state.cmd_tx.send(cmd).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(15), wait).await {
+        Ok(Ok(Ok(()))) => (
+            StatusCode::ACCEPTED,
+            axum::Json(serde_json::json!({ "ok": true })),
+        )
+            .into_response(),
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "join timed out").into_response(),
     }
 }
 // ---------------------------------------------------------------------------

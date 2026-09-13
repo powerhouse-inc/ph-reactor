@@ -239,6 +239,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         paths: paths.clone(),
         config,
         peer_id,
+        listen: None,
         store,
         eng_cmd_tx,
         last_save_mtime: std::fs::metadata(&paths.config_file)
@@ -348,6 +349,8 @@ struct Ctx {
     paths: StatePaths,
     config: ReactorConfig,
     peer_id: PeerId,
+    /// The engine's resolved listen address (set by its Identity event).
+    listen: Option<Multiaddr>,
     store: Arc<Store>,
     /// The engine's command channel.
     eng_cmd_tx: mpsc::UnboundedSender<EngineCommand>,
@@ -375,6 +378,7 @@ fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
     match ev {
         EngineEvent::Identity { peer_id, listen } => {
             ctx.reactor_healthy = true;
+            ctx.listen = Some(listen.clone());
             ctx.last_event = Some(format!("p2p listening on {listen}"));
             tracing::info!("engine: listening ({peer_id})");
         }
@@ -573,6 +577,118 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
                 let _ = reply.send(Err(e));
             }
         },
+        Command::Invite { groups, reply } => {
+            let listen = match ctx.listen.clone() {
+                Some(l) => l,
+                None => {
+                    let _ = reply.send(Err(
+                        "the reactor has not announced its listen address yet; retry".to_string(),
+                    ));
+                    return Ok(false);
+                }
+            };
+            let groups = if groups.is_empty() {
+                vec![ctx.config.instance.name.clone()]
+            } else {
+                groups
+            };
+            let signing = ctx.store.key();
+            match crate::p2p::invite::InviteToken::make(
+                &ctx.config.instance.name,
+                &ctx.peer_id.to_base58(),
+                &signing,
+                &listen.to_string(),
+                groups,
+            ) {
+                Ok(token) => match token.encode() {
+                    Ok(s) => {
+                        ctx.last_event = Some("generated an invite".into());
+                        let _ = reply.send(Ok(s));
+                    }
+                    Err(e) => {
+                        let _ = reply.send(Err(e));
+                    }
+                },
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
+        Command::Join { invite, reply } => {
+            let token = match crate::p2p::invite::InviteToken::decode(&invite) {
+                Ok(t) => t,
+                Err(e) => {
+                    let _ = reply.send(Err(e));
+                    return Ok(false);
+                }
+            };
+            let mut key_arr = [0u8; 32];
+            key_arr.copy_from_slice(&token.pubkey);
+            if let Err(e) = ctx.store.register_peer_key(&token.peer_id, key_arr) {
+                let _ = reply.send(Err(e));
+                return Ok(false);
+            }
+            let signing = ctx.store.key();
+            let accept = crate::p2p::invite::InviteAccept::make(
+                &token.nonce,
+                &ctx.config.instance.name,
+                &ctx.peer_id.to_base58(),
+                &signing,
+            );
+            let peer = match PeerId::from_str(&token.peer_id) {
+                Ok(p) => p,
+                Err(e) => {
+                    let _ = reply.send(Err(format!("bad inviter peer id: {e}")));
+                    return Ok(false);
+                }
+            };
+            let addr = match Multiaddr::from_str(&token.addr) {
+                Ok(a) => a.with(libp2p::multiaddr::Protocol::P2p(peer)),
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                    return Ok(false);
+                }
+            };
+            let name = token.name;
+            if ctx
+                .config
+                .drives
+                .iter()
+                .any(|d| d.name.eq_ignore_ascii_case(&name))
+            {
+                let _ = reply.send(Err(format!("a drive named '{name}' is already configured")));
+                return Ok(false);
+            }
+            ctx.config.drives.push(DriveConfig {
+                name: name.clone(),
+                addr: addr.to_string(),
+                token_env: None,
+                paused: false,
+                available_offline: true,
+            });
+            ctx.engine_drives.push(name.clone());
+            if let Err(e) = persist_config(ctx) {
+                let _ = reply.send(Err(e.to_string()));
+                return Ok(false);
+            }
+            let drive = Drive {
+                name,
+                addr,
+                token_env: None,
+                paused: false,
+                available_offline: true,
+            };
+            match ctx.eng_cmd_tx.send(EngineCommand::Join { drive, accept }) {
+                Ok(()) => {
+                    ctx.last_event = Some("joined a vault via invite".into());
+                    tracing::info!("joined a vault via invite");
+                    let _ = reply.send(Ok(()));
+                }
+                Err(e) => {
+                    let _ = reply.send(Err(e.to_string()));
+                }
+            }
+        }
         Command::Quit => {
             tracing::info!("quit requested");
             ctx.stopping = true;
@@ -1243,6 +1359,67 @@ pub async fn doc_command(state_dir: Option<&Path>, cmd: crate::cli::DocCommand) 
             }
         }
     }
+}
+
+/// The `invite` CLI: asks the running daemon to generate a signed invite
+/// (its live identity + a challenge) for a peer to join this vault, and
+/// prints the string.
+pub async fn invite_command(state_dir: Option<&Path>, groups: Vec<String>) -> Result<()> {
+    let paths = StatePaths::resolve(state_dir);
+    paths.ensure_dirs()?;
+    if !daemon_is_running(&paths.daemon_pidfile()) {
+        bail!("the daemon is not running — start it (ph-reactor) and retry: invites are generated by the daemon from its live identity");
+    }
+    let config = config::load(&paths)?;
+    let url = format!(
+        "http://{}:{}/api/invite",
+        config.settings.host, config.settings.port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let body = serde_json::json!({ "groups": groups });
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    if !status.is_success() {
+        let text = r.text().await.unwrap_or_default();
+        bail!("invite failed: {status} {text}");
+    }
+    let v: serde_json::Value = r.json().await?;
+    let invite = v
+        .get("invite")
+        .and_then(|s| s.as_str())
+        .unwrap_or_default()
+        .to_string();
+    println!("{invite}");
+    Ok(())
+}
+
+/// The `join` CLI: consumes an invite string through the running daemon —
+/// it pins the inviter (TOFU) and adds a drive with a signed join-proof.
+pub async fn join_command(state_dir: Option<&Path>, invite: String) -> Result<()> {
+    let paths = StatePaths::resolve(state_dir);
+    paths.ensure_dirs()?;
+    if !daemon_is_running(&paths.daemon_pidfile()) {
+        bail!("the daemon is not running — start it (ph-reactor) and retry: joins add a drive through the daemon so the engine dials the inviter");
+    }
+    let config = config::load(&paths)?;
+    let url = format!(
+        "http://{}:{}/api/join",
+        config.settings.host, config.settings.port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(15))
+        .build()?;
+    let body = serde_json::json!({ "invite": invite });
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    if !status.is_success() {
+        let text = r.text().await.unwrap_or_default();
+        bail!("join failed: {status} {text}");
+    }
+    println!("joined: the inviter is pinned and a drive was added (it syncs once the connection is up)");
+    Ok(())
 }
 
 /// Opens the local store from disk for read-only CLI use. The daemon
