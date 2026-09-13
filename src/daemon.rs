@@ -179,9 +179,17 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     check_listen_port(&listen)?;
     check_settings_port(&config.settings.host, config.settings.port)?;
 
-    // The doc store (snapshots + live logs under <state>/docs).
-    let store =
-        Store::open(&paths.docs_dir, &signing, &peer_id.to_base58()).map_err(anyhow::Error::msg)?;
+    // The doc store (snapshots + live logs under <state>/docs), seeded with
+    // the realistic models so the console can create docs under them. The
+    // built-in `open@1` + `group@1` come from `Store::open`.
+    let store = {
+        let store =
+            Store::open(&paths.docs_dir, &signing, &peer_id.to_base58()).map_err(anyhow::Error::msg)?;
+        for m in crate::model::realistic::realistic_models() {
+            store.add_model(Arc::new(m));
+        }
+        store
+    };
     tracing::info!(
         "store ready ({} live docs, peer {})",
         store.live_doc_count(),
@@ -1633,7 +1641,11 @@ fn open_local_store(paths: &StatePaths) -> Result<Arc<Store>> {
         })?;
     let signing = p2p::signing_key(&kp).map_err(anyhow::Error::msg)?;
     let origin = p2p::peer_id_of(&kp).to_base58();
-    Store::open(&paths.docs_dir, &signing, &origin).map_err(anyhow::Error::msg)
+    let store = Store::open(&paths.docs_dir, &signing, &origin).map_err(anyhow::Error::msg)?;
+    for m in crate::model::realistic::realistic_models() {
+        store.add_model(Arc::new(m));
+    }
+    Ok(store)
 }
 
 /// Applies the operation to the config file (no daemon running; the

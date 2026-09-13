@@ -24,6 +24,51 @@ use serde_json::json;
 
 use crate::model::l1::L1;
 
+/// The JSON definition of the `folder@1` model: a container that groups
+/// documents by membership. Moving a doc into a folder appends its name to
+/// the folder's `members`; the Documents view can show which folder a doc
+/// lives in by scanning members.
+pub fn folder_def() -> serde_json::Value {
+    json!({
+        "name": "folder",
+        "version": "1",
+        "fields": {
+            "description": "string",
+            "members": "string[]"
+        },
+        "reducers": {
+            "init": {
+                "payload": {
+                    "name": "string",
+                    "description": "string",
+                    "members": "string[]"
+                },
+                "writes": {
+                    "__name__": { "set": "$payload.name" },
+                    "description": { "set": "$payload.description" },
+                    "members": { "set": "$payload.members" }
+                },
+                "pre": []
+            },
+            "add-member": {
+                "payload": { "member": "string" },
+                "writes": { "members": { "append": "$payload.member" } },
+                "pre": []
+            },
+            "remove-member": {
+                "payload": { "member": "string" },
+                "writes": { "members": { "remove": "$payload.member" } },
+                "pre": []
+            },
+            "set-description": {
+                "payload": { "description": "string" },
+                "writes": { "description": { "set": "$payload.description" } },
+                "pre": []
+            }
+        }
+    })
+}
+
 /// The JSON definition of the `project@1` model.
 pub fn project_def() -> serde_json::Value {
     json!({
@@ -254,6 +299,7 @@ pub fn realistic_models() -> Vec<L1> {
         L1::from_def(account_def()).expect("the account definition is well-formed"),
         L1::from_def(transaction_def()).expect("the transaction definition is well-formed"),
         L1::from_def(invoice_def()).expect("the invoice definition is well-formed"),
+        L1::from_def(folder_def()).expect("the folder definition is well-formed"),
     ]
 }
 

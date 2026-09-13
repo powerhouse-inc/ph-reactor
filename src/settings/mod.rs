@@ -103,6 +103,8 @@ impl Settings {
             .route("/api/groups", get(groups_api).post(create_group))
             .route("/api/groups/:name/action", post(group_action))
             .route("/api/groups/:name/activity", get(group_activity))
+            .route("/api/folders", get(folders_api).post(create_folder))
+            .route("/api/folders/:name/action", post(folder_action))
             .route("/api/docs/:name", get(doc_detail))
             .route("/api/llm/test", post(llm_test))
             .route("/api/models", get(models_api).post(register_model))
@@ -847,6 +849,60 @@ async fn group_activity(
         })
         .collect();
     axum::Json(out).into_response()
+}
+
+
+/// `GET /api/folders` — the registered folder documents.
+async fn folders_api(state: axum::extract::State<Arc<Settings>>) -> Response {
+    let docs = query_docs(&state.store, "folder", None);
+    let mut out = Vec::new();
+    for d in docs {
+        let f = d.get("fields").cloned().unwrap_or_else(|| json!({}));
+        let members = f
+            .get("members")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        out.push(json!({
+            "name": d.get("name").cloned().unwrap_or_default(),
+            "description": f.get("description").cloned().unwrap_or(Value::String(String::new())),
+            "members": members,
+            "memberCount": members.len(),
+        }));
+    }
+    axum::Json(out).into_response()
+}
+
+#[derive(Deserialize)]
+struct FolderBody {
+    name: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    members: Vec<String>,
+}
+
+/// `POST /api/folders` — create a `folder@1` document.
+async fn create_folder(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<FolderBody>,
+) -> Response {
+    let payload = json!({
+        "name": body.name,
+        "description": body.description,
+        "members": body.members,
+    });
+    run_create_doc_model(&state, &body.name, "folder@1", payload).await
+}
+
+/// `POST /api/folders/:name/action` — a folder action (add-member,
+/// remove-member, set-description).
+async fn folder_action(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<GroupActionBody>,
+) -> Response {
+    run_create_action(&state, &name, "folder@1", &body.kind, body.payload).await
 }
 
 #[derive(Deserialize)]
