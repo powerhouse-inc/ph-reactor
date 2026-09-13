@@ -12,7 +12,11 @@ in `docs/superpowers/specs/` and the plan in `docs/superpowers/plans/`).
 | 5 | Folders and group documents (quorum) | done |
 | 6 | The console v2 UI (flashy redesign) | done |
 | 7 | Verify: build, clippy, tests, live smoke | done |
-| 8 | Merge to main | pending |
+| 8 | Merge to main | done |
+
+All eight tasks are complete. `main` was fast-forwarded to the feature branch
+(eight commits ahead of `origin/main` at the time; a clean fast-forward) and
+pushed to `origin/main` (`07d2000..e7a5793`).
 
 ## Task notes
 
@@ -76,8 +80,8 @@ in `docs/superpowers/specs/` and the plan in `docs/superpowers/plans/`).
 - Tabs: Overview (peers + live fire feed + the one-click reference processor),
   Documents (create under any type, filter by model/field, inspect + update a
   field), Types (LLM-draft / manual / register / use), Folders, Groups (with the
-  two-person rule and signed activity), Settings (drive, identity, LLM with a
-  live test button).
+  two-person rule and signed activity), and Settings (drive, identity, LLM with
+  a live test button).
 - Doc creation goes through `POST /api/docs` (extended to create under a
   specific model's `init` reducer when `model` is supplied; bare names resolve
   to the registered version). `POST /api/docs/action` also resolves bare model
@@ -93,4 +97,6 @@ in `docs/superpowers/specs/` and the plan in `docs/superpowers/plans/`).
   create a doc; a single signer cannot add a group manager (the two-person
   rule). Full detail in `evidence/e2e.md`.
 
-### Task 8 - Merge to main (pending)
+### Task 8 - Merge to main (done)
+- `main` is a clean fast-forward to the feature branch (it was an ancestor);
+  pushed to `origin/main` (`07d2000..e7a5793`).
