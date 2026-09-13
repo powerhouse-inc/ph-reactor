@@ -27,9 +27,9 @@ use std::time::Duration;
 use futures_util::StreamExt;
 use libp2p::gossipsub;
 use libp2p::identify;
+use libp2p::identity::Keypair;
 use libp2p::kad;
 use libp2p::relay;
-use libp2p::identity::Keypair;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::behaviour::toggle::Toggle;
 use libp2p::swarm::{dial_opts::DialOpts, NetworkBehaviour, Swarm, SwarmEvent};
@@ -154,7 +154,10 @@ pub enum EngineCommand {
     FindProviders { key: Vec<u8> },
     /// Join a drive by a signed invite: add the drive and attach the
     /// join-proof to the first hello so the inviter can add a drive back.
-    Join { drive: Drive, accept: invite::InviteAccept },
+    Join {
+        drive: Drive,
+        accept: invite::InviteAccept,
+    },
     /// Shut the engine down (drain and return).
     Shutdown,
 }
@@ -244,7 +247,6 @@ struct SyncBehaviour {
     relay_client: relay::client::Behaviour,
 }
 
-
 impl SyncEngine {
     /// Builds the engine. `listen` is the configured listen multiaddr.
     /// `token` is the local shared secret (already env-resolved).
@@ -315,9 +317,10 @@ impl SyncEngine {
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .map_err(|e| anyhow::anyhow!("relay client: {e}"))?
             .with_behaviour(move |_kp, relay_client| {
-                let relay_server = Toggle::from(relay_enabled.then(|| {
-                    relay::Behaviour::new(peer_id_of(_kp), relay::Config::default())
-                }));
+                let relay_server = Toggle::from(
+                    relay_enabled
+                        .then(|| relay::Behaviour::new(peer_id_of(_kp), relay::Config::default())),
+                );
                 SyncBehaviour {
                     gossipsub,
                     sync,
@@ -554,7 +557,11 @@ impl SyncEngine {
         }
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&accept.pubkey);
-        if self.store.register_peer_key(&accept.peer_id, key_arr).is_err() {
+        if self
+            .store
+            .register_peer_key(&accept.peer_id, key_arr)
+            .is_err()
+        {
             tracing::warn!(%peer, "invite proof key mismatch (TOFU); not adding a drive");
             return;
         }
@@ -686,7 +693,9 @@ impl SyncEngine {
                 }
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
-                let _ = self.evt_tx.send(EngineEvent::PeerConnected { peer: peer_id });
+                let _ = self
+                    .evt_tx
+                    .send(EngineEvent::PeerConnected { peer: peer_id });
                 let Some(name) = self.drive_name_by_peer(peer_id) else {
                     return;
                 };
@@ -735,9 +744,7 @@ impl SyncEngine {
                 // Identify -> DHT: feed the routing table with the
                 // addresses each peer advertises so it can be reached.
                 SyncBehaviourEvent::Identify(identify::Event::Received {
-                    peer_id,
-                    info,
-                    ..
+                    peer_id, info, ..
                 }) => {
                     if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
                         for addr in &info.listen_addrs {
@@ -755,10 +762,9 @@ impl SyncEngine {
                             tracing::debug!("dht bootstrap failed: {e:?}");
                             let _ = self.evt_tx.send(EngineEvent::DhtBootstrap(false));
                         }
-                        kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
-                            key,
-                            providers,
-                        })) => {
+                        kad::QueryResult::GetProviders(Ok(
+                            kad::GetProvidersOk::FoundProviders { key, providers },
+                        )) => {
                             for peer in providers {
                                 if peer != self.peer_id {
                                     let _ = self.evt_tx.send(EngineEvent::DhtProvider {
@@ -911,7 +917,11 @@ impl SyncEngine {
                         // exists yet (a drive added later completes the
                         // handshake from this record).
                         self.guests.insert(peer);
-                        if self.store.register_peer_key(&peer.to_base58(), arr).is_err() {
+                        if self
+                            .store
+                            .register_peer_key(&peer.to_base58(), arr)
+                            .is_err()
+                        {
                             tracing::warn!(%peer, "TOFU key mismatch: refusing the handshake");
                             let _ = self
                                 .swarm
@@ -1012,7 +1022,8 @@ impl SyncEngine {
                                     DriveStatus::Error,
                                     Some(
                                         "TOFU key mismatch: the peer presented a different key \
-                                         than was pinned on first contact".to_string(),
+                                         than was pinned on first contact"
+                                            .to_string(),
                                     ),
                                 );
                                 tracing::warn!(

@@ -178,7 +178,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         .token_env
         .as_deref()
         .and_then(|n| std::env::var(n).ok())
-    .filter(|s| !s.is_empty());
+        .filter(|s| !s.is_empty());
     let bootstraps: Vec<(PeerId, Multiaddr)> = config
         .p2p
         .bootstraps
@@ -203,8 +203,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     });
     // Seed the DHT with the configured bootstrap peers once the engine is up.
     if !bootstraps.is_empty() {
-        let _ = eng_cmd_tx
-            .send(EngineCommand::DhtBootstrap { peers: bootstraps });
+        let _ = eng_cmd_tx.send(EngineCommand::DhtBootstrap { peers: bootstraps });
     }
 
     // Channels: status fan-out and the single-writer command channel
@@ -582,9 +581,9 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
             kind,
             payload,
             reply,
-        } => match crate::doc::ModelRef::parse(&model).and_then(|mr| {
-            ctx.store.apply_local_action(&name, &mr, &kind, &payload)
-        }) {
+        } => match crate::doc::ModelRef::parse(&model)
+            .and_then(|mr| ctx.store.apply_local_action(&name, &mr, &kind, &payload))
+        {
             Ok(action) => {
                 tracing::info!("applied {kind} action to '{name}'");
                 ctx.last_event = Some(format!("applied {kind} to '{name}'"));
@@ -1436,7 +1435,9 @@ pub async fn join_command(state_dir: Option<&Path>, invite: String) -> Result<()
         let text = r.text().await.unwrap_or_default();
         bail!("join failed: {status} {text}");
     }
-    println!("joined: the inviter is pinned and a drive was added (it syncs once the connection is up)");
+    println!(
+        "joined: the inviter is pinned and a drive was added (it syncs once the connection is up)"
+    );
     Ok(())
 }
 

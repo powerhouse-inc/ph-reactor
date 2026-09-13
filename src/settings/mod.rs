@@ -308,8 +308,8 @@ async fn action_doc(
     }
     match tokio::time::timeout(Duration::from_secs(10), wait).await {
         Ok(Ok(Ok(action))) => {
-            let json = serde_json::to_value(&action)
-                .unwrap_or_else(|_| serde_json::json!({ "ok": true }));
+            let json =
+                serde_json::to_value(&action).unwrap_or_else(|_| serde_json::json!({ "ok": true }));
             (StatusCode::OK, axum::Json(json)).into_response()
         }
         Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
@@ -347,7 +347,11 @@ async fn make_invite(
         )
             .into_response(),
         Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
-        _ => (StatusCode::SERVICE_UNAVAILABLE, "invite generation timed out").into_response(),
+        _ => (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "invite generation timed out",
+        )
+            .into_response(),
     }
 }
 

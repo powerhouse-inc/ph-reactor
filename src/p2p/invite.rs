@@ -109,8 +109,7 @@ impl InviteToken {
     /// Verify the signature against this token's own `pubkey`.
     pub fn verify(&self) -> Result<(), String> {
         let pk = verifying_key(&self.pubkey)?;
-        let sig =
-            Signature::from_slice(&self.sig).map_err(|e| format!("bad invite sig: {e}"))?;
+        let sig = Signature::from_slice(&self.sig).map_err(|e| format!("bad invite sig: {e}"))?;
         pk.verify_strict(&self.message_bytes(), &sig)
             .map_err(|e| format!("invite signature invalid: {e}"))
     }
@@ -182,8 +181,7 @@ impl InviteAccept {
     /// Verify the signature against this accept's own `pubkey`.
     pub fn verify(&self) -> Result<(), String> {
         let pk = verifying_key(&self.pubkey)?;
-        let sig =
-            Signature::from_slice(&self.sig).map_err(|e| format!("bad accept sig: {e}"))?;
+        let sig = Signature::from_slice(&self.sig).map_err(|e| format!("bad accept sig: {e}"))?;
         pk.verify_strict(&self.message_bytes(), &sig)
             .map_err(|e| format!("accept signature invalid: {e}"))
     }

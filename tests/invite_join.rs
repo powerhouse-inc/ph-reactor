@@ -23,8 +23,8 @@ use libp2p::multiaddr::Protocol;
 use libp2p::{Multiaddr, PeerId};
 use tokio::sync::mpsc;
 
-use ph_reactor::drives::DriveStatus;
 use ph_reactor::drives::Drive;
+use ph_reactor::drives::DriveStatus;
 use ph_reactor::p2p::{self, invite, EngineCommand, EngineEvent, SyncEngine};
 use ph_reactor::store::Store;
 
@@ -47,8 +47,7 @@ async fn spawn_node(tag: &str) -> Node {
     let key = Keypair::generate_ed25519();
     let peer = key.public().to_peer_id();
     let signing = p2p::signing_key(&key).expect("signing key");
-    let store =
-        Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
+    let store = Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
     let listen = Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").expect("listen addr");
@@ -125,8 +124,7 @@ async fn invite_join_then_sync() {
     assert_eq!(token.name, "alpha");
 
     // Beta's join-proof: echoes the nonce, signed by beta.
-    let accept =
-        invite::InviteAccept::make(&token.nonce, "beta", &b.peer.to_base58(), &b.signing);
+    let accept = invite::InviteAccept::make(&token.nonce, "beta", &b.peer.to_base58(), &b.signing);
 
     // Beta joins: add a drive for alpha (named after alpha) with the proof.
     let drive = Drive {
@@ -154,23 +152,21 @@ async fn invite_join_then_sync() {
     .await;
 
     // Both sides reach Synced (handshake + initial catch-up complete).
-    wait_for(
-        &mut a.evt_rx,
-        |ev| matches!(
+    wait_for(&mut a.evt_rx, |ev| {
+        matches!(
             ev,
             EngineEvent::DriveStatus { name, status, .. }
                 if name.starts_with("beta") && *status == DriveStatus::Synced
-        ),
-    )
+        )
+    })
     .await;
-    wait_for(
-        &mut b.evt_rx,
-        |ev| matches!(
+    wait_for(&mut b.evt_rx, |ev| {
+        matches!(
             ev,
             EngineEvent::DriveStatus { name, status, .. }
                 if name == "alpha" && *status == DriveStatus::Synced
-        ),
-    )
+        )
+    })
     .await;
 
     // Beta creates a doc; it propagates to alpha over the synced pair.

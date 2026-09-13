@@ -40,22 +40,16 @@ async fn spawn_dht_node(tag: &str) -> Node {
     let key = Keypair::generate_ed25519();
     let peer = key.public().to_peer_id();
     let signing = p2p::signing_key(&key).expect("signing key");
-    let store =
-        Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
+    let store = Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
     let listen = Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").expect("listen addr");
     let engine = SyncEngine::new(
-        &key,
-        store,
-        tag,
-        listen,
-        false, // no mDNS
-        true,   // DHT enabled
-        false,  // no relay
+        &key, store, tag, listen, false, // no mDNS
+        true,  // DHT enabled
+        false, // no relay
         None,  // no shared token
-        cmd_rx,
-        evt_tx,
+        cmd_rx, evt_tx,
     )
     .expect("engine");
     tokio::spawn(async move {
@@ -73,7 +67,13 @@ async fn spawn_dht_node(tag: &str) -> Node {
     .await
     .expect("identity event");
 
-    Node { cmd_tx, evt_rx, listen, peer, _dir: dir }
+    Node {
+        cmd_tx,
+        evt_rx,
+        listen,
+        peer,
+        _dir: dir,
+    }
 }
 
 /// Drains `rx` until an event satisfying `pred` arrives (30s budget).
@@ -113,18 +113,29 @@ async fn dht_provider_discovery() {
         .unwrap();
 
     // Both nodes complete a bootstrap (their routing table learns the peer).
-    wait_for(&mut a.evt_rx, |ev| matches!(ev, EngineEvent::DhtBootstrap(true))).await;
-    wait_for(&mut b.evt_rx, |ev| matches!(ev, EngineEvent::DhtBootstrap(true))).await;
+    wait_for(&mut a.evt_rx, |ev| {
+        matches!(ev, EngineEvent::DhtBootstrap(true))
+    })
+    .await;
+    wait_for(&mut b.evt_rx, |ev| {
+        matches!(ev, EngineEvent::DhtBootstrap(true))
+    })
+    .await;
 
     // A publishes a provider record: "I provide this doc".
     let doc = DocId::new();
     let key = doc.to_string().into_bytes();
     a.cmd_tx
-        .send(EngineCommand::PublishProvider { name: "a".into(), doc })
+        .send(EngineCommand::PublishProvider {
+            name: "a".into(),
+            doc,
+        })
         .unwrap();
 
     // B asks the DHT who provides that key.
-    b.cmd_tx.send(EngineCommand::FindProviders { key: key.clone() }).unwrap();
+    b.cmd_tx
+        .send(EngineCommand::FindProviders { key: key.clone() })
+        .unwrap();
 
     // B learns A is a provider of the key (via the replicated record).
     wait_for(&mut b.evt_rx, |ev| {

@@ -110,7 +110,11 @@ impl VerifyReport {
         out.push_str(&format!(
             "  {} action(s){}\n\n",
             self.actions.len(),
-            if self.from_snapshot { " since snapshot" } else { "" }
+            if self.from_snapshot {
+                " since snapshot"
+            } else {
+                ""
+            }
         ));
         for (i, a) in self.actions.iter().enumerate() {
             out.push_str(&format!(
@@ -559,15 +563,11 @@ impl Store {
                     Some(k) => match VerifyingKey::from_bytes(&k) {
                         Ok(pk) => {
                             if !action.verify_cosig(i, &pk) {
-                                problems.push(format!(
-                                    "co-signature {} from {} invalid",
-                                    i, cs.origin
-                                ));
+                                problems
+                                    .push(format!("co-signature {} from {} invalid", i, cs.origin));
                             }
                         }
-                        Err(_) => {
-                            problems.push(format!("co-signer {} key malformed", cs.origin))
-                        }
+                        Err(_) => problems.push(format!("co-signer {} key malformed", cs.origin)),
                     },
                     None => problems.push(format!("unknown co-signer {}", cs.origin)),
                 }
@@ -987,7 +987,11 @@ impl Inner {
             .map(|f| f.value.clone())
             .unwrap_or(serde_json::Value::Null)
             .as_array()
-            .map(|a| a.iter().filter_map(|v| v.as_str().map(String::from)).collect())
+            .map(|a| {
+                a.iter()
+                    .filter_map(|v| v.as_str().map(String::from))
+                    .collect()
+            })
             .unwrap_or_default();
         let mut seen: HashSet<&str> = HashSet::new();
         let mut in_group = 0usize;
@@ -1080,8 +1084,10 @@ mod tests {
         let evil = identity(12);
 
         // First contact pins the key; re-pinning the same key is idempotent.
-        s.register_peer_key(origin, good.verifying_key().to_bytes()).unwrap();
-        s.register_peer_key(origin, good.verifying_key().to_bytes()).unwrap();
+        s.register_peer_key(origin, good.verifying_key().to_bytes())
+            .unwrap();
+        s.register_peer_key(origin, good.verifying_key().to_bytes())
+            .unwrap();
 
         // A different key for the same origin is a TOFU mismatch (rejected,
         // and does not replace the pinned key).
@@ -1092,8 +1098,10 @@ mod tests {
 
         // The pinned (good) key still wins: re-registering it succeeds, and
         // the evil key is still rejected (it never got pinned).
-        s.register_peer_key(origin, good.verifying_key().to_bytes()).unwrap();
-        s.register_peer_key(origin, evil.verifying_key().to_bytes()).unwrap_err();
+        s.register_peer_key(origin, good.verifying_key().to_bytes())
+            .unwrap();
+        s.register_peer_key(origin, evil.verifying_key().to_bytes())
+            .unwrap_err();
     }
 
     /// Build a signed open@1 `set` action from `origin` with `key`.
@@ -1260,7 +1268,8 @@ mod tests {
         // a remote peer (different origin) signs actions
         let remote_key = identity(7);
         let remote_origin = "remote-peer";
-        s.register_peer_key(remote_origin, remote_key.verifying_key().to_bytes()).unwrap();
+        s.register_peer_key(remote_origin, remote_key.verifying_key().to_bytes())
+            .unwrap();
 
         let id = s.create_doc("shared", BM::new()).unwrap();
         let entry_clock0 = s.summary()[&id].clone();
@@ -1291,7 +1300,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open_store(dir.path());
         let rogue = identity(3);
-        s.register_peer_key("rogue", rogue.verifying_key().to_bytes()).unwrap();
+        s.register_peer_key("rogue", rogue.verifying_key().to_bytes())
+            .unwrap();
         let id = s.create_doc("t", BM::new()).unwrap();
         let mut clock = s.summary()[&id].clone();
         clock.tick("rogue");
@@ -1348,7 +1358,8 @@ mod tests {
             ("carol", &k_carol),
             ("mallory", &k_mallory),
         ] {
-            s.register_peer_key(name, k.verifying_key().to_bytes()).unwrap();
+            s.register_peer_key(name, k.verifying_key().to_bytes())
+                .unwrap();
         }
 
         // Bootstrap: members [alice bob carol], managers [alice].
@@ -1491,8 +1502,10 @@ mod tests {
         let mut fields: BM<String, serde_json::Value> = BM::new();
         fields.insert("title".into(), "hello".into());
         s.create_doc("v1", fields).unwrap();
-        s.update_field("v1", "body", serde_json::json!("world")).unwrap();
-        s.update_field("v1", "body", serde_json::json!("world2")).unwrap();
+        s.update_field("v1", "body", serde_json::json!("world"))
+            .unwrap();
+        s.update_field("v1", "body", serde_json::json!("world2"))
+            .unwrap();
         let report = s.verify("v1").unwrap();
         assert!(
             report.ok,
@@ -1515,7 +1528,8 @@ mod tests {
         let k_bob = identity(2);
         let k_carol = identity(3);
         for (name, k) in [("alice", &k_alice), ("bob", &k_bob), ("carol", &k_carol)] {
-            s.register_peer_key(name, k.verifying_key().to_bytes()).unwrap();
+            s.register_peer_key(name, k.verifying_key().to_bytes())
+                .unwrap();
         }
         let id = DocId::new();
         let init = make_group_action(
@@ -1557,12 +1571,12 @@ mod tests {
             "a cosigned doc verifies clean: {:?}",
             report.actions
         );
-        let add = report.actions.iter().find(|a| a.kind == "add-manager").unwrap();
-        assert!(
-            add.ok,
-            "the co-signatures check out: {:?}",
-            add.problems
-        );
+        let add = report
+            .actions
+            .iter()
+            .find(|a| a.kind == "add-manager")
+            .unwrap();
+        assert!(add.ok, "the co-signatures check out: {:?}", add.problems);
         let m = report.model.as_ref().expect("the model is reported");
         assert_eq!(m.name, "group");
     }
@@ -1613,7 +1627,8 @@ mod tests {
             let mut fields: BM<String, serde_json::Value> = BM::new();
             fields.insert("title".into(), "hello".into());
             s.create_doc("v1", fields).unwrap();
-            s.update_field("v1", "body", serde_json::json!("world")).unwrap();
+            s.update_field("v1", "body", serde_json::json!("world"))
+                .unwrap();
             let alog = s.wal_path(&s.get("v1").unwrap().id);
             let mut lines: Vec<Action> = std::fs::read_to_string(&alog)
                 .unwrap()
