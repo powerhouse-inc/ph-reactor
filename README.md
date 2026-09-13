@@ -2,9 +2,8 @@
 
 A single-process Rust daemon that runs a local Powerhouse **reactor** in
 the background on Linux: an event-sourced document vault with
-**libp2p-based drive sync**, a status-bar **tray icon**, and a loopback
-**settings page** for configuring the remote drives to keep in sync
-(e.g. the `powerhouse-knowledge` vault on another machine).
+**libp2p-based drive sync**, a status-bar **tray icon**, and a loopback **console** for configuring the remote drives to
+keep in sync (e.g. the `powerhouse-knowledge` vault on another machine).
 
 No Node, no npm, no child processes: the daemon *is* the reactor.
 
@@ -19,8 +18,7 @@ No Node, no npm, no child processes: the daemon *is* the reactor.
 - **Tray**: an `org.kde.StatusNotifierItem` over D-Bus (zbus) with a
   `DBusMenu` — no GTK dependency; headless-safe (no session bus → the
   daemon runs without a tray).
-- **Settings**: a single-page UI + JSON API on `127.0.0.1:4002`
-  (drives, reactor, quit).
+- **Console**: a client-side-routed control panel (Overview / Drives / Groups / Processors / Documents / Settings) + a JSON API on `127.0.0.1:4002`.
 
 ## Install
 
@@ -193,15 +191,35 @@ Left-click (activation) opens the settings page. If no session bus is
 available (headless/SSH) the daemon logs one warning and runs without a
 tray; everything else works.
 
-## Settings page
+## Console
 
-`http://127.0.0.1:4002/` (loopback only, no auth by design): reactor
-card, drives table with pause/resume/resync/remove, add-drive form
-(multiaddr). JSON API: `GET /api/status`, `POST /api/drives`, `POST
-/api/drives/<name>/pause|resume|resync`, `DELETE /api/drives/<name>`,
-`POST /api/docs` (synchronous doc creation, used by `ph-reactor doc
-add`), `GET /api/query?model=<m>&field=<k>&value=<v>` (the read-model
-query, answered from the live store), `POST /api/config` (key/value),
+`http://127.0.0.1:4002/` (loopback only, no auth by design) serves the
+**reactor console** — a client-side-routed control panel (hash routing,
+no framework, no build step; the HTML/JS/CSS is embedded in the binary).
+The views:
+
+- **Overview** — reactor health, a drives summary, the LLM endpoint
+  status, and a recent-activity feed.
+- **Drives** — add / remove / pause / resume / resync drives, each with
+  its live status chip, plus the peer ban list.
+- **Groups** — create a group and manage its members/managers (the
+  two-person rule, with quorum rejections surfaced as friendly errors);
+  see a group's recent signed actions.
+- **Processors** — a live read of the daemon's subsystems (sync engine,
+  document store, settings server, log rotation, status poller).
+- **Documents** — browse every document (filter by model and
+  `field=value`), open one to read its fields, create a new document.
+- **Settings** — the full config grouped by concern, including the LLM
+  (OpenAI-compatible) endpoint with a **Test connection** button.
+
+A theme switch (system / light / dark) persists to `localStorage`. The
+console talks to the JSON API on the same loopback server: `GET
+/api/status`, `GET /api/config`, `GET /api/processors`, `GET
+/api/groups`, `POST /api/groups`, `POST /api/groups/<name>/action`,
+`GET /api/groups/<name>/activity`, `GET /api/docs`, `GET
+/api/docs/<name>`, `POST /api/llm/test`, `POST /api/drives`,
+`POST /api/drives/<name>/pause|resume|resync`, `DELETE
+/api/drives/<name>`, `POST /api/docs`, `POST /api/config` (key/value),
 `POST /api/quit`.
 
 ## Configuration
