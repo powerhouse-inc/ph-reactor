@@ -111,6 +111,7 @@ impl Settings {
             .route("/api/models", get(models_api).post(register_model))
             .route("/api/models/register", post(register_model))
             .route("/api/llm/draft-type", post(llm_draft_type))
+            .route("/api/llm/draft-processor", post(llm_draft_processor))
             .with_state(Arc::new(self));
         let task = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
@@ -1293,6 +1294,171 @@ Return only the JSON object for the described document."#;
         axum::Json(json!({
             "ok": false,
             "error": "the model did not return a valid JSON definition after 3 attempts",
+            "raw": last_raw,
+        })),
+    )
+        .into_response()
+}
+
+/// `POST /api/llm/draft-processor` — ask the configured LLM to draft a
+/// subscription (a processor spec: a trigger plus a reaction) from a short
+/// description. Returned for review; the console activates it with
+/// `POST /api/processors`. Mirrors [`llm_draft_type`].
+#[derive(Deserialize)]
+struct DraftProcessorBody {
+    description: String,
+}
+
+async fn llm_draft_processor(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<DraftProcessorBody>,
+) -> Response {
+    let cfg = config::load(&state.paths).unwrap_or_default();
+    let key = std::env::var(&cfg.llm.api_key_env).unwrap_or_default();
+    if key.is_empty() {
+        return (
+            StatusCode::OK,
+            axum::Json(json!({
+                "ok": false,
+                "error": "no LLM API key set (the value of the configured apiKeyEnv); fill in the trigger and reaction by hand",
+            })),
+        )
+            .into_response();
+    }
+    // The models the LLM can target, each with its fields and reducers, so it
+    // writes a trigger that actually matches a real action.
+    let mut model_lines = Vec::new();
+    for r in state.store.model_refs() {
+        let def = state.store.model_definition(&r).unwrap_or(Value::Null);
+        let fields = def.get("fields").cloned().unwrap_or(Value::Null);
+        let reducers = def
+            .get("reducers")
+            .and_then(|v| v.as_object())
+            .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
+            .unwrap_or_default();
+        model_lines.push(format!("- {} : fields {} ; reducers [{}]", r.name, fields, reducers));
+    }
+    let sys = format!(
+        r#"You write "subscriptions" for an event-sourced document store. A subscription watches for a specific change to documents and, when it matches, runs a reaction. Given a short description of what the user wants, return ONE valid JSON object and nothing else: no prose, no markdown fences, no trailing commas.
+
+Schema:
+{{
+  "name": "lowercase-hyphenated",
+  "models": ["<model>", ...],
+  "action_kind": "<reducer-kind>",
+  "field": "<field-name>",
+  "value": <any json value>,
+  "reaction": {{ "kind": "<kind>", ... }}
+}}
+
+- "models": the document models to watch (choose from the list below). An empty [] means any model.
+- "action_kind": the reducer kind that produced the change (e.g. "set-status"). Use null when the description means "any change".
+- "field": the field being written (e.g. "status"). Use null to not care.
+- "value": the value the field must be written to (e.g. "accepted"). Use null to not care.
+- A change matches only when EVERY non-null constraint matches, so a specific model + a set-<field> action_kind + the field + the target value is the most precise trigger.
+- "reaction": what to do when it matches. Kinds:
+    - {{ "kind": "run", "command": "<shell command>" }}  -- runs locally (15s timeout); the triggering doc name is $PH_DOC and its model is $PH_MODEL, available as shell env vars. Use them in the command.
+    - {{ "kind": "log", "message": "<text>" }}          -- appends to the daemon log; $doc and $model are substituted.
+    - {{ "kind": "emit", "event": "<name>" }}           -- records a named event for a UI feed.
+    - {{ "kind": "create-doc", "model": "<m>", "name": "<n>", "fields": {{ ... }} }}  -- creates a document.
+
+Available models (target real ones; prefer a specific set-<field> reducer so the subscription fires on that exact transition):
+{model_lines}
+
+Rules:
+- "name" is lowercase-hyphenated, derived from the description.
+- Prefer a SPECIFIC, matchable trigger: a real model + its set-<field> action_kind + the field + the target value. Use null/empty for action_kind/field/value only when the description genuinely means "any change to these models".
+- The reaction is usually a "run" command: keep it a single, self-contained shell command that uses $PH_DOC and $PH_MODEL where it needs the triggering document. Keep it safe and idempotent.
+- Output valid JSON only.
+
+Example, for "when an invoice is accepted, log that it was paid":
+{{
+  "name": "invoice-accepted",
+  "models": ["invoice"],
+  "action_kind": "set-status",
+  "field": "status",
+  "value": "accepted",
+  "reaction": {{ "kind": "run", "command": "echo \"invoice $PH_DOC accepted - paid\"" }}
+}}
+
+Return only the JSON object for the described subscription."#,
+        model_lines = model_lines.join("\n")
+    );
+    let url = format!(
+        "{}/chat/completions",
+        cfg.llm.base_url.trim_end_matches('/')
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap_or_default();
+    let mut last_raw = String::new();
+    for attempt in 0..3u32 {
+        let user = if attempt == 0 {
+            body.description.clone()
+        } else {
+            format!(
+                "{} — Return ONLY a single complete, well-formed JSON object \
+                 (no markdown fences, no trailing prose). Do not truncate the \
+                 output.",
+                body.description
+            )
+        };
+        match client
+            .post(&url)
+            .bearer_auth(&key)
+            .json(&json!({
+                "model": cfg.llm.model,
+                "temperature": 0.2,
+                "max_tokens": 2048,
+                "messages": [
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": user},
+                ],
+            }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                let v: Value = r.json().await.unwrap_or(Value::Null);
+                let content = v
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(spec) = extract_json_object(&content) {
+                    return (
+                        StatusCode::OK,
+                        axum::Json(json!({ "ok": true, "spec": spec })),
+                    )
+                        .into_response();
+                }
+                last_raw = content;
+            }
+            Ok(r) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({ "ok": false, "error": format!("LLM returned HTTP {}", r.status()) })),
+                )
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({ "ok": false, "error": format!("LLM request failed: {e}") })),
+                )
+                    .into_response();
+            }
+        }
+    }
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({
+            "ok": false,
+            "error": "the model did not return a valid subscription after 3 attempts",
             "raw": last_raw,
         })),
     )

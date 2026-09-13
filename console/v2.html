@@ -299,30 +299,102 @@ async function renderOverview() {
     </div>
     <div style="display:flex;flex-direction:column;gap:14px">
       <div class="card"><h3>Subscriptions</h3><div id="proc-list"></div></div>
-      <div class="card"><h3>Reference — create in one click</h3>
-        <div class="muted" style="font-size:12px;margin-bottom:10px">Fire a command whenever an invoice is marked <span class="code">accepted</span>.</div>
+      <div class="card"><h3>New subscription</h3>
+        <div class="muted" style="font-size:12px;margin-bottom:10px">Describe what it should do — the LLM writes the trigger + reaction, or fill it in by hand.</div>
         <div style="display:flex;flex-direction:column;gap:8px">
-          <input id="ref-name" value="on-invoice-accepted" placeholder="name">
-          <input id="ref-cmd" value="echo paid" placeholder="command on fire">
-          <button class="btn primary" id="ref-create">✦  Create processor</button>
+          <textarea id="sub-desc" rows="2" placeholder="e.g. when a project is marked done, log it and notify the account manager"></textarea>
+          <button class="btn" id="sub-gen">✦  Generate with LLM</button>
+          <div class="divider"></div>
+          <input id="sub-name" placeholder="name (lowercase-hyphenated)">
+          <input id="sub-models" placeholder="models (comma-sep, blank = any)">
+          <div class="field-row">
+            <input id="sub-action" placeholder="action kind" title="reducer kind, e.g. set-status">
+            <input id="sub-field" placeholder="field" title="e.g. status">
+            <input id="sub-value" placeholder="value" title="the value the field becomes">
+          </div>
+          <div class="field-row">
+            <select id="sub-reakind">
+              <option value="run">run — shell command</option>
+              <option value="log">log — a message</option>
+              <option value="emit">emit — an event</option>
+              <option value="create-doc">create — a document</option>
+            </select>
+            <input id="sub-reaction" placeholder="command" style="flex:1">
+          </div>
+          <button class="btn primary" id="sub-activate">⚡  Activate</button>
+          <div class="muted" style="font-size:11px">in a run command, the doc name is <span class="code">$PH_DOC</span> and its model <span class="code">$PH_MODEL</span>.</div>
         </div>
       </div>
     </div>
   </div>`;
   $("#content").replaceChildren(fireEl);
 
-  // reference processor
-  const refCmd = $("#ref-cmd").value.trim() || "echo paid";
-  $("#ref-create").onclick = async () => {
+  // New subscription: LLM-generate + manual, then activate.
+  const reactKind = $("#sub-reakind");
+  const reactInput = $("#sub-reaction");
+  const refreshReactionLabel = () => {
+    const k = reactKind.value;
+    reactInput.placeholder =
+      k === "run" ? "command, e.g. echo 'doc $PH_DOC changed'"
+      : k === "log" ? "message, e.g. $doc was updated"
+      : k === "emit" ? "event name"
+      : 'JSON: {"model":"…","name":"…","fields":{…}}';
+  };
+  reactKind.onchange = refreshReactionLabel;
+  refreshReactionLabel();
+
+  const fillSubForm = (s) => {
+    $("#sub-name").value = s.name || "";
+    $("#sub-models").value = (s.models || []).join(", ");
+    $("#sub-action").value = s.action_kind || "";
+    $("#sub-field").value = s.field || "";
+    $("#sub-value").value = s.value == null ? "" : (typeof s.value === "string" ? s.value : JSON.stringify(s.value));
+    const k = s.reaction && s.reaction.kind;
+    if (k) reactKind.value = k;
+    refreshReactionLabel();
+    if (k === "create-doc") reactInput.value = JSON.stringify({ model: s.reaction.model, name: s.reaction.name, fields: s.reaction.fields || {} });
+    else if (k === "log") reactInput.value = s.reaction.message || "";
+    else if (k === "emit") reactInput.value = s.reaction.event || "";
+    else reactInput.value = (s.reaction && s.reaction.command) || "";
+  };
+
+  $("#sub-gen").onclick = async () => {
+    const desc = $("#sub-desc").value.trim();
+    if (!desc) { toast("describe the subscription first", true); return; }
+    const b = $("#sub-gen"); b.disabled = true; b.textContent = "… generating";
     try {
-      const name = $("#ref-name").value.trim();
-      await post("/api/processors", {
-        name, models: ["invoice"], field: "status", value: "accepted",
-        reaction: { kind: "run", command: refCmd },
-      });
-      toast("Processor created: " + name);
-      render();
+      const r = await post("/api/llm/draft-processor", { description: desc });
+      if (!r.ok) throw new Error(r.error || "draft failed");
+      fillSubForm(r.spec);
+      toast("drafted — review, then activate");
     } catch (e) { toast(e.message, true); }
+    b.disabled = false; b.textContent = "✦  Generate with LLM";
+  };
+
+  $("#sub-activate").onclick = async () => {
+    const name = $("#sub-name").value.trim();
+    if (!name) { toast("give it a name", true); return; }
+    const k = reactKind.value;
+    const raw = reactInput.value;
+    let reaction;
+    if (k === "create-doc") reaction = JSON.parse(raw || "{}");
+    else if (k === "log") reaction = { kind: "log", message: raw };
+    else if (k === "emit") reaction = { kind: "emit", event: raw };
+    else reaction = { kind: "run", command: raw };
+    const models = $("#sub-models").value.split(",").map((x) => x.trim()).filter(Boolean);
+    const valRaw = $("#sub-value").value.trim();
+    let value = null;
+    if (valRaw) { try { value = JSON.parse(valRaw); } catch { value = valRaw; } }
+    await post("/api/processors", {
+      name, models,
+      action_kind: $("#sub-action").value.trim() || null,
+      field: $("#sub-field").value.trim() || null,
+      value,
+      reaction,
+    });
+    toast("activated: " + name);
+    $("#sub-name").value = ""; $("#sub-desc").value = "";
+    render();
   };
 
   renderProcList(procs, ov);

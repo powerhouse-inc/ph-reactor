@@ -172,6 +172,23 @@ pub fn now_ms() -> u64 {
         .map(|d| d.as_millis() as u64)
         .unwrap_or(0)
 }
+/// The reference subscription, seeded on first run: pay an invoice when it is
+/// accepted. A working, self-documenting example of the "listen on doc
+/// changes" engine — the user replaces the command with a real hook.
+pub fn reference_spec() -> ProcessorSpec {
+    ProcessorSpec {
+        name: "pay-on-invoice-accepted".into(),
+        models: vec!["invoice".into()],
+        action_kind: Some("set-status".into()),
+        field: Some("status".into()),
+        value: Some(serde_json::json!("accepted")),
+        reaction: Reaction::Run {
+            command: "echo 'ph-reactor: invoice $PH_DOC accepted - payment due'".into(),
+        },
+        created: now_ms(),
+    }
+}
+
 
 fn substitute(template: &str, doc: &str, model: &str) -> String {
     template

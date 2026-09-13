@@ -252,8 +252,14 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
 
     // The user-configurable processor engine (subscriptions on doc changes):
     // it subscribes in its constructor and runs as a background task.
-    let processor_runner =
-        crate::processor::ProcessorRunner::new(store.clone(), paths.processors_file());
+    let proc_file = paths.processors_file();
+    // First run: seed the reference subscription so the console has a working
+    // example of the doc-change engine (the README promises this). A persisted
+    // file means the user has configured subscriptions; never overwrite it.
+    if !proc_file.exists() {
+        crate::processor::save_specs(&proc_file, &[crate::processor::reference_spec()]);
+    }
+    let processor_runner = crate::processor::ProcessorRunner::new(store.clone(), proc_file);
     let processor_handle = processor_runner.handle();
     processor_runner.spawn();
 
