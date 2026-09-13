@@ -25,6 +25,7 @@ back to the `org.kde.StatusNotifierItem-1000-1` name).
 | 09-12 | 10 open@1 model + action-log store | done | commits 4f8fdeb/9f64817: the `Action` envelope (model/kind/payload/ts/clock/origin/cosig/sig/prev_hash; ed25519 + co-signatures; content-hash chain); `open@1` (`set`/`delete`) reducing 1:1 to v1 field-writes; the per-doc WAL becomes the action log with a single apply pipeline (verify → model → validate → precondition → reduce → merge); the P2P wire carries actions |
 | 09-12 | 11 L1 interpreter + group model + quorum | done | commit d7f3aac: `model/l1.rs` (a JSON model definition interpreted by one fixed engine: typed fields, write templates over `$actor`/`$ts`/`$payload.*`, a precondition DSL, and a quorum spec) and `model/group.rs` (members/managers; add/remove-member; add-manager quorum-gated for the two-person rule); quorum = N distinct valid co-signers in the group; quorum pass/fail, distinctness, and tamper tests |
 | 09-12 | 12 doc verify + doc action + verify engine | done | commits 8842529/a99dc11: `Store::verify` (a read-only audit that replays and re-reduces the surviving log, re-verifying every origin + co-signature, each precondition, the prev_hash chain, and that the re-folded field map equals the stored doc; a per-action `VerifyReport` + `render()`); `doc verify` (read-only, VERIFIED/FAILED, non-zero exit) and `doc action` (daemon path: `/api/docs/action` → `Command::CreateAction` → `apply_local_action`). Also fixed `create_doc`, which built its whole batch against an empty log (every prev_hash None) — it now applies one at a time; `apply_action` has no chain check, so verify is the independent chain audit. `--cosign` is deferred to the full-P2P phase (collecting peer co-signatures needs their keys over the wire) |
+| 09-13 | 13 P2P transport (DHT + relay increment) | done (partial) | commits a7dbc10/6f0ee44: Kademlia DHT (peer routing + provider records + a `DhtBootstrap` command; identify→kad hookup + a `PeerConnected` event the daemon logs) with an in-process 2-peer provider-discovery test (`tests/dht.rs`); circuit relay wired — config-gated server (`p2p.relay`, default off) + always-on client via `SwarmBuilder::with_relay_client` (additive to direct TCP). **Not done / follow-up:** the in-process relay-mediated-hop test (the relay v2 reservation is not reliable under loopback; needs a realistic network), TOFU key pinning, group-scoped name records, and the `2.0.0` action-aware wire — these ride with task 14 (invites), where the group docs make them meaningful. A banned peer is still refused via `rejects_peer` (tasks 6/12 ban machinery). |
 
 ## Deviations from the spec
 
@@ -66,9 +67,8 @@ back to the `org.kde.StatusNotifierItem-1000-1` name).
   reproduced in the live E2E, now a regression test.
 
 ## Verification
-
-- `cargo test`: 44 unit + 2 integration (two-engine sync; late-
-  drive-add handshake race) — all green.
+- `cargo test`: 67 unit + 3 integration (two-engine sync; late-
+  drive-add handshake race; DHT 2-peer provider discovery) — all green.
 - `cargo clippy --all-targets -- -D warnings`: clean. `cargo fmt --check`:
   clean.
 - Two-binary E2E (both daemons daemonized, separate state dirs, real
