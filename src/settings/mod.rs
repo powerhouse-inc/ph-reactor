@@ -1171,7 +1171,54 @@ async fn llm_draft_type(
         .timeout(Duration::from_secs(45))
         .build()
         .unwrap_or_default();
-    let sys = r#"You design document models. Given a short description of a document, return ONLY a JSON object of the exact shape: {"name":"<lowercase-hyphenated>","version":"1","fields":{"<field>":"<string|number|boolean|object|array>"}},"reducers":{"init":{"payload":{"name":"string", plus one entry per field},"writes":{"__name__":{"set":"$payload.name"}, plus one entry per field},"pre":[]},"set-<field>":{"payload":{"<field>":"<type>"},"writes":{"<field>":{"set":"$payload.<field>"}},"pre":[]}}}. No prose, no markdown fences."#;
+    let sys = r#"You design document models for an event-sourced store. Given a short description, return ONE valid JSON object and nothing else: no prose, no markdown fences, no trailing commas.
+
+Shape — "fields" maps each field name to exactly one of the type strings string | number | boolean | object | array:
+
+{
+  "name": "lowercase-hyphenated",
+  "version": "1",
+  "fields": { "<field>": "<string|number|boolean|object|array>" },
+  "reducers": {
+    "init": {
+      "payload": { "name": "string", "<field>": "<type>" },
+      "writes": { "__name__": { "set": "$payload.name" }, "<field>": { "set": "$payload.<field>" } },
+      "pre": []
+    },
+    "set-<field>": {
+      "payload": { "<field>": "<type>" },
+      "writes": { "<field>": { "set": "$payload.<field>" } },
+      "pre": []
+    }
+  }
+}
+
+Rules:
+- "name" is lowercase-hyphenated; "version" is the string "1".
+- "name" is the document's identity, not a field: it appears only in init's payload and as the "__name__" write, never in "fields".
+- Every reducer has "payload", "writes", and a "pre" array; leave "pre" empty unless the description demands a guard.
+- "init" creates the document: its payload holds the name plus every field, and its writes set "__name__" to "$payload.name" and each field to "$payload.<field>".
+- Add one "set-<field>" reducer per field so each can be updated on its own.
+- Every write value is an object with exactly one key: "set" (normal fields), "append" (add to an array field), or "remove".
+- Templates available in writes: "$payload.<field>", "$actor", "$ts".
+
+Complete example, for "a note with a body and a number of stars":
+{
+  "name": "note",
+  "version": "1",
+  "fields": { "body": "string", "stars": "number" },
+  "reducers": {
+    "init": {
+      "payload": { "name": "string", "body": "string", "stars": "number" },
+      "writes": { "__name__": { "set": "$payload.name" }, "body": { "set": "$payload.body" }, "stars": { "set": "$payload.stars" } },
+      "pre": []
+    },
+    "set-body": { "payload": { "body": "string" }, "writes": { "body": { "set": "$payload.body" } }, "pre": [] },
+    "set-stars": { "payload": { "stars": "number" }, "writes": { "stars": { "set": "$payload.stars" } }, "pre": [] }
+  }
+}
+
+Return only the JSON object for the described document."#;
     let url = format!(
         "{}/chat/completions",
         cfg.llm.base_url.trim_end_matches('/')
@@ -1196,7 +1243,7 @@ async fn llm_draft_type(
             .json(&json!({
                 "model": cfg.llm.model,
                 "temperature": 0.2,
-                "max_tokens": 4096,
+                "max_tokens": 8192,
                 "messages": [
                     {"role": "system", "content": sys},
                     {"role": "user", "content": user},
