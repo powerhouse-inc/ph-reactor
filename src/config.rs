@@ -149,6 +149,33 @@ impl Default for SettingsConfig {
     }
 }
 
+/// The OpenAI-compatible LLM endpoint (see the spec's "New config").
+/// `apiKeyEnv` is the environment variable that holds the key; the value is
+/// read from the environment at call time and never written to disk (the
+/// same `tokenEnv` convention the drives use).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct LlmConfig {
+    /// The OpenAI-compatible base URL (ending in the version prefix).
+    #[serde(rename = "baseUrl")]
+    pub base_url: String,
+    /// The env-var name holding the API key (never the value itself).
+    #[serde(rename = "apiKeyEnv")]
+    pub api_key_env: String,
+    /// The model id sent to the endpoint.
+    pub model: String,
+}
+
+impl Default for LlmConfig {
+    fn default() -> Self {
+        Self {
+            base_url: "https://api.openai.com/v1".into(),
+            api_key_env: "LLM_API_KEY".into(),
+            model: "gpt-4o-mini".into(),
+        }
+    }
+}
+
 /// The top-level configuration document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -159,6 +186,7 @@ pub struct ReactorConfig {
     pub p2p: P2pConfig,
     pub drives: Vec<DriveConfig>,
     pub settings: SettingsConfig,
+    pub llm: LlmConfig,
     #[serde(rename = "logLevel")]
     pub log_level: String,
     /// Unknown fields, preserved verbatim (forward compatibility).
@@ -174,6 +202,7 @@ impl Default for ReactorConfig {
             p2p: P2pConfig::default(),
             drives: Vec::new(),
             settings: SettingsConfig::default(),
+            llm: LlmConfig::default(),
             log_level: "info".into(),
             extra: BTreeMap::new(),
         }
@@ -224,6 +253,15 @@ impl ReactorConfig {
                 "logLevel",
                 &format!("expected one of: {}", LOG_LEVELS.join(", ")),
             ));
+        }
+        if self.llm.base_url.trim().is_empty()
+            || !(self.llm.base_url.starts_with("http://")
+                || self.llm.base_url.starts_with("https://"))
+        {
+            return Err(invalid("llm.baseUrl", "must be an http(s) base URL"));
+        }
+        if self.llm.model.trim().is_empty() {
+            return Err(invalid("llm.model", "must be a non-empty string"));
         }
         Ok(())
     }
@@ -382,10 +420,23 @@ pub fn set(config: &mut ReactorConfig, key: &str, value: &Value) -> Result<(), C
             }
             config.log_level = s;
         }
+        "llm.baseUrl" => {
+            set_string("llm.baseUrl", &mut config.llm.base_url, value, |s| {
+                s.starts_with("http://") || s.starts_with("https://")
+            })?;
+        }
+        "llm.apiKeyEnv" => match value {
+            Value::Null => config.llm.api_key_env = String::new(),
+            Value::String(s) => config.llm.api_key_env = s.clone(),
+            _ => return Err(invalid("llm.apiKeyEnv", "expected a string or null")),
+        },
+        "llm.model" => {
+            set_string("llm.model", &mut config.llm.model, value, |s| !s.trim().is_empty())?;
+        }
         _ => {
             return Err(invalid(
                 key,
-                "unknown key (allowed: instance.name, instance.listen, p2p.mdns, p2p.tokenEnv, settings.host, settings.port, logLevel)",
+                "unknown key (allowed: instance.name, instance.listen, p2p.mdns, p2p.tokenEnv, llm.baseUrl, llm.apiKeyEnv, llm.model, settings.host, settings.port, logLevel)",
             ))
         }
     }
@@ -521,6 +572,46 @@ mod tests {
         assert_eq!(config.p2p.token_env.as_deref(), Some("GATE"));
         set(&mut config, "p2p.tokenEnv", &Value::Null).unwrap();
         assert!(config.p2p.token_env.is_none());
+    }
+
+    #[test]
+    fn llm_config_defaults_set_and_round_trips() {
+        // Defaults.
+        let config = ReactorConfig::default();
+        assert_eq!(config.llm.base_url, "https://api.openai.com/v1");
+        assert_eq!(config.llm.api_key_env, "LLM_API_KEY");
+        assert_eq!(config.llm.model, "gpt-4o-mini");
+
+        // set(): valid values.
+        let mut c = ReactorConfig::default();
+        set(
+            &mut c,
+            "llm.baseUrl",
+            &Value::String("https://my.llm.local/v1".into()),
+        )
+        .unwrap();
+        assert_eq!(c.llm.base_url, "https://my.llm.local/v1");
+        set(&mut c, "llm.apiKeyEnv", &Value::String("MY_KEY".into())).unwrap();
+        assert_eq!(c.llm.api_key_env, "MY_KEY");
+        set(&mut c, "llm.model", &Value::String("gpt-4o".into())).unwrap();
+        assert_eq!(c.llm.model, "gpt-4o");
+
+        // set(): validation rejects a non-URL base and an empty model.
+        assert!(set(&mut c, "llm.baseUrl", &Value::String("not-a-url".into())).is_err());
+        assert!(set(&mut c, "llm.model", &Value::String("".into())).is_err());
+        // apiKeyEnv: null clears it.
+        set(&mut c, "llm.apiKeyEnv", &Value::Null).unwrap();
+        assert_eq!(c.llm.api_key_env, "");
+
+        // Round-trip through save/load preserves the section.
+        let (_t, paths) = temp_paths();
+        let mut saved = ReactorConfig::default();
+        saved.llm.model = "test-model".into();
+        saved.llm.base_url = "http://127.0.0.1:9999/v1".into();
+        save(&paths, &saved).unwrap();
+        let re = load(&paths).unwrap();
+        assert_eq!(re.llm.model, "test-model");
+        assert_eq!(re.llm.base_url, "http://127.0.0.1:9999/v1");
     }
 
     #[test]
