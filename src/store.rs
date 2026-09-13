@@ -79,6 +79,14 @@ pub struct DocChange {
     pub state: DocState,
     /// The timestamp of the action that caused the change (ordering key).
     pub ts: u64,
+    /// The reducer kind of the action that caused the change, if any
+    /// (`None` for an adopted state, which has no action). Lets a processor
+    /// match a *transition*, not just a resulting state.
+    pub action_kind: Option<String>,
+    /// The payload's `field`, if the action set one.
+    pub action_field: Option<String>,
+    /// The payload's `value`, if the action set one.
+    pub action_value: Option<serde_json::Value>,
 }
 
 /// Persisted store metadata: the ts high-water mark (`index.json`).
@@ -500,7 +508,7 @@ impl Store {
             entry.log.clear();
         }
         let ts = inner.ts_hint;
-        inner.emit_change(state.doc.id, ts);
+        inner.emit_change(state.doc.id, ts, None);
         Ok(())
     }
 
@@ -1002,7 +1010,7 @@ impl Inner {
             }
         }
         if applied_any || deleted {
-            self.emit_change(action.doc_id, action.ts);
+            self.emit_change(action.doc_id, action.ts, Some(action));
         }
         Ok(ApplyResult {
             applied: applied_any,
@@ -1012,9 +1020,20 @@ impl Inner {
 
     /// Publish a doc-change event to every subscriber (non-blocking; dead
     /// senders are pruned). Called after a successful apply or adoption.
-    fn emit_change(&mut self, doc_id: DocId, ts: u64) {
+    fn emit_change(&mut self, doc_id: DocId, ts: u64, action: Option<&Action>) {
         let Some(entry) = self.entries.get(&doc_id) else {
             return;
+        };
+        let (action_kind, action_field, action_value) = match action {
+            Some(a) => (
+                Some(a.kind.clone()),
+                a.payload
+                    .get("field")
+                    .and_then(|v| v.as_str())
+                    .map(String::from),
+                a.payload.get("value").cloned(),
+            ),
+            None => (None, None, None),
         };
         let change = DocChange {
             doc_id,
@@ -1029,6 +1048,9 @@ impl Inner {
                 model: entry.model.clone(),
             },
             ts,
+            action_kind,
+            action_field,
+            action_value,
         };
         let mut dead = Vec::new();
         for (i, tx) in self.subscribers.iter().enumerate() {
@@ -1307,6 +1329,31 @@ mod tests {
             c.tick(origin);
         }
         c
+    }
+
+    #[test]
+    fn doc_change_carries_the_action_delta() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_store(dir.path());
+        let mut rx = s.subscribe_changes();
+
+        s.create_doc("note-delta", BM::new()).unwrap();
+        s.update_field("note-delta", "status", serde_json::json!("accepted"))
+            .unwrap();
+
+        // The feed carries both changes; the last is the `set`.
+        let mut last: Option<DocChange> = None;
+        while let Ok(c) = rx.try_recv() {
+            last = Some(c);
+        }
+        let c = last.expect("a change was emitted");
+        assert_eq!(c.name, "note-delta");
+        assert_eq!(c.action_kind.as_deref(), Some("set"));
+        assert_eq!(c.action_field.as_deref(), Some("status"));
+        assert_eq!(
+            c.action_value.as_ref(),
+            Some(&serde_json::json!("accepted"))
+        );
     }
 
     #[test]
