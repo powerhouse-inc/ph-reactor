@@ -370,6 +370,27 @@ impl Store {
         Ok(id)
     }
 
+    /// Create a document under a specific model's `init` reducer (the
+    /// model-aware counterpart to [`create_doc`], which is always `open@1`).
+    /// The `init` action must set `__name__` to `name`. Returns the new id.
+    pub fn create_doc_model(
+        &self,
+        name: &str,
+        model: &ModelRef,
+        payload: &serde_json::Value,
+    ) -> Result<DocId, String> {
+        Store::validate_name(name)?;
+        let mut inner = self.inner.lock();
+        if inner.names.contains_key(name) {
+            return Err(format!("a doc named {name} already exists"));
+        }
+        let id = DocId::new();
+        inner.entries.insert(id, Entry::new(id));
+        let action = inner.build_action(id, model, "init", payload)?;
+        inner.apply_action(&action)?;
+        Ok(id)
+    }
+
     pub fn update_field(
         &self,
         name: &str,
