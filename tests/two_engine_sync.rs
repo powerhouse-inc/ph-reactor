@@ -50,8 +50,9 @@ async fn spawn_node(tag: &str) -> Node {
         store.clone(),
         tag,
         listen,
-        false, // no mDNS in the test
-        None,  // no shared token
+        false,    // no mDNS in the test
+        false,    // no DHT in the test
+        None,     // no shared token
         cmd_rx,
         evt_tx,
     )

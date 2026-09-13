@@ -85,6 +85,14 @@ pub struct P2pConfig {
     /// matches this variable's value.
     #[serde(rename = "tokenEnv")]
     pub token_env: Option<String>,
+    /// Enable the Kademlia DHT: peer routing, provider records, and
+    /// bootstrap discovery over the relay/loopback network.
+    pub dht: bool,
+    /// Enable the circuit relay (client and server) for NAT traversal.
+    pub relay: bool,
+    /// Bootstrap peers as full multiaddrs (`/ip4/…/tcp/…/p2p/<peer-id>`).
+    /// Used to seed the DHT on a node that knows no one yet.
+    pub bootstraps: Vec<String>,
 }
 
 impl Default for P2pConfig {
@@ -92,6 +100,9 @@ impl Default for P2pConfig {
         Self {
             mdns: true,
             token_env: None,
+            dht: true,
+            relay: false,
+            bootstraps: Vec::new(),
         }
     }
 }

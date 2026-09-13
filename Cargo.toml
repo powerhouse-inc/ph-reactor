@@ -62,6 +62,9 @@ libp2p = { version = "0.56", default-features = false, features = [
   "ed25519",
   "request-response",
   "macros",
+  "identify",
+  "kad",
+  "relay",
 ] }
 
 [features]

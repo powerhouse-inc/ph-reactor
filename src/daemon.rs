@@ -178,13 +178,20 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         .token_env
         .as_deref()
         .and_then(|n| std::env::var(n).ok())
-        .filter(|s| !s.is_empty());
+    .filter(|s| !s.is_empty());
+    let bootstraps: Vec<(PeerId, Multiaddr)> = config
+        .p2p
+        .bootstraps
+        .iter()
+        .filter_map(|s| crate::p2p::parse_bootstrap(s))
+        .collect();
     let engine = SyncEngine::new(
         &kp,
         store.clone(),
         &config.instance.name,
         listen,
         config.p2p.mdns,
+        config.p2p.dht,
         token,
         eng_cmd_rx,
         evt_tx,
@@ -193,6 +200,11 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     let mut engine_task = tokio::spawn(async move {
         engine.run().await;
     });
+    // Seed the DHT with the configured bootstrap peers once the engine is up.
+    if !bootstraps.is_empty() {
+        let _ = eng_cmd_tx
+            .send(EngineCommand::DhtBootstrap { peers: bootstraps });
+    }
 
     // Channels: status fan-out and the single-writer command channel
     // (tray + settings + CLI all send here).
@@ -387,6 +399,19 @@ fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
                 Some(n) => format!("doc updated: {n}"),
                 None => "remote doc change".into(),
             });
+        }
+        EngineEvent::DhtBootstrap(ok) => {
+            ctx.last_event = Some(if ok {
+                "dht: bootstrap complete".into()
+            } else {
+                "dht: bootstrap failed".into()
+            });
+            tracing::info!(ok, "engine: dht bootstrap");
+        }
+        EngineEvent::DhtProvider { key, peer } => {
+            let _ = &key; // the key is the doc id; the daemon dials `peer` to fetch it
+            ctx.last_event = Some(format!("dht: {peer} provides a doc"));
+            tracing::info!(%peer, "engine: dht provider discovered");
         }
     }
 }

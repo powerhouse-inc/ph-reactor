@@ -25,6 +25,8 @@ use std::time::Duration;
 
 use futures_util::StreamExt;
 use libp2p::gossipsub;
+use libp2p::identify;
+use libp2p::kad;
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::behaviour::toggle::Toggle;
@@ -94,6 +96,22 @@ fn set_perms_0600(path: &std::path::Path) {
 pub fn peer_id_of(kp: &Keypair) -> PeerId {
     kp.public().to_peer_id()
 }
+/// Parses a bootstrap multiaddr (`/ip4/…/tcp/…/p2p/<peer-id>`) into the
+/// peer id and the dial address (the multiaddr without its `/p2p` tail).
+pub fn parse_bootstrap(s: &str) -> Option<(PeerId, Multiaddr)> {
+    let full: Multiaddr = s.parse().ok()?;
+    let mut peer_id = None;
+    let mut base = Vec::new();
+    for proto in full.iter() {
+        match proto {
+            libp2p::multiaddr::Protocol::P2p(pid) => peer_id = Some(pid),
+            other => base.push(other),
+        }
+    }
+    let peer_id = peer_id?;
+    let addr = base.into_iter().collect::<Multiaddr>();
+    Some((peer_id, addr))
+}
 
 /// The 32-byte raw ed25519 public key of the identity.
 pub fn public_key_bytes(kp: &Keypair) -> Result<[u8; 32], String> {
@@ -126,6 +144,12 @@ pub enum EngineCommand {
     SetPaused { name: String, paused: bool },
     /// Force a re-sync: immediate catch-up tick.
     Resync { name: String },
+    /// Bootstrap the DHT: seed the routing table from these peers.
+    DhtBootstrap { peers: Vec<(PeerId, Multiaddr)> },
+    /// Publish a provider record: this node provides the doc.
+    PublishProvider { name: String, doc: DocId },
+    /// Query the DHT for providers of a key (doc id bytes).
+    FindProviders { key: Vec<u8> },
     /// Shut the engine down (drain and return).
     Shutdown,
 }
@@ -143,6 +167,10 @@ pub enum EngineEvent {
     },
     /// A doc changed (applied locally or received remotely).
     DocChanged { name: Option<String> },
+    /// The DHT bootstrap finished (`true` = succeeded, `false` = failed).
+    DhtBootstrap(bool),
+    /// The DHT reported a provider for a key (doc id bytes).
+    DhtProvider { key: Vec<u8>, peer: PeerId },
 }
 
 // ---------------------------------------------------------------------------
@@ -196,10 +224,12 @@ struct SyncBehaviour {
     gossipsub: gossipsub::Behaviour,
     sync: request_response::Behaviour<SyncCodec>,
     mdns: Toggle<mdns::tokio::Behaviour>,
+    identify: identify::Behaviour,
+    kad: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
 }
 
 impl SyncBehaviour {
-    fn new(key: &Keypair, mdns_enabled: bool) -> anyhow::Result<Self> {
+    fn new(key: &Keypair, mdns_enabled: bool, dht_enabled: bool) -> anyhow::Result<Self> {
         let peer_id = peer_id_of(key);
 
         let config = gossipsub::ConfigBuilder::default()
@@ -222,10 +252,34 @@ impl SyncBehaviour {
             .map_err(anyhow::Error::from)?;
         let mdns = Toggle::from(if mdns_enabled { Some(mdns) } else { None });
 
+        // Identify: advertises our protocols and listen addresses to
+        // connected peers; the DHT consumes the received addresses for
+        // routing (`kad.add_address`).
+        let id_cfg = identify::Config::new("1.0.0".to_string(), key.public())
+            .with_agent_version("ph-reactor/1.0.0".to_string());
+        let identify = identify::Behaviour::new(id_cfg);
+
+        // Kademlia: peer routing + provider records. `dht: false` -> the
+        // behaviour is absent (not advertised), so the node is truly off
+        // the DHT.
+        let kad = if dht_enabled {
+            let mut cfg = kad::Config::new(kad::PROTOCOL_NAME);
+            cfg.set_query_timeout(Duration::from_secs(30));
+            let store = kad::store::MemoryStore::new(peer_id);
+            let mut kad = kad::Behaviour::with_config(peer_id, store, cfg);
+            kad.set_mode(Some(kad::Mode::Server));
+            Some(kad)
+        } else {
+            None
+        };
+        let kad = Toggle::from(kad);
+
         Ok(Self {
             gossipsub,
             sync,
             mdns,
+            identify,
+            kad,
         })
     }
 }
@@ -240,13 +294,14 @@ impl SyncEngine {
         pub_name: &str,
         listen: Multiaddr,
         mdns_enabled: bool,
+        dht_enabled: bool,
         token: Option<String>,
         cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
         evt_tx: mpsc::UnboundedSender<EngineEvent>,
     ) -> anyhow::Result<Self> {
         let peer_id = peer_id_of(key);
 
-        let behaviour = SyncBehaviour::new(key, mdns_enabled)?;
+        let behaviour = SyncBehaviour::new(key, mdns_enabled, dht_enabled)?;
         let swarm = SwarmBuilder::with_existing_identity(key.clone())
             .with_tokio()
             .with_tcp(
@@ -422,6 +477,37 @@ impl SyncEngine {
                     }
                 }
             }
+            EngineCommand::DhtBootstrap { peers } => {
+                // Seed the swarm's dialer with the bootstrap peers first
+                // (no kad borrow yet), then hand them to the DHT.
+                for (peer, addr) in &peers {
+                    self.swarm.add_peer_address(*peer, addr.clone());
+                }
+                if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                    for (peer, addr) in &peers {
+                        kad.add_address(peer, addr.clone());
+                    }
+                    if peers.is_empty() {
+                        tracing::debug!("dht: no bootstrap peers, skipping");
+                    } else {
+                        let _ = kad.bootstrap();
+                        tracing::info!("dht: bootstrap initiated");
+                    }
+                }
+            }
+            EngineCommand::PublishProvider { name, doc } => {
+                if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                    let key = kad::RecordKey::new(&doc.to_string());
+                    let _ = kad.start_providing(key);
+                    tracing::info!(%doc, %name, "dht: published provider record");
+                }
+            }
+            EngineCommand::FindProviders { key } => {
+                if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                    let rk = kad::RecordKey::new(&key);
+                    let _ = kad.get_providers(rk);
+                }
+            }
             EngineCommand::Shutdown => {
                 self.running = false;
             }
@@ -580,6 +666,49 @@ impl SyncEngine {
                     }
                 }
                 SyncBehaviourEvent::Mdns(_) => {}
+                // Identify -> DHT: feed the routing table with the
+                // addresses each peer advertises so it can be reached.
+                SyncBehaviourEvent::Identify(identify::Event::Received {
+                    peer_id,
+                    info,
+                    ..
+                }) => {
+                    if let Some(kad) = self.swarm.behaviour_mut().kad.as_mut() {
+                        for addr in &info.listen_addrs {
+                            kad.add_address(&peer_id, addr.clone());
+                        }
+                    }
+                }
+                SyncBehaviourEvent::Identify(_) => {}
+                SyncBehaviourEvent::Kad(kad::Event::OutboundQueryProgressed { result, .. }) => {
+                    match result {
+                        kad::QueryResult::Bootstrap(Ok(_)) => {
+                            let _ = self.evt_tx.send(EngineEvent::DhtBootstrap(true));
+                        }
+                        kad::QueryResult::Bootstrap(Err(e)) => {
+                            tracing::debug!("dht bootstrap failed: {e:?}");
+                            let _ = self.evt_tx.send(EngineEvent::DhtBootstrap(false));
+                        }
+                        kad::QueryResult::GetProviders(Ok(kad::GetProvidersOk::FoundProviders {
+                            key,
+                            providers,
+                        })) => {
+                            for peer in providers {
+                                if peer != self.peer_id {
+                                    let _ = self.evt_tx.send(EngineEvent::DhtProvider {
+                                        key: key.to_vec(),
+                                        peer,
+                                    });
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+                SyncBehaviourEvent::Kad(kad::Event::RoutingUpdated { peer, .. }) => {
+                    tracing::debug!("dht: routing table updated for {peer}");
+                }
+                SyncBehaviourEvent::Kad(_) => {}
             },
             _ => {}
         }
