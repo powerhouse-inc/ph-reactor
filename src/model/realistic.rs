@@ -69,6 +69,46 @@ pub fn folder_def() -> serde_json::Value {
     })
 }
 
+/// The JSON definition of the `note@1` model: a plain text "file" — a title
+/// and a body. The default content created straight into a group's drive;
+/// the drive lists its name to the group's members.
+pub fn note_def() -> serde_json::Value {
+    json!({
+        "name": "note",
+        "version": "1",
+        "fields": {
+            "title": "string",
+            "body": "string"
+        },
+        "reducers": {
+            "init": {
+                "payload": {
+                    "name": "string",
+                    "title": "string",
+                    "body": "string"
+                },
+                "writes": {
+                    "__name__": { "set": "$payload.name" },
+                    "title": { "set": "$payload.title" },
+                    "body": { "set": "$payload.body" }
+                },
+                "pre": []
+            },
+            "edit": {
+                "payload": {
+                    "title": "string",
+                    "body": "string"
+                },
+                "writes": {
+                    "title": { "set": "$payload.title" },
+                    "body": { "set": "$payload.body" }
+                },
+                "pre": []
+            }
+        }
+    })
+}
+
 /// The JSON definition of the `project@1` model.
 pub fn project_def() -> serde_json::Value {
     json!({
@@ -300,6 +340,7 @@ pub fn realistic_models() -> Vec<L1> {
         L1::from_def(transaction_def()).expect("the transaction definition is well-formed"),
         L1::from_def(invoice_def()).expect("the invoice definition is well-formed"),
         L1::from_def(folder_def()).expect("the folder definition is well-formed"),
+        L1::from_def(note_def()).expect("the note definition is well-formed"),
     ]
 }
 
