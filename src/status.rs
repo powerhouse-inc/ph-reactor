@@ -31,6 +31,9 @@ pub struct StatusSnapshot {
     /// The native reactor core (the p2p engine + local store).
     pub reactor: ReactorStatus,
     pub drives: Vec<DriveStatusEntry>,
+    /// Banned peer ids (base58): their handshakes are refused.
+    #[serde(default)]
+    pub bans: Vec<String>,
     pub settings: SettingsStatus,
     /// RFC 3339 UTC of the last refresh.
     pub updated_at: String,
@@ -84,6 +87,7 @@ impl StatusSnapshot {
                 last_event: None,
             },
             drives: Vec::new(),
+            bans: Vec::new(),
             settings: SettingsStatus { url: settings_url },
             updated_at: rfc3339_now(),
         }
@@ -179,6 +183,7 @@ mod tests {
                 status: "synced".into(),
                 detail: String::new(),
             }],
+            bans: Vec::new(),
             settings: SettingsStatus {
                 url: "http://127.0.0.1:4002".into(),
             },

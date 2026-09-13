@@ -948,6 +948,7 @@ fn refresh_status(ctx: &Ctx, settings_url: &str) -> StatusSnapshot {
         version: crate::VERSION.to_string(),
         reactor,
         drives,
+        bans: ctx.bans.iter().cloned().collect(),
         settings: status::SettingsStatus {
             url: settings_url.into(),
         },
@@ -2070,6 +2071,7 @@ mod tests {
                 status: "paused".into(),
                 detail: String::new(),
             }],
+            bans: Vec::new(),
             settings: status::SettingsStatus {
                 url: "http://127.0.0.1:4002".into(),
             },

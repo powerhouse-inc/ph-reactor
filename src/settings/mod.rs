@@ -532,6 +532,21 @@ const PAGE: &str = r#"<!doctype html>
     environment variable; they are never stored. Pausing stops syncing but
     keeps the local docs.
   </div>
+
+  <h2 style="font-size:14px; margin:24px 0 8px;">Banned peers</h2>
+  <table>
+    <thead><tr><th>Peer</th><th></th></tr></thead>
+    <tbody id="bans"></tbody>
+  </table>
+  <form class="add" id="banform">
+    <input name="peer" placeholder="peer id to ban (12D3Koo…)" required style="flex:1; min-width:280px">
+    <button type="submit">Ban</button>
+  </form>
+  <div class="hint">
+    A banned peer cannot sync with this vault: its handshakes are refused and
+    syncing stops. A peer is also banned automatically after 3 failed auth
+    attempts within 10 minutes.
+  </div>
 </main>
 <div class="toast" id="toast"></div>
 <script>
@@ -610,6 +625,27 @@ async function refresh() {
       tbody.innerHTML =
         `<tr><td colspan="4" class="detail">no drives configured</td></tr>`;
     }
+    const btbody = $("bans");
+    btbody.innerHTML = "";
+    const bans = s.bans || [];
+    for (const b of bans) {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        `<td class="addr">${esc(b)}</td>` +
+        `<td><button class="danger" data-b="${esc(b)}">unban</button></td>`;
+      tr.querySelector("button").addEventListener("click", async (ev) => {
+        try {
+          await post("/api/unban", { peer: ev.target.dataset.b });
+          toast("unbanned");
+          await refresh();
+        } catch (err) { toast(String(err)); }
+      });
+      btbody.appendChild(tr);
+    }
+    if (!bans.length) {
+      btbody.innerHTML =
+        `<tr><td colspan="2" class="detail">no banned peers</td></tr>`;
+    }
   } catch (e) {
     $("rxstate").textContent = "daemon unreachable";
   }
@@ -627,6 +663,17 @@ $("addform").addEventListener("submit", async (e) => {
     });
     e.target.reset();
     toast("drive added");
+    await refresh();
+  } catch (err) { toast(String(err)); }
+});
+
+$("banform").addEventListener("submit", async (e) => {
+  e.preventDefault();
+  const f = new FormData(e.target);
+  try {
+    await post("/api/ban", { peer: f.get("peer") });
+    e.target.reset();
+    toast("banned");
     await refresh();
   } catch (err) { toast(String(err)); }
 });
