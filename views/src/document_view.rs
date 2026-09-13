@@ -4,9 +4,9 @@
 //! Rust analogue of the TypeScript reactor's `KyselyDocumentView` (which
 //! is the SQL-backed snapshot index with `get`/`findByType`/`exists`).
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
-use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -73,10 +73,7 @@ impl ReadModel for DocumentView {
         // If the doc's model or liveness changed, drop it from the old
         // model's bucket. Owned values are extracted first so the mutable
         // bucket borrow below does not conflict with the id lookup.
-        let prev = g
-            .by_id
-            .get(&id)
-            .map(|p| (p.model.name.clone(), p.deleted));
+        let prev = g.by_id.get(&id).map(|p| (p.model.name.clone(), p.deleted));
         if let Some((prev_model, prev_deleted)) = prev {
             if prev_model != snap.model.name || prev_deleted != snap.deleted {
                 if let Some(list) = g.by_model.get_mut(&prev_model) {
@@ -97,10 +94,7 @@ impl ReadModel for DocumentView {
                 .or_default()
                 .push(id.clone());
             // De-duplicate on re-apply of the same model.
-            g.by_model
-                .get_mut(&snap.model.name)
-                .unwrap()
-                .dedup();
+            g.by_model.get_mut(&snap.model.name).unwrap().dedup();
         } else if let Some(list) = g.by_model.get_mut(&snap.model.name) {
             list.retain(|x| x != &id);
         }
@@ -234,7 +228,10 @@ mod tests {
         assert_eq!(v.count("project"), 1);
         assert_eq!(v.count(""), 3);
 
-        let todo = v.find("task", Some(&DocFilter::new("status", Value::String("todo".into()))));
+        let todo = v.find(
+            "task",
+            Some(&DocFilter::new("status", Value::String("todo".into()))),
+        );
         assert_eq!(todo.len(), 1);
         assert_eq!(todo[0].name, "a");
     }

@@ -5,9 +5,9 @@
 //! (the edge index with `getOutgoing`/`getIncoming`/`findPath`/
 //! `findAncestors`).
 
+use parking_lot::Mutex;
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::path::PathBuf;
-use parking_lot::Mutex;
 
 use serde::{Deserialize, Serialize};
 
@@ -101,7 +101,8 @@ impl ReadModel for RelationshipIndex {
             })
             .collect();
         let tmp = path.with_extension("tmp");
-        let raw = serde_json::to_vec_pretty(&Persisted { edges: flat }).map_err(|e| e.to_string())?;
+        let raw =
+            serde_json::to_vec_pretty(&Persisted { edges: flat }).map_err(|e| e.to_string())?;
         std::fs::write(&tmp, raw).map_err(|e| e.to_string())?;
         std::fs::rename(&tmp, path).map_err(|e| e.to_string())?;
         Ok(())
@@ -118,9 +119,7 @@ impl ReadModel for RelationshipIndex {
         let mut g = self.inner.lock();
         g.clear();
         for (src, fields) in p.edges {
-            let m = g
-                .entry(src)
-                .or_default();
+            let m = g.entry(src).or_default();
             for (f, targets) in fields {
                 m.entry(f).or_default().extend(targets);
             }
@@ -211,7 +210,10 @@ mod tests {
 
     fn decls() -> BTreeMap<(String, String), String> {
         let mut m = BTreeMap::new();
-        m.insert(("task".to_string(), "project".to_string()), "project".to_string());
+        m.insert(
+            ("task".to_string(), "project".to_string()),
+            "project".to_string(),
+        );
         m
     }
 
@@ -245,9 +247,13 @@ mod tests {
     #[test]
     fn path_follows_the_graph() {
         let mut d = decls();
-        d.insert(("project".to_string(), "owner".to_string()), "account".to_string());
+        d.insert(
+            ("project".to_string(), "owner".to_string()),
+            "account".to_string(),
+        );
         let ix = RelationshipIndex::new(d, None);
-        ix.apply(&snap("acc", "account", "currency", "USD")).unwrap();
+        ix.apply(&snap("acc", "account", "currency", "USD"))
+            .unwrap();
         ix.apply(&snap("p", "project", "owner", "acc")).unwrap();
         ix.apply(&snap("t", "task", "project", "p")).unwrap();
         let path = ix.find_path("t", "acc");

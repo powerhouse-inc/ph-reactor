@@ -10,8 +10,8 @@
 //! budget. Changes arrive in the store's apply order, so a processor sees a
 //! doc's changes in sequence.
 
-use std::sync::Arc;
 use parking_lot::Mutex;
+use std::sync::Arc;
 
 use tokio::sync::mpsc;
 

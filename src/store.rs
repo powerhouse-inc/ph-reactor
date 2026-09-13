@@ -26,8 +26,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::Mutex;
-use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
 use tracing::warn;
 
 use crate::action::Action;

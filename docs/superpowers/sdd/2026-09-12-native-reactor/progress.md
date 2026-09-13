@@ -30,6 +30,8 @@ back to the `org.kde.StatusNotifierItem-1000-1` name).
 | 09-13 | 15 Ban lists | done (core) | a local ban list that refuses a peer's handshakes so it cannot sync with the vault. Engine: a `banned: HashSet<PeerId>` (constructor param, `EngineCommand::Ban`/`Unban` mutate it); the handshake is refused at BOTH gates — the dialer (`open_handshake` marks the drive `error "banned by user"` instead of dialing) and the responder (`serve_request` answers an incoming hello from a banned peer with `HelloErr::Banned`, a new `codec` variant with a unit test). Persisted to `bans.json` in the state dir (a `StatePaths::bans_file`; daemon loads it into the engine at startup and re-saves on each Ban/Unban). CLI `ph-reactor ban/unban <peer>` (settings API `/api/ban`, `/api/unban`, one-shot replies) for the future ban UI; a bad peer id is rejected. Regression test `banned_peer_is_refused` (a banned peer that dials the vault gets `HelloErr::Banned`, the drive ends `error`, and no doc crosses the link). The full ban UI and the auto-ban-on-auth-errors part of the user request remain open. |
 | 09-13 | 16 Auto-ban on repeated auth failures | done | the engine counts failed auth (wrong-token) attempts per peer (`auth_failures: (count, last-attempt)`); a peer that hits `AUTH_BAN_AFTER` (3) within `AUTH_BAN_WINDOW` (10 min) is auto-banned — added to the live `banned` set, its drive marked `error: auto-banned …`, and a new `EngineEvent::PeerAutoBanned { peer }` emitted, which the daemon handles by persisting the peer to `bans.json` (so it survives restart like a manual ban). The rejected hello then answers `HelloErr::Banned` instead of `BadToken`. Unit-tested (`auto_ban_after_auth_threshold`: a peer crosses the threshold and is banned; a distinct peer is independent). This is the "auto-ban the offending peer after N failed auth attempts" part of the original request. **Still open:** the ban UI in the settings page. |
 | 09-13 | 17 Ban UI in the settings page | done | the settings page gains a "Banned peers" section: a table of the current ban list with a per-peer **unban** button (POST `/api/unban`) and a "ban a peer" input (POST `/api/ban`), plus a hint that auto-ban fires after 3 failed auth attempts in 10 min. The ban list rides the shared `StatusSnapshot` (a new `bans: Vec<String>` field, `#[serde(default)]` so the `status --json` contract stays backward-compatible) — the daemon already refreshes it every 5 s and the page already polls `/api/status`, so no new polling path. End-to-end verified: ban → the peer appears in `/api/status.bans` and the page section; unban → it clears. **This completes the full ban-lists scope** (manual ban, auto-ban, and the UI). |
+| 09-13 | 18 Read-model layer (`views/`) | done | a new `ph-reactor-views` crate: `DocumentView` (per-model read-model projection — `create`/`update`/`remove` + `index`/`incoming`/`query`), `DocumentModelIndexer` (a `Map<ModelRef, DocumentView>`), and a `SyncCoordinator` that applies a `Sync` event to both the store and the read models. The daemon wires the engine's `Event::Sync` stream into the coordinator (the store is the source of truth; the read models are a projection refreshed per sync, so they lag the store by at most one apply). Unit tests for the projection + index. |
+| 09-13 | 19 Ten-client E2E + full-mesh finding | done | `views/tests/e2e.rs`: ten reactors in one process (90 drives, full mesh, real ed25519 keys, distinct ports). Two peers create a realistic project-management + finance doc set (7 + 2 docs, 4 L1 models with field types, preconditions, and a reverse-index); asserts all ten converge on the same docs and read models and that every read model answers the same queries (2 projects, 2 accounts, 3 tasks, 2 transactions). **Finding:** the initial convergence (the connect-time catch-up) is reliable for all ten, but *ongoing* changes to an already-converged set are lossy in a ten-peer full mesh — a gossip-missing peer can wait a full 30 s reconciliation tick, and non-bootstrap peers (discovered via the DHT, not dialed directly) rely on that lossy path. The two-peer engine test covers the reliable update path. Tightening live convergence for large meshes is the follow-up. |
 
 ## Deviations from the spec
 
@@ -71,12 +73,21 @@ back to the `org.kde.StatusNotifierItem-1000-1` name).
   reproduced in the live E2E, now a regression test.
 
 ## Verification
-- `cargo test`: 79 green (74 in the lib unit suite + the integration
-  suites: two-engine sync, the late-drive-add handshake race, DHT 2-peer
-  provider discovery, invite/join sync, banned-peer refusal, and
-  auto-ban-on-auth-failures).
+- `cargo test -p ph-reactor -p ph-reactor-views`: all green (the lib unit
+  suite + the `ph-reactor-views` read-model/projection/indexer unit suites
+  + the integration suites: two-engine sync, the late-drive-add handshake
+  race, DHT 2-peer provider discovery, invite/join sync, banned-peer
+  refusal, auto-ban-on-auth-failures, and the ten-client E2E).
+- **Ten-client E2E** (`views/tests/e2e.rs`): ten reactors in one process
+  (90 drives, full mesh, real ed25519 keys, distinct ports) converge on a
+  realistic project-management + finance doc set created across two peers;
+  every client's read model answers the same queries. Passes in ~13 s.
 - `cargo clippy --all-targets -- -D warnings`: clean. `cargo fmt --check`:
   clean.
+- Release binary smoke test: `ph-reactor --help`, `status`, and `doctor`
+  against a fresh state dir all pass; `doctor` confirms the session bus is
+  reachable (the StatusNotifierItem tray dependency), the identity key, the
+  doc store, and the listen address.
 - Two-binary E2E (both daemons daemonized, separate state dirs, real
   identities): B `doc add note` → A's `doc get note` shows B's fields;
   A `doc add from-alpha` → B lists both docs; both `status --json`

@@ -52,8 +52,7 @@ async fn spawn_node(tag: &str) -> Node {
     let key = Keypair::generate_ed25519();
     let peer = key.public().to_peer_id();
     let signing = p2p::signing_key(&key).expect("signing key");
-    let store =
-        Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
+    let store = Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
     // Load the realistic models so this peer can reduce their actions.
     for m in realistic_models() {
         store.add_model(Arc::new(m));
@@ -91,10 +90,7 @@ async fn spawn_node(tag: &str) -> Node {
 
     // Read models driven off this store's change feed.
     let view = Arc::new(DocumentView::new(None));
-    let index = Arc::new(RelationshipIndex::new(
-        realistic_relationships(),
-        None,
-    ));
+    let index = Arc::new(RelationshipIndex::new(realistic_relationships(), None));
     let models: Vec<Arc<dyn ReadModel>> = vec![
         Arc::clone(&view) as Arc<dyn ReadModel>,
         Arc::clone(&index) as Arc<dyn ReadModel>,
@@ -129,8 +125,7 @@ async fn wait_docs_all(nodes: &[Node], names: &[&str], timeout: Duration) -> boo
     loop {
         let mut ok = true;
         for n in nodes {
-            let have: HashSet<String> =
-                n.store.list().into_iter().map(|d| d.name).collect();
+            let have: HashSet<String> = n.store.list().into_iter().map(|d| d.name).collect();
             for name in names {
                 if !have.contains(*name) {
                     ok = false;
@@ -258,7 +253,10 @@ async fn ten_clients_converge_and_read_models_answer() {
             }
             nodes[i]
                 .cmd_tx
-                .send(EngineCommand::AddDrive(drive(&format!("peer-{j:02}"), &nodes[j])))
+                .send(EngineCommand::AddDrive(drive(
+                    &format!("peer-{j:02}"),
+                    &nodes[j],
+                )))
                 .unwrap();
         }
     }
@@ -294,7 +292,9 @@ async fn ten_clients_converge_and_read_models_answer() {
 
     // Each node's read model must answer the project-management queries.
     for (i, n) in nodes.iter().enumerate() {
-        let todos = n.query.query("task", Some(DocFilter::new("status", json!("todo"))));
+        let todos = n
+            .query
+            .query("task", Some(DocFilter::new("status", json!("todo"))));
         assert_eq!(
             todos.as_array().map(|a| a.len()),
             Some(2),

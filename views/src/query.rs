@@ -16,7 +16,10 @@ pub struct QueryService {
 }
 
 impl QueryService {
-    pub fn new(view: std::sync::Arc<DocumentView>, index: Option<std::sync::Arc<RelationshipIndex>>) -> Self {
+    pub fn new(
+        view: std::sync::Arc<DocumentView>,
+        index: Option<std::sync::Arc<RelationshipIndex>>,
+    ) -> Self {
         Self { view, index }
     }
 
@@ -51,7 +54,12 @@ impl QueryService {
         let Some(ix) = &self.index else {
             return Value::Array(Vec::new());
         };
-        Value::Array(ix.incoming(target, field).into_iter().map(Value::String).collect())
+        Value::Array(
+            ix.incoming(target, field)
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        )
     }
 }
 

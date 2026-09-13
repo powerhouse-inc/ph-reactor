@@ -209,7 +209,10 @@ pub fn realistic_models() -> Vec<L1> {
 /// reducer knowing anything about querying.
 pub fn realistic_relationships() -> BTreeMap<(String, String), String> {
     let mut m = BTreeMap::new();
-    m.insert(("task".to_string(), "project".to_string()), "project".to_string());
+    m.insert(
+        ("task".to_string(), "project".to_string()),
+        "project".to_string(),
+    );
     m.insert(
         ("transaction".to_string(), "account".to_string()),
         "account".to_string(),
@@ -220,13 +223,16 @@ pub fn realistic_relationships() -> BTreeMap<(String, String), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::doc::ModelRef;
     use crate::model::Model;
 
     #[test]
     fn each_model_reduces_its_init() {
         for def in [project_def(), task_def(), account_def(), transaction_def()] {
-            let name = def.get("name").and_then(|v| v.as_str()).unwrap().to_string();
+            let name = def
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap()
+                .to_string();
             let l1 = L1::from_def(def).unwrap();
             let r = l1.ref_();
             assert_eq!(r.name, name, "{name} model name");
