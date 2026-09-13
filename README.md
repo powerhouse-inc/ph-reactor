@@ -18,7 +18,7 @@ No Node, no npm, no child processes: the daemon *is* the reactor.
 - **Tray**: an `org.kde.StatusNotifierItem` over D-Bus (zbus) with a
   `DBusMenu` — no GTK dependency; headless-safe (no session bus → the
   daemon runs without a tray).
-- **Console**: a client-side-routed control panel (Overview / Drives / Groups / Processors / Documents / Settings) + a JSON API on `127.0.0.1:4002`.
+- **Console**: a client-side-routed control panel (Overview / Documents / Types / Folders / Groups / Settings) with a JSON API — loopback by default, bindable to Tailscale or other hosts.
 
 ## Install
 
@@ -193,34 +193,74 @@ tray; everything else works.
 
 ## Console
 
-`http://127.0.0.1:4002/` (loopback only, no auth by design) serves the
-**reactor console** — a client-side-routed control panel (hash routing,
-no framework, no build step; the HTML/JS/CSS is embedded in the binary).
-The views:
+`http://127.0.0.1:4002/` (loopback by default — set `settings.host` to
+`0.0.0.0` or your Tailscale IP to reach it over the network; there is no
+auth, so the bind address is the security boundary) serves the **reactor
+console** — a client-side-routed control panel (hash routing, no framework,
+no build step; the HTML/JS/CSS is embedded in the binary). The original
+console is still available at `/console`. The v2 views:
 
-- **Overview** — reactor health, a drives summary, the LLM endpoint
-  status, and a recent-activity feed.
-- **Drives** — add / remove / pause / resume / resync drives, each with
-  its live status chip, plus the peer ban list.
-- **Groups** — create a group and manage its members/managers (the
-  two-person rule, with quorum rejections surfaced as friendly errors);
-  see a group's recent signed actions.
-- **Processors** — a live read of the daemon's subsystems (sync engine,
-  document store, settings server, log rotation, status poller).
+- **Overview** — reactor health, peer and document counts, a live
+  **activity feed** of processor fires, and a one-click **reference
+  processor** (an `invoice` whose `status → accepted` runs a command).
 - **Documents** — browse every document (filter by model and
-  `field=value`), open one to read its fields, create a new document.
+  `field=value`), open one to read and edit its fields (a plain field `set`
+  or a model action), and create a new document under a model.
+- **Types** — the registered document models. **Draft a new one from a
+  text description via the LLM**, review the generated JSON definition,
+  register it as an interpreter, and create documents under it.
+- **Folders** — named membership containers over peers (create, add
+  members).
+- **Groups** — signed membership documents enforcing the **two-person
+  quorum** (a change needs two distinct members; one node cannot satisfy it
+  by itself). Create groups, manage members and managers, and read each
+  group's signed activity; quorum failures surface as friendly errors.
+- **Processors** — user-configurable **subscriptions on document changes**:
+  a `ProcessorSpec` picks the models and an optional `field=value`, and a
+  reaction (`run` / `log` / `emit` / `create-doc`). List, edit, remove, and
+  watch each processor's **fire history**.
 - **Settings** — the full config grouped by concern, including the LLM
-  (OpenAI-compatible) endpoint with a **Test connection** button.
+  (OpenAI-compatible) endpoint with a **Test connection** button, and a
+  pause/resume toggle for the whole sync engine.
 
 A theme switch (system / light / dark) persists to `localStorage`. The
-console talks to the JSON API on the same loopback server: `GET
-/api/status`, `GET /api/config`, `GET /api/processors`, `GET
-/api/groups`, `POST /api/groups`, `POST /api/groups/<name>/action`,
-`GET /api/groups/<name>/activity`, `GET /api/docs`, `GET
-/api/docs/<name>`, `POST /api/llm/test`, `POST /api/drives`,
-`POST /api/drives/<name>/pause|resume|resync`, `DELETE
-/api/drives/<name>`, `POST /api/docs`, `POST /api/config` (key/value),
-`POST /api/quit`.
+console talks to the JSON API on the same server. The routes:
+
+```
+  GET     /api/status                      reactor, drives, settings snapshot
+  GET     /api/overview                    peer count, live document count
+  GET     /api/config                      the config document
+  POST    /api/config                      set / replace / pause / resume
+  GET     /api/docs[?model=&field=&value=] list documents
+  GET     /api/docs/<name>                 one document's fields
+  POST    /api/docs                        create a document
+  POST    /api/docs/action                 a field set or a model action
+  GET     /api/query[?model=&filter=]      the read-model query API
+  GET     /api/models                      registered document models
+  POST    /api/models|/api/models/register register a model definition
+  POST    /api/llm/draft-type              LLM: text -> model definition
+  POST    /api/llm/test                    LLM: connectivity check
+  GET     /api/folders                     list folders
+  POST    /api/folders                     create a folder
+  POST    /api/folders/<name>/action       add / remove a folder member
+  GET     /api/groups                      list groups
+  POST    /api/groups                      create a group
+  POST    /api/groups/<name>/action        a signed group action (quorum-checked)
+  GET     /api/groups/<name>/activity      a group's signed actions
+  GET     /api/processors                  list processors
+  POST    /api/processors                  create a processor
+  PUT     /api/processors/<name>           update a processor
+  DELETE  /api/processors/<name>           remove a processor
+  GET     /api/processors/<name>/fires     a processor's fire history
+  POST    /api/drives                      add a drive
+  DELETE  /api/drives/<name>               remove a drive
+  POST    /api/drives/<name>/pause        pause a drive's sync
+  POST    /api/drives/<name>/resume       resume a drive's sync
+  POST    /api/drives/<name>/resync       force a fresh catch-up
+  POST    /api/invite | /api/join         invite / join a vault
+  POST    /api/ban  | /api/unban          ban / unban a peer
+  POST    /api/quit                        shut the daemon down
+```
 
 ## Configuration
 
@@ -258,6 +298,10 @@ console talks to the JSON API on the same loopback server: `GET
   `requires-auth` starts syncing once the token matches on both sides.
 - `paused`: paused drives stop syncing but keep their local mirror;
   resume re-dials and re-catches-up.
+- `settings.host` / `settings.port` — the console bind address and port
+  (default `127.0.0.1:4002`). Set `host` to `0.0.0.0` or your Tailscale IP
+  to open the console to the network — there is no auth, so treat the bind
+  address as the boundary.
 - Edit via `ph-reactor config set <key> <json-value>` or the settings
   page. The daemon adopts config changes on its next poll; process-level
   settings (listen port) apply on restart.
@@ -327,11 +371,63 @@ autostart (the `.desktop` file carries `X-GNOME-Autostart-Enabled=true`).
 
 ## Development
 
-```sh
-cargo test          # unit + in-process two-engine sync (loopback TCP), offline
-cargo clippy --all-targets -- -D warnings
-cargo run --        # foreground daemon against the real state dir
+### Repo layout
+
+```
+ph-reactor/
+  src/               the daemon — one binary plus a lib
+    main.rs          CLI entry point
+    cli.rs           the clap command tree
+    daemon.rs        the daemon: swarm, tick loop, subsystems, settings server
+    store.rs         the event-sourced store (ops, vector clocks, WAL/snapshots)
+    config.rs        config load / validate / hot-reload
+    processor.rs     processors: user subscriptions on doc changes + fire feed
+    doc.rs           document model and op application
+    action.rs        actions (field sets, model actions)
+    p2p/             the libp2p swarm (mod.rs: behaviours; codec.rs; invite.rs)
+    settings/        the axum settings server + the embedded consoles
+      mod.rs         the HTTP/JSON API routes
+      console.html   the original console (served at /console)
+    model/           document models (l1, open, group, realistic seeds)
+    tray/            the StatusNotifierItem tray (D-Bus) + its menu
+    status.rs        the StatusSnapshot (the `status --json` contract)
+    query.rs         the read-model query API
+    paths.rs         the state-dir layout
+    logrotate.rs     size-rotated logging
+  console/v2.html    the v2 console (embedded; served at /)
+  views/             a small lib crate: read-model / document-view / processor types
+  tests/             integration tests (two-engine sync, DHT discovery, invite/join)
+  docs/superpowers/  the spec -> plan -> SDD -> evidence trail (see below)
+  snap/              the snapcraft package definition
+  scripts/install.sh the one-liner installer
 ```
 
-Design: `docs/superpowers/specs/2026-09-12-native-reactor-design.md`;
-plan: `docs/superpowers/plans/2026-09-12-native-reactor.md`.
+### Build, run, test
+
+```sh
+cargo build --release --locked     # the daemon (target/release/ph-reactor)
+cargo run                          # foreground daemon against the real state dir
+cargo test                         # unit + in-process two-engine sync (loopback), offline
+cargo clippy --all-targets -- -D warnings
+```
+
+Run a throwaway instance against a scratch state dir (console on
+`127.0.0.1:4002`): `PH_REACTOR_STATE_DIR=/tmp/ph-dev cargo run`.
+
+### Design and the superpowers workflow
+
+Decisions are recorded under `docs/superpowers/` as a **spec -> plan ->
+SDD (per-task brief/report) -> evidence** trail; new features follow the
+same shape. The daemon's design and plan:
+
+- Design: `docs/superpowers/specs/2026-09-12-native-reactor-design.md`
+- Plan:   `docs/superpowers/plans/2026-09-12-native-reactor.md`
+- The console redesign: `docs/superpowers/specs/2026-09-13-console-v2-design.md`
+
+### Contributing
+
+Work on a `fix/…` or `feat/…` branch, never directly on `main`, and make
+small, self-contained commits. Keep the console framework-free (the
+embedded HTML/JS/CSS loads into the binary as-is) and keep the
+`status --json` contract stable — it is what the companion Omarchy plugin
+(`powerhouse-inc/ph-reactor-omarchy`) parses.
