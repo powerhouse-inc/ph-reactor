@@ -26,6 +26,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use parking_lot::Mutex;
+use tokio::sync::mpsc;
 use serde::{Deserialize, Serialize};
 use tracing::warn;
 
@@ -62,6 +63,22 @@ pub struct DocState {
 
 fn default_model_ref() -> ModelRef {
     open_ref()
+}
+
+/// A notification that a document's state changed: a local or remote
+/// action was applied, or a state was adopted. The read-model layer
+/// subscribes to this feed to maintain derived indexes incrementally.
+#[derive(Debug, Clone)]
+pub struct DocChange {
+    pub doc_id: DocId,
+    pub name: String,
+    /// The model that governs the doc.
+    pub model: ModelRef,
+    pub deleted: bool,
+    /// The resulting full state after the change.
+    pub state: DocState,
+    /// The timestamp of the action that caused the change (ordering key).
+    pub ts: u64,
 }
 
 /// Persisted store metadata: the ts high-water mark (`index.json`).
@@ -146,6 +163,8 @@ struct Entry {
     clock: VecClock,
     deleted: bool,
     log: Vec<Action>,
+    /// The model that wrote the doc (open@1 until an action sets it).
+    model: ModelRef,
 }
 
 impl Entry {
@@ -159,6 +178,7 @@ impl Entry {
             clock: VecClock::default(),
             deleted: false,
             log: Vec::new(),
+            model: open_ref(),
         }
     }
 }
@@ -194,6 +214,8 @@ struct Inner {
     quarantined: u64,
     /// The models this peer knows how to reduce (open@1 by default).
     models: ModelRegistry,
+    /// Read-model subscribers (doc-change feed). Senders are non-blocking.
+    subscribers: Vec<mpsc::UnboundedSender<DocChange>>,
 }
 
 impl Store {
@@ -212,6 +234,7 @@ impl Store {
             outbound: Vec::new(),
             quarantined: 0,
             models: ModelRegistry::seeded_with_builtins(),
+            subscribers: Vec::new(),
         };
         inner
             .known_keys
@@ -231,6 +254,16 @@ impl Store {
     /// The `(name, version)` refs of every loaded model, sorted.
     pub fn model_refs(&self) -> Vec<ModelRef> {
         self.inner.lock().models.refs()
+    }
+
+    /// Subscribe to the doc-change feed: a [`DocChange`] is delivered here
+    /// whenever a document's state changes on this store (a local or remote
+    /// action applied, or a state adopted). The read-model layer consumes
+    /// this to keep its derived indexes current.
+    pub fn subscribe_changes(&self) -> mpsc::UnboundedReceiver<DocChange> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.lock().subscribers.push(tx);
+        rx
     }
 
     pub fn origin(&self) -> String {
@@ -411,7 +444,7 @@ impl Store {
             clock: e.clock.clone(),
             deleted: e.deleted,
             log_hash: e.log.last().map(|a| a.hash()),
-            model: open_ref(),
+            model: e.model.clone(),
         })
     }
 
@@ -420,15 +453,20 @@ impl Store {
     /// the audit trail records the adoption.
     pub fn adopt_state(&self, state: &DocState) -> Result<(), String> {
         let mut inner = self.inner.lock();
-        let entry = inner
-            .entries
-            .entry(state.doc.id)
-            .or_insert_with(|| Entry::new(state.doc.id));
-        entry.doc = state.doc.clone();
-        lift_name(&mut entry.doc);
-        entry.clock = state.clock.clone();
-        entry.deleted = state.deleted;
-        entry.log.clear();
+        {
+            let entry = inner
+                .entries
+                .entry(state.doc.id)
+                .or_insert_with(|| Entry::new(state.doc.id));
+            entry.doc = state.doc.clone();
+            lift_name(&mut entry.doc);
+            entry.clock = state.clock.clone();
+            entry.deleted = state.deleted;
+            entry.model = state.model.clone();
+            entry.log.clear();
+        }
+        let ts = inner.ts_hint;
+        inner.emit_change(state.doc.id, ts);
         Ok(())
     }
 
@@ -502,6 +540,7 @@ impl Store {
                 clock: b.clock.clone(),
                 deleted: b.deleted,
                 log: Vec::new(),
+                model: b.model.clone(),
             },
             None => Entry::new(id),
         };
@@ -716,6 +755,7 @@ impl Inner {
                 clock: state.clock,
                 deleted: state.deleted,
                 log: Vec::new(),
+                model: state.model.clone(),
             },
             None => Entry::new(id),
         };
@@ -874,6 +914,7 @@ impl Inner {
                 return Err(r.describe());
             }
             let (a, d) = apply_ops_to_entry(entry, model.as_ref(), action);
+            entry.model = action.model.clone();
             entry.log.push(action.clone());
             (a, d)
         };
@@ -911,10 +952,50 @@ impl Inner {
                 self.names.insert(name, action.doc_id);
             }
         }
+        if applied_any || deleted {
+            self.emit_change(action.doc_id, action.ts);
+        }
         Ok(ApplyResult {
             applied: applied_any,
             doc_deleted: deleted,
         })
+    }
+
+    /// Publish a doc-change event to every subscriber (non-blocking; dead
+    /// senders are pruned). Called after a successful apply or adoption.
+    fn emit_change(&mut self, doc_id: DocId, ts: u64) {
+        let Some(entry) = self.entries.get(&doc_id) else {
+            return;
+        };
+        let change = DocChange {
+            doc_id,
+            name: entry.doc.name.clone(),
+            model: entry.model.clone(),
+            deleted: entry.deleted,
+            state: DocState {
+                doc: entry.doc.clone(),
+                clock: entry.clock.clone(),
+                deleted: entry.deleted,
+                log_hash: entry.log.last().map(|a| a.hash()),
+                model: entry.model.clone(),
+            },
+            ts,
+        };
+        let mut dead = Vec::new();
+        for (i, tx) in self.subscribers.iter().enumerate() {
+            if tx.send(change.clone()).is_err() {
+                dead.push(i);
+            }
+        }
+        if !dead.is_empty() {
+            let kept = std::mem::take(&mut self.subscribers)
+                .into_iter()
+                .enumerate()
+                .filter(|(i, _)| !dead.contains(i))
+                .map(|(_, s)| s)
+                .collect();
+            self.subscribers = kept;
+        }
     }
 
     /// Quarantine: count it and report; the action is not applied.
