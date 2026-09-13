@@ -18,6 +18,7 @@
 //! commands ([`EngineCommand`]) and events ([`EngineEvent`]).
 
 pub mod codec;
+pub mod invite;
 use std::collections::{HashMap, HashSet};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
@@ -151,6 +152,9 @@ pub enum EngineCommand {
     PublishProvider { name: String, doc: DocId },
     /// Query the DHT for providers of a key (doc id bytes).
     FindProviders { key: Vec<u8> },
+    /// Join a drive by a signed invite: add the drive and attach the
+    /// join-proof to the first hello so the inviter can add a drive back.
+    Join { drive: Drive, accept: invite::InviteAccept },
     /// Shut the engine down (drain and return).
     Shutdown,
 }
@@ -192,8 +196,9 @@ struct DriveRuntime {
     handshaken: bool,
     /// Next proactive catch-up tick.
     next_catch_up: tokio::time::Instant,
-    /// Last time a doc or hello was seen from this drive.
     last_seen: tokio::time::Instant,
+    /// A join-proof to attach to the first hello (set by [`EngineCommand::Join`]).
+    accept: Option<invite::InviteAccept>,
 }
 
 // ---------------------------------------------------------------------------
@@ -382,65 +387,13 @@ impl SyncEngine {
     fn handle_cmd(&mut self, cmd: EngineCommand) {
         match cmd {
             EngineCommand::AddDrive(drive) => {
-                let peer = drive
-                    .addr
-                    .iter()
-                    .find_map(|p| {
-                        if let libp2p::multiaddr::Protocol::P2p(pid) = p {
-                            Some(pid)
-                        } else {
-                            None
-                        }
-                    })
-                    .unwrap_or_else(PeerId::random);
-                let now = tokio::time::Instant::now();
-                let rt = DriveRuntime {
-                    drive: drive.clone(),
-                    peer,
-                    status: if drive.paused {
-                        DriveStatus::Paused
-                    } else {
-                        DriveStatus::Connecting
-                    },
-                    remote_clocks: HashMap::new(),
-                    in_flight: HashSet::new(),
-                    handshaken: false,
-                    next_catch_up: now,
-                    last_seen: now,
-                };
-                let name = rt.drive.name.clone();
-                let is_new = self.drives.insert(name.clone(), rt).is_none();
-                if is_new {
-                    tracing::info!("adding drive '{name}' ({peer})");
-                }
-                if !drive.paused {
-                    // A hello from this peer may have arrived before
-                    // the drive existed: that half-completed the
-                    // handshake (their key is registered), so finish it
-                    // now.
-                    if self.guests.contains(&peer) {
-                        if let Some(rt) = self.drives.get_mut(&name) {
-                            rt.handshaken = true;
-                            rt.last_seen = now;
-                        }
-                        self.set_status(&name, DriveStatus::Connecting, None);
-                    }
-                    // The peer may already be connected (their dial
-                    // reached us before this drive existed, so the
-                    // ConnectionEstablished handshake never fired for
-                    // it): open the handshake on the existing
-                    // connection.
-                    if self.drives.get(&name).is_some_and(|rt| !rt.handshaken)
-                        && self.swarm.is_connected(&peer)
-                    {
-                        self.open_handshake(&name);
-                    }
-                    let _ = self.swarm.dial(
-                        DialOpts::peer_id(peer)
-                            .addresses(vec![drive.addr.clone()])
-                            .build(),
-                    );
-                    self.set_status(&name, DriveStatus::Connecting, Some("dialing".into()));
+                self.add_drive_internal(drive);
+            }
+            EngineCommand::Join { drive, accept } => {
+                let name = drive.name.clone();
+                self.add_drive_internal(drive);
+                if let Some(rt) = self.drives.get_mut(&name) {
+                    rt.accept = Some(accept);
                 }
             }
             EngineCommand::RemoveDrive { name } => {
@@ -521,6 +474,105 @@ impl SyncEngine {
                 self.running = false;
             }
         }
+    }
+
+    /// Shared drive-add logic: register the runtime and start dialing.
+    /// Used by [`EngineCommand::AddDrive`] and [`EngineCommand::Join`].
+    fn add_drive_internal(&mut self, drive: Drive) {
+        let peer = drive
+            .addr
+            .iter()
+            .find_map(|p| {
+                if let libp2p::multiaddr::Protocol::P2p(pid) = p {
+                    Some(pid)
+                } else {
+                    None
+                }
+            })
+            .unwrap_or_else(PeerId::random);
+        let now = tokio::time::Instant::now();
+        let rt = DriveRuntime {
+            drive: drive.clone(),
+            peer,
+            status: if drive.paused {
+                DriveStatus::Paused
+            } else {
+                DriveStatus::Connecting
+            },
+            remote_clocks: HashMap::new(),
+            in_flight: HashSet::new(),
+            handshaken: false,
+            next_catch_up: now,
+            last_seen: now,
+            accept: None,
+        };
+        let name = rt.drive.name.clone();
+        let is_new = self.drives.insert(name.clone(), rt).is_none();
+        if is_new {
+            tracing::info!("adding drive '{name}' ({peer})");
+        }
+        if !drive.paused {
+            // A hello from this peer may have arrived before the drive
+            // existed: that half-completed the handshake (their key is
+            // registered), so finish it now.
+            if self.guests.contains(&peer) {
+                if let Some(rt) = self.drives.get_mut(&name) {
+                    rt.handshaken = true;
+                    rt.last_seen = now;
+                }
+                self.set_status(&name, DriveStatus::Connecting, None);
+            }
+            // The peer may already be connected (their dial reached us
+            // before this drive existed, so the ConnectionEstablished
+            // handshake never fired for it): open the handshake on the
+            // existing connection.
+            if self.drives.get(&name).is_some_and(|rt| !rt.handshaken)
+                && self.swarm.is_connected(&peer)
+            {
+                self.open_handshake(&name);
+            }
+            let _ = self.swarm.dial(
+                DialOpts::peer_id(peer)
+                    .addresses(vec![drive.addr.clone()])
+                    .build(),
+            );
+            self.set_status(&name, DriveStatus::Connecting, Some("dialing".into()));
+        }
+    }
+
+    /// Verify a join-proof and add a drive for the joiner so the pair can
+    /// sync. The proof is signed by the joiner's key (pinned via TOFU) and
+    /// echoes the invite's nonce; on success a drive named after the
+    /// joiner is added, addressed by the transport-verified connection peer.
+    fn handle_invite_accept(&mut self, peer: PeerId, accept: invite::InviteAccept) {
+        if accept.verify().is_err() {
+            tracing::warn!(%peer, "invite proof failed verification; ignoring");
+            return;
+        }
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&accept.pubkey);
+        if self.store.register_peer_key(&accept.peer_id, key_arr).is_err() {
+            tracing::warn!(%peer, "invite proof key mismatch (TOFU); not adding a drive");
+            return;
+        }
+        let short = peer.to_base58();
+        let name = format!("{} ({})", accept.name, &short[..short.len().min(12)]);
+        let addr = match format!("/p2p/{short}").parse::<Multiaddr>() {
+            Ok(a) => a,
+            Err(e) => {
+                tracing::warn!(%peer, "bad joiner addr {e}; not adding a drive");
+                return;
+            }
+        };
+        let drive = Drive {
+            name,
+            addr,
+            token_env: None,
+            paused: false,
+            available_offline: true,
+        };
+        tracing::info!(%peer, "join proof accepted; adding a drive for the joiner");
+        self.add_drive_internal(drive);
     }
 
     fn set_status(&self, name: &str, status: DriveStatus, detail: Option<String>) {
@@ -790,7 +842,7 @@ impl SyncEngine {
         channel: request_response::ResponseChannel<SyncMsg>,
     ) {
         match request {
-            SyncMsg::Hello(h) => {
+            SyncMsg::Hello(mut h) => {
                 // Version gate.
                 if h.version != PROTOCOL_VERSION {
                     let _ = self.swarm.behaviour_mut().sync.send_response(
@@ -801,6 +853,12 @@ impl SyncEngine {
                         }),
                     );
                     return;
+                }
+                // A joiner proves it holds a valid invite: verify the proof
+                // and add a drive for it so the two can sync (the proof
+                // carries the joiner's name, key, and the echoed nonce).
+                if let Some(accept) = h.accept.take() {
+                    self.handle_invite_accept(peer, accept);
                 }
                 // Token gate: if we require one, the hello must carry it.
                 if let Some(need) = &self.token {
@@ -1101,6 +1159,7 @@ impl SyncEngine {
             return;
         }
         let peer = self.drives.get(name).unwrap().peer;
+        let accept = self.drives.get_mut(name).and_then(|rt| rt.accept.take());
         let pubkey = self.store.key().verifying_key().to_bytes();
         let hello = Hello {
             version: PROTOCOL_VERSION,
@@ -1108,6 +1167,7 @@ impl SyncEngine {
             peer_id: self.peer_id.to_base58(),
             pubkey: hex::encode(pubkey),
             token: self.token.clone(),
+            accept,
         };
         let _ = self
             .swarm

@@ -50,6 +50,10 @@ pub struct Hello {
     pub pubkey: String,
     /// Optional shared secret (value, not env name).
     pub token: Option<String>,
+    /// Optional join-proof (set by the joiner when joining an invite):
+    /// proves it holds a valid invite so the inviter can add a drive back.
+    #[serde(default)]
+    pub accept: Option<crate::p2p::invite::InviteAccept>,
 }
 
 /// Successful handshake reply.
@@ -256,6 +260,7 @@ mod tests {
             peer_id: "12D34".into(),
             pubkey: "00".repeat(32),
             token: Some("s3cret".into()),
+            accept: None,
         });
         let cases = vec![
             msg,
