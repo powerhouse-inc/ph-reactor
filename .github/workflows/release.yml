@@ -21,12 +21,18 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Install Rust (stable, musl target)
+      - name: Install Rust (stable, musl target) + the musl C toolchain
         run: |
           rustup toolchain install stable
           rustup target add x86_64-unknown-linux-musl
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
 
       - name: Build
+        env:
+          # cc-rs builds a C dependency (ring) for the musl target; point it
+          # at musl-gcc (from musl-tools) so the binary stays fully static.
+          CC_x86_64_unknown_linux_musl: musl-gcc
         run: |
           cargo build --release --target x86_64-unknown-linux-musl
           mkdir -p dist

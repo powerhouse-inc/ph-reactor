@@ -1,15 +1,17 @@
 name: ph-reactor
 base: core24
-version: "0.1.0"
-summary: Local Powerhouse switchboard with a tray icon
+version: "1.0.0"
+summary: Local Powerhouse reactor with a tray icon
 description: |
-  Runs a Powerhouse switchboard in the background. On first run it
-  bootstraps a private Node.js runtime and the @powerhousedao/switchboard
-  package, then keeps a remote knowledge-vault drive (e.g. the
-  powerhouse-knowledge vault) mirrored locally. A status-bar tray icon
-  (StatusNotifierItem) shows switchboard and drive state; the menu and the
-  local settings page (http://127.0.0.1:4002/) configure drives. All state
-  lives under $SNAP_USER_DATA/ph-reactor (~/.ph/reactor outside the snap).
+  Runs the Powerhouse reactor in the background: a single native Rust
+  process that keeps remote knowledge-vault drives (e.g. the
+  powerhouse-knowledge vault) mirrored locally over a libp2p p2p mesh
+  (gossip + catch-up), with no separate Node.js runtime. A status-bar tray
+  icon (StatusNotifierItem) shows reactor and drive state; the menu and the
+  local settings page (http://127.0.0.1:4002/) configure drives — including
+  joining a vault with a one-shot signed invite (ph-reactor invite / join).
+  All state lives under $SNAP_USER_DATA/ph-reactor
+  (~/.ph/reactor outside the snap).
 grade: stable
 confinement: strict
 

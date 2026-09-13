@@ -231,10 +231,13 @@ are happy with the new instance.
 
 ## Build the snap
 
-From the repository root, on an Ubuntu host with `snapcraft` (LXD):
+From the repository root, on an Ubuntu host with `snapcraft` (LXD) and
+`musl-tools` (a transitive C dependency builds under `musl-gcc`; `apt
+install musl-tools`):
 
 ```sh
-cargo build --release --target x86_64-unknown-linux-musl
+CC_x86_64_unknown_linux_musl=musl-gcc \
+  cargo build --release --target x86_64-unknown-linux-musl
 mkdir -p dist && cp target/x86_64-unknown-linux-musl/release/ph-reactor dist/
 snapcraft --use-lxd        # produces ph-reactor_1.0.0_amd64.snap
 ```
