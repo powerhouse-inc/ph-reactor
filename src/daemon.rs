@@ -183,8 +183,8 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     // the realistic models so the console can create docs under them. The
     // built-in `open@1` + `group@1` come from `Store::open`.
     let store = {
-        let store =
-            Store::open(&paths.docs_dir, &signing, &peer_id.to_base58()).map_err(anyhow::Error::msg)?;
+        let store = Store::open(&paths.docs_dir, &signing, &peer_id.to_base58())
+            .map_err(anyhow::Error::msg)?;
         for m in crate::model::realistic::realistic_models() {
             store.add_model(Arc::new(m));
         }
@@ -303,6 +303,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         reactor_healthy: false,
         last_event: None,
         last_doc: None,
+        pending_invites: HashMap::new(),
         stopping: false,
     };
 
@@ -423,6 +424,10 @@ struct Ctx {
     last_event: Option<String>,
     /// The most recently applied or changed document name.
     last_doc: Option<String>,
+    /// Pending invite grants: the invite's nonce -> the groups a joiner is
+    /// granted. Recorded when an invite is minted, applied (then removed)
+    /// when its join-proof is accepted.
+    pending_invites: HashMap<Vec<u8>, Vec<String>>,
     /// Set on shutdown signals / Quit; ends the loop.
     stopping: bool,
 }
@@ -497,6 +502,43 @@ fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
                     tracing::info!("persisted a joined drive: {name}");
                 }
             }
+        }
+        EngineEvent::InviteAccepted { peer, nonce } => {
+            let joiner = peer.to_base58();
+            let Some(groups) = ctx.pending_invites.remove(&nonce) else {
+                ctx.last_event = Some(format!(
+                    "a peer joined ({joiner}) but no invite grant was recorded for its nonce"
+                ));
+                tracing::info!(%peer, "invite accepted; no pending grant for its nonce");
+                return;
+            };
+            let model = match crate::doc::ModelRef::parse("group@1") {
+                Ok(m) => m,
+                Err(e) => {
+                    ctx.last_event = Some(format!("bad group model ref: {e}"));
+                    return;
+                }
+            };
+            let mut applied = 0usize;
+            for g in &groups {
+                match ctx.store.apply_local_action(
+                    g,
+                    &model,
+                    "add-member",
+                    &serde_json::json!({ "member": joiner.clone() }),
+                ) {
+                    Ok(_) => {
+                        applied += 1;
+                        tracing::info!(%peer, group = %g, "grant: added joiner to the group");
+                    }
+                    Err(e) => {
+                        tracing::warn!(%peer, group = %g, "grant: could not add joiner to group: {e}");
+                    }
+                }
+            }
+            ctx.last_event = Some(format!(
+                "granted {applied} group(s) to {joiner} on invite join"
+            ));
         }
         EngineEvent::PeerAutoBanned { peer } => {
             if ctx.bans.insert(peer.clone()) {
@@ -701,6 +743,7 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
             } else {
                 groups
             };
+            let grant_groups = groups.clone();
             let signing = ctx.store.key();
             match crate::p2p::invite::InviteToken::make(
                 &ctx.config.instance.name,
@@ -711,6 +754,11 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
             ) {
                 Ok(token) => match token.encode() {
                     Ok(s) => {
+                        if ctx.pending_invites.len() > 256 {
+                            ctx.pending_invites.clear();
+                        }
+                        ctx.pending_invites
+                            .insert(token.nonce.clone(), grant_groups);
                         ctx.last_event = Some("generated an invite".into());
                         let _ = reply.send(Ok(s));
                     }
