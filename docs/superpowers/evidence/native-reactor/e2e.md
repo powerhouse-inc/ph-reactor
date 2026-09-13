@@ -152,10 +152,42 @@ both daemonized. Steps, in order:
 The handshake race this run exposed is bug 7 above; the daemonize
 failure behind the earlier "hangs" is bug 6.
 
+## Invite/join: join a vault with a signed string (2026-09-13)
+
+`ph-reactor invite` (inviter) prints a signed, shareable token
+(`base64(JSON)`) binding the inviter's instance name, peer id, ed25519
+public key, resolved listen address, a 16-byte challenge nonce, and the
+granted groups, with an ed25519 signature over all of it. `ph-reactor
+join <token>` (joiner) verifies it, pins the inviter's key (TOFU), adds a
+drive addressed `/ip4/…/tcp/…/p2p/<inviter-peer>`, and attaches a signed
+join-proof (echoing the nonce) to the first hello; the inviter verifies
+that proof, pins the joiner, and adds a drive back. No pre-shared
+multiaddr is needed; a tampered or forged token fails the signature
+check, and a key change on a pinned peer is refused.
+
+Proven with two daemonized instances (no pre-configured drives):
+
+- alpha `invite` -> printed a 540-char token (`addr=/ip4/127.0.0.1/tcp/4399`,
+  `groups=["reactor"]`, signed).
+- beta `join <token>` -> drive added and the inviter pinned.
+- alpha `doc add shared-note` -> beta `doc get shared-note` returned it
+  within ~9 s (beta reached `synced`).
+- beta `doc add beta-note` -> alpha `doc get beta-note` returned it
+  (bidirectional).
+- After convergence, `drive list` shows the peer on BOTH sides; the
+  inviter's copy is persisted to its config (survives a restart) via the
+  engine's `DriveJoined` event.
+
+Security properties are covered by `tests/invite_join.rs` (full E2E:
+invite, join, both sides `Synced`, doc propagation, clean shutdown) and
+the unit tests in `p2p/invite.rs` (forged proof rejected by `verify()`,
+nonce binding, TOFU key mismatch).
+
 ## Suites
 
-- `cargo test`: 44 unit + 2 integration — all pass.
-- `cargo clippy --all-targets -- -D warnings` — clean; `cargo fmt --check` — clean.
+- `cargo test`: 73 unit + 4 integration (`dht_discovery`, `invite_join`,
+  `two_engine_sync`) — all pass.
+- `cargo clippy --all-targets` — clean.
 
 ## Not verified here (deferred)
 
