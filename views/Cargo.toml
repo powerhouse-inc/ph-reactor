@@ -27,3 +27,18 @@ hex = "0.4"
 [dev-dependencies]
 tempfile = "3"
 ed25519-dalek = "2"
+libp2p = { version = "0.56", default-features = false, features = [
+  "tokio",
+  "tcp",
+  "noise",
+  "yamux",
+  "gossipsub",
+  "mdns",
+  "ed25519",
+  "request-response",
+  "macros",
+  "identify",
+  "kad",
+  "relay",
+] }
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
