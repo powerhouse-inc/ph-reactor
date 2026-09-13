@@ -1,0 +1,789 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Reactor</title>
+<style>
+  :root {
+    --bg: #070a12;
+    --bg-2: #0b0f1c;
+    --panel: rgba(20, 27, 45, 0.66);
+    --panel-2: rgba(28, 36, 60, 0.55);
+    --line: rgba(120, 140, 200, 0.16);
+    --line-2: rgba(120, 140, 200, 0.30);
+    --text: #e6ecff;
+    --muted: #8b95b5;
+    --dim: #5b6488;
+    --cyan: #38e1ff;
+    --violet: #a78bfa;
+    --green: #43e0a0;
+    --amber: #ffc46b;
+    --red: #ff6b81;
+    --glow-cyan: 0 0 22px rgba(56, 225, 255, 0.35);
+    --glow-violet: 0 0 22px rgba(167, 139, 250, 0.35);
+    --mono: ui-monospace, "SF Mono", "JetBrains Mono", Menlo, Consolas, monospace;
+    --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    background:
+      radial-gradient(1200px 700px at 78% -10%, rgba(56, 225, 255, 0.10), transparent 60%),
+      radial-gradient(1000px 700px at 8% 108%, rgba(167, 139, 250, 0.12), transparent 55%),
+      var(--bg);
+    color: var(--text);
+    font-family: var(--sans);
+    font-size: 14px;
+    line-height: 1.5;
+    overflow: hidden;
+  }
+  ::-webkit-scrollbar { width: 10px; height: 10px; }
+  ::-webkit-scrollbar-thumb { background: rgba(120,140,200,0.25); border-radius: 8px; }
+  ::-webkit-scrollbar-track { background: transparent; }
+  button { font-family: inherit; }
+
+  .shell { display: grid; grid-template-columns: 232px 1fr; height: 100vh; }
+
+  /* ---- sidebar ---- */
+  .sidebar {
+    background: linear-gradient(180deg, var(--bg-2), var(--bg));
+    border-right: 1px solid var(--line);
+    display: flex; flex-direction: column;
+    padding: 18px 14px;
+    gap: 4px;
+  }
+  .brand {
+    display: flex; align-items: center; gap: 10px;
+    padding: 6px 10px 18px;
+  }
+  .brand .logo {
+    width: 30px; height: 30px; border-radius: 9px;
+    background: linear-gradient(135deg, var(--cyan), var(--violet));
+    display: grid; place-items: center;
+    font-weight: 800; color: #04121a; font-size: 15px;
+    box-shadow: var(--glow-cyan);
+  }
+  .brand .name { font-weight: 700; letter-spacing: 0.04em; font-size: 15px; }
+  .brand .name small { display: block; font-weight: 500; color: var(--dim); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; }
+  .nav-item {
+    display: flex; align-items: center; gap: 11px;
+    padding: 9px 12px; border-radius: 10px; cursor: pointer;
+    color: var(--muted); font-weight: 500; border: 1px solid transparent;
+    transition: all 0.16s ease; user-select: none;
+  }
+  .nav-item .ico { width: 18px; text-align: center; font-size: 15px; opacity: 0.9; }
+  .nav-item:hover { background: rgba(120,140,200,0.07); color: var(--text); }
+  .nav-item.active {
+    background: linear-gradient(90deg, rgba(56,225,255,0.12), rgba(167,139,250,0.08));
+    border-color: var(--line-2); color: var(--text);
+  }
+  .nav-item.active .ico { color: var(--cyan); }
+  .sidebar .foot { margin-top: auto; padding: 10px 12px; font-size: 11px; color: var(--dim); }
+  .sidebar .foot .row { display: flex; justify-content: space-between; }
+
+  /* ---- content ---- */
+  .content { overflow-y: auto; padding: 22px 26px 40px; }
+  .content-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
+  .content-head h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0.01em; }
+  .content-head .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
+  .view { display: none; animation: fade 0.28s ease; }
+  .view.on { display: block; }
+  @keyframes fade { from { opacity: 0; transform: translateY(6px); } to { opacity: 1; transform: none; } }
+
+  /* ---- shared bits ---- */
+  .card {
+    background: var(--panel); border: 1px solid var(--line);
+    border-radius: 14px; padding: 16px;
+    backdrop-filter: blur(8px);
+    transition: border-color 0.18s ease, box-shadow 0.18s ease, transform 0.18s ease;
+  }
+  .card.hov:hover { border-color: var(--line-2); box-shadow: var(--glow-cyan); transform: translateY(-1px); }
+  .card h3 { margin: 0 0 12px; font-size: 13px; letter-spacing: 0.12em; text-transform: uppercase; color: var(--muted); font-weight: 600; }
+  .grid { display: grid; gap: 14px; }
+  .g2 { grid-template-columns: 1fr 1fr; }
+  .g3 { grid-template-columns: repeat(3, 1fr); }
+  .g-2fr { grid-template-columns: 1.4fr 1fr; }
+
+  .btn {
+    background: linear-gradient(135deg, rgba(56,225,255,0.16), rgba(167,139,250,0.16));
+    border: 1px solid var(--line-2); color: var(--text);
+    padding: 8px 14px; border-radius: 10px; cursor: pointer;
+    font-weight: 600; font-size: 13px; transition: all 0.15s ease;
+  }
+  .btn:hover { box-shadow: var(--glow-cyan); border-color: var(--cyan); }
+  .btn.primary { background: linear-gradient(135deg, var(--cyan), var(--violet)); color: #04121a; border: none; }
+  .btn.primary:hover { box-shadow: var(--glow-violet); filter: brightness(1.08); }
+  .btn.ghost { background: transparent; border-color: var(--line); color: var(--muted); }
+  .btn.ghost:hover { color: var(--text); border-color: var(--line-2); box-shadow: none; }
+  .btn.danger:hover { border-color: var(--red); color: var(--red); box-shadow: 0 0 18px rgba(255,107,129,0.3); }
+  .btn.sm { padding: 5px 10px; font-size: 12px; border-radius: 8px; }
+
+  input, select, textarea {
+    background: var(--bg-2); border: 1px solid var(--line); color: var(--text);
+    padding: 9px 11px; border-radius: 9px; font-family: var(--sans); font-size: 13px;
+    width: 100%; outline: none; transition: border-color 0.15s ease, box-shadow 0.15s ease;
+  }
+  textarea.mono { font-family: var(--mono); font-size: 12px; line-height: 1.5; resize: vertical; }
+  input:focus, select:focus, textarea:focus { border-color: var(--cyan); box-shadow: 0 0 0 3px rgba(56,225,255,0.12); }
+  label.field { display: block; margin-bottom: 12px; }
+  label.field span { display: block; font-size: 11px; color: var(--muted); margin-bottom: 6px; letter-spacing: 0.04em; }
+  .field-row { display: flex; gap: 10px; }
+  .field-row > * { flex: 1; }
+
+  .badge { display: inline-flex; align-items: center; gap: 5px; padding: 3px 9px; border-radius: 20px; font-size: 11px; font-weight: 600; letter-spacing: 0.03em; }
+  .badge .dot { width: 6px; height: 6px; border-radius: 50%; }
+  .b-green { background: rgba(67,224,160,0.12); color: var(--green); } .b-green .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
+  .b-cyan { background: rgba(56,225,255,0.12); color: var(--cyan); } .b-cyan .dot { background: var(--cyan); }
+  .b-violet { background: rgba(167,139,250,0.14); color: var(--violet); } .b-violet .dot { background: var(--violet); }
+  .b-amber { background: rgba(255,196,107,0.12); color: var(--amber); } .b-amber .dot { background: var(--amber); }
+  .b-dim { background: rgba(120,140,200,0.10); color: var(--muted); }
+  .b-red { background: rgba(255,107,129,0.12); color: var(--red); } .b-red .dot { background: var(--red); }
+
+  .table { width: 100%; border-collapse: collapse; }
+  .table th { text-align: left; font-size: 11px; color: var(--dim); letter-spacing: 0.08em; text-transform: uppercase; font-weight: 600; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  .table td { padding: 10px; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .table tr:last-child td { border-bottom: none; }
+  .table tr.rowclick { cursor: pointer; }
+  .table tr.rowclick:hover td { background: rgba(120,140,200,0.05); }
+  .mono { font-family: var(--mono); }
+  .muted { color: var(--muted); }
+  .dim { color: var(--dim); }
+  .code { font-family: var(--mono); font-size: 12px; background: var(--bg-2); border: 1px solid var(--line); border-radius: 7px; padding: 2px 6px; color: var(--cyan); }
+
+  .dot-live { width: 8px; height: 8px; border-radius: 50%; background: var(--green); box-shadow: 0 0 10px var(--green); animation: pulse 1.8s infinite; }
+  @keyframes pulse { 0%,100% { opacity: 1; } 50% { opacity: 0.35; } }
+  .dot-off { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
+
+  /* terminal feed */
+  .term {
+    background: #04060c; border: 1px solid var(--line); border-radius: 12px;
+    font-family: var(--mono); font-size: 12.5px; line-height: 1.7;
+    height: 460px; overflow-y: auto; padding: 14px 16px;
+  }
+  .term .line { white-space: pre-wrap; word-break: break-word; }
+  .term .t-time { color: var(--dim); }
+  .term .t-fire { color: var(--cyan); }
+  .term .t-run { color: var(--green); }
+  .term .t-log { color: var(--violet); }
+  .term .t-notify { color: var(--amber); }
+  .term .t-err { color: var(--red); }
+  .term .t-doc { color: var(--text); }
+  .term .new { animation: flash 1s ease; }
+  @keyframes flash { from { background: rgba(56,225,255,0.18); } to { background: transparent; } }
+
+  .empty { text-align: center; color: var(--dim); padding: 30px; font-size: 13px; }
+  .empty .big { font-size: 26px; opacity: 0.5; margin-bottom: 8px; }
+
+  .toast-wrap { position: fixed; bottom: 20px; right: 22px; display: flex; flex-direction: column; gap: 8px; z-index: 50; }
+  .toast { background: var(--panel-2); border: 1px solid var(--line-2); border-left: 3px solid var(--cyan); border-radius: 10px; padding: 10px 14px; font-size: 13px; box-shadow: 0 8px 30px rgba(0,0,0,0.5); animation: slidein 0.25s ease; }
+  .toast.err { border-left-color: var(--red); }
+  @keyframes slidein { from { transform: translateX(20px); opacity: 0; } to { transform: none; opacity: 1; } }
+
+  .stat { text-align: center; padding: 18px 10px; }
+  .stat .num { font-size: 30px; font-weight: 800; background: linear-gradient(135deg, var(--cyan), var(--violet)); -webkit-background-clip: text; background-clip: text; -webkit-text-fill-color: transparent; }
+  .stat .lbl { font-size: 11px; color: var(--muted); letter-spacing: 0.08em; text-transform: uppercase; margin-top: 4px; }
+  .kv { display: flex; justify-content: space-between; padding: 7px 0; border-bottom: 1px solid var(--line); font-size: 13px; }
+  .kv:last-child { border-bottom: none; }
+  .kv .k { color: var(--muted); }
+  .kv .v { font-family: var(--mono); font-size: 12px; }
+  .divider { height: 1px; background: var(--line); margin: 16px 0; }
+  .pill-row { display: flex; gap: 8px; flex-wrap: wrap; }
+  .switch { display: inline-flex; align-items: center; gap: 8px; cursor: pointer; user-select: none; }
+  .switch input { display: none; }
+  .switch .track { width: 38px; height: 20px; border-radius: 20px; background: var(--bg-2); border: 1px solid var(--line); position: relative; transition: all 0.2s ease; }
+  .switch .track::after { content: ""; position: absolute; top: 2px; left: 2px; width: 14px; height: 14px; border-radius: 50%; background: var(--dim); transition: all 0.2s ease; }
+  .switch input:checked + .track { background: rgba(56,225,255,0.2); border-color: var(--cyan); }
+  .switch input:checked + .track::after { left: 20px; background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
+  .doc-name { font-family: var(--mono); color: var(--cyan); }
+  .link { color: var(--cyan); cursor: pointer; text-decoration: none; }
+  .link:hover { text-decoration: underline; }
+</style>
+</head>
+<body>
+<div class="shell">
+  <aside class="sidebar">
+    <div class="brand">
+      <div class="logo">R</div>
+      <div class="name">Reactor<small>local console</small></div>
+    </div>
+    <div class="nav-item active" data-tab="overview"><span class="ico">◈</span> Overview</div>
+    <div class="nav-item" data-tab="documents"><span class="ico">▤</span> Documents</div>
+    <div class="nav-item" data-tab="types"><span class="ico">❖</span> Types</div>
+    <div class="nav-item" data-tab="folders"><span class="ico">▣</span> Folders</div>
+    <div class="nav-item" data-tab="groups"><span class="ico">⬡</span> Groups</div>
+    <div class="nav-item" data-tab="settings"><span class="ico">⚙</span> Settings</div>
+    <div class="foot">
+      <div class="row"><span>peers</span><span class="mono" id="side-peers">–</span></div>
+      <div class="row"><span>docs</span><span class="mono" id="side-docs">–</span></div>
+    </div>
+  </aside>
+  <main class="content" id="content"></main>
+</div>
+<div class="toast-wrap" id="toasts"></div>
+
+<script>
+"use strict";
+const $ = (s, r = document) => r.querySelector(s);
+const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtTs = (t) => (t ? new Date(t).toLocaleTimeString() : "—");
+
+async function api(path, method = "GET", body) {
+  const opt = { method, headers: { "Content-Type": "application/json" } };
+  if (body !== undefined) opt.body = JSON.stringify(body);
+  const r = await fetch(path, opt);
+  let data = null;
+  const text = await r.text();
+  try { data = text ? JSON.parse(text) : null; } catch { data = text; }
+  if (!r.ok) {
+    const msg = typeof data === "string" ? data : (data && data.error) ? data.error : ("HTTP " + r.status);
+    const e = new Error(msg); e.status = r.status; e.data = data; throw e;
+  }
+  return data;
+}
+const get = (p) => api(p, "GET");
+const post = (p, b) => api(p, "POST", b ?? {});
+const put = (p, b) => api(p, "PUT", b ?? {});
+const del = (p) => api(p, "DELETE");
+
+function toast(msg, isErr = false) {
+  const t = document.createElement("div");
+  t.className = "toast" + (isErr ? " err" : "");
+  t.textContent = msg;
+  $("#toasts").appendChild(t);
+  setTimeout(() => { t.style.transition = "opacity 0.3s"; t.style.opacity = "0"; setTimeout(() => t.remove(), 300); }, 3200);
+}
+
+const state = { tab: "overview", fireCursor: {}, lastFire: {} };
+const TITLES = {
+  overview: ["Overview", "peers, live processor fires, and your subscriptions"],
+  documents: ["Documents", "create, inspect, and organize documents"],
+  types: ["Types", "draft, register, and use document model types"],
+  folders: ["Folders", "membership containers that group documents"],
+  groups: ["Groups", "signed membership docs with the two-person rule"],
+  settings: ["Settings", "drive, identity, and LLM configuration"],
+};
+
+function switchTab(tab) {
+  state.tab = tab;
+  $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.tab === tab));
+  render();
+}
+
+function head(tab) {
+  const [t, s] = TITLES[tab];
+  return `<div class="content-head"><div><h1>${t}</h1><div class="sub">${s}</div></div>
+  <div style="display:flex;align-items:center;gap:8px" class="muted"><span class="dot-live" id="conn"></span><span class="mono" style="font-size:12px">live</span></div></div>`;
+}
+
+/* ============================ OVERVIEW ============================ */
+async function renderOverview() {
+  let peers = 0, docCount = 0;
+  try {
+    const ov = await get("/api/overview");
+    peers = ov.peerCount ?? 0;
+    docCount = ov.liveDocCount ?? 0;
+  } catch {}
+  $("#side-peers").textContent = peers;
+  $("#side-docs").textContent = docCount;
+
+  const [procs, ov] = await Promise.all([get("/api/processors").catch(() => []), get("/api/overview").catch(() => ({}))]);
+  const fireEl = document.createElement("div");
+  fireEl.innerHTML = head("overview") + `
+  <div class="grid g-2fr">
+    <div class="card">
+      <h3>Live activity</h3>
+      <div class="term" id="fire-term"></div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card"><h3>Subscriptions</h3><div id="proc-list"></div></div>
+      <div class="card"><h3>Reference — create in one click</h3>
+        <div class="muted" style="font-size:12px;margin-bottom:10px">Fire a command whenever an invoice is marked <span class="code">accepted</span>.</div>
+        <div style="display:flex;flex-direction:column;gap:8px">
+          <input id="ref-name" value="on-invoice-accepted" placeholder="name">
+          <input id="ref-cmd" value="echo paid" placeholder="command on fire">
+          <button class="btn primary" id="ref-create">✦  Create processor</button>
+        </div>
+      </div>
+    </div>
+  </div>`;
+  $("#content").replaceChildren(fireEl);
+
+  // reference processor
+  const refCmd = $("#ref-cmd").value.trim() || "echo paid";
+  $("#ref-create").onclick = async () => {
+    try {
+      const name = $("#ref-name").value.trim();
+      await post("/api/processors", {
+        name, models: ["invoice"], field: "status", value: "accepted",
+        reaction: { kind: "run", command: refCmd },
+      });
+      toast("Processor created: " + name);
+      render();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  renderProcList(procs, ov);
+  pollFires(procs);
+}
+
+function renderProcList(procs, ov) {
+  const el = $("#proc-list");
+  if (!el) return;
+  if (!procs.length) {
+    el.innerHTML = `<div class="empty"><div class="big">✦</div>No subscriptions yet.<br>Create one on the right.</div>`;
+    return;
+  }
+  const rows = procs.map((p) => {
+    const filter = p.field ? ` ${p.field}=${p.value ?? ""}` : (p.action_kind ? ` ${p.action_kind}` : "");
+    const models = (p.models || []).join(", ");
+    const badge = p.enabled === false ? `<span class="badge b-dim"><span class="dot"></span>off</span>` : `<span class="badge b-green"><span class="dot"></span>on</span>`;
+    return `<tr class="rowclick" data-pname="${esc(p.name)}">
+      <td><span class="doc-name">${esc(p.name)}</span>${badge}</td>
+      <td class="muted mono" style="font-size:12px">${esc(models)}${esc(filter)}</td>
+      <td style="text-align:right"><span class="badge b-violet mono" style="font-size:10px">${esc(p.reaction?.kind || "")}</span></td>
+    </tr>`;
+  }).join("");
+  el.innerHTML = `<table class="table"><thead><tr><th>name</th><th>fires when</th><th></th></tr></thead><tbody>${rows}</tbody></table>
+  <div class="muted" style="font-size:11px;margin-top:8px">click a subscription to see its fire history</div>`;
+  $$("#proc-list tr.rowclick").forEach((tr) => {
+    tr.onclick = () => showFireDetail(tr.dataset.pname, procs);
+  });
+}
+
+function showFireDetail(name, procs) {
+  const p = procs.find((x) => x.name === name);
+  const fire = document.createElement("div");
+  fire.innerHTML = `<div class="content-head"><button class="btn ghost sm" id="back">← back</button><h1>${esc(name)}</h1></div>
+  <div class="card"><h3>Reaction</h3><div class="kv"><span class="k">type</span><span class="v">${esc(p?.reaction?.kind || "—")}</span></div>
+  <div class="kv"><span class="k">reaction</span><span class="v">${esc(JSON.stringify(p?.reaction || {}))}</span></div>
+  <div class="kv"><span class="k">models</span><span class="v">${esc((p?.models || []).join(", "))}</span></div>
+  <div class="kv"><span class="k">filter</span><span class="v">${esc(p?.field ? p.field + "=" + (p.value ?? "") : (p?.action_kind || "—"))}</span></div>
+  <div class="divider"></div><h3>Fires</h3><div class="term" id="detail-term" style="height:360px"></div></div>`;
+  $("#content").replaceChildren(fire);
+  $("#back").onclick = () => render();
+  (async () => {
+    try {
+      const fires = await get(`/api/processors/${encodeURIComponent(name)}/fires`);
+      const term = $("#detail-term");
+      term.innerHTML = fires.length
+        ? fires.slice().reverse().map((f) => fireLine(f)).join("")
+        : `<div class="empty"><div class="big">✦</div>No fires yet.</div>`;
+    } catch (e) { $("#detail-term").innerHTML = `<div class="empty">${esc(e.message)}</div>`; }
+  })();
+}
+
+function fireLine(f) {
+  const detail = f.detail || f.action || "fire";
+  return `<div class="line"><span class="t-time">${fmtTs(f.ts)}</span> <span class="t-fire">✦</span> <span class="t-run">${esc(detail)}</span> <span class="t-doc dim">← ${esc(f.doc)}${f.action ? " · " + esc(f.action) : ""}</span></div>`;
+}
+
+async function pollFires(procs) {
+  if (state.tab !== "overview") return;
+  const term = $("#fire-term");
+  if (!term) return;
+  for (const p of procs) {
+    try {
+      const fires = await get(`/api/processors/${encodeURIComponent(p.name)}/fires`);
+      const last = state.lastFire[p.name];
+      if (fires.length && fires[fires.length - 1] !== last) {
+        state.lastFire[p.name] = fires[fires.length - 1];
+        const line = document.createElement("div");
+        line.className = "line new";
+        const latest = fires.slice().reverse()[0];
+        line.innerHTML = `<span class="t-time">${fmtTs(latest.ts)}</span> <span class="t-fire">✦</span> <span class="t-run">${esc(latest.detail || latest.action || "fire")}</span> <span class="t-doc dim">← ${esc(latest.doc)} <span class="dim">[${esc(p.name)}]</span></span>`;
+        term.prepend(line);
+      }
+    } catch {}
+  }
+  while (term.children.length > 200) term.lastChild.remove();
+  term.scrollTop = 0;
+  setTimeout(() => pollFires(procs), 1500);
+}
+
+/* ============================ DOCUMENTS ============================ */
+async function renderDocuments() {
+  const [models, docs] = await Promise.all([get("/api/models").catch(() => []), get("/api/docs").catch(() => [])]);
+  const el = document.createElement("div");
+  el.innerHTML = head("documents") + `
+  <div class="grid g-2fr">
+    <div class="card">
+      <h3>All documents</h3>
+      <div class="field" style="display:flex;gap:10px;align-items:flex-end;margin-bottom:12px">
+        <div style="flex:0 0 180px"><label class="field"><span>filter by model</span><select id="doc-model-filter"><option value="">all</option>${models.map((m) => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("")}</select></div>
+        <div style="flex:1"><label class="field"><span>filter by field = value</span><div class="field-row"><input id="df-field" placeholder="status"><input id="df-value" placeholder="accepted"></div></label></div>
+        <button class="btn ghost sm" id="doc-filter-go">go</button>
+      </div>
+      <div id="docs-list"></div>
+    </div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card"><h3>Create document</h3>
+        <label class="field"><span>model</span><select id="new-model">${models.map((m) => `<option value="${esc(m.name)}">${esc(m.name)}</option>`).join("")}</select></label>
+        <label class="field"><span>name</span><input id="new-name" placeholder="my-doc-1"></label>
+        <label class="field"><span>fields (JSON payload for the model's init)</span><textarea id="new-fields" class="mono" rows="6">{}</textarea></label>
+        <button class="btn primary" id="new-doc-create">+ Create</button>
+      </div>
+      <div class="card" id="doc-detail-card" style="display:none"></div>
+    </div>
+  </div>`;
+  $("#content").replaceChildren(el);
+
+  const loadDocs = async () => {
+    const m = $("#doc-model-filter").value;
+    const f = $("#df-field").value.trim(), v = $("#df-value").value.trim();
+    const q = [];
+    if (m) q.push("model=" + encodeURIComponent(m));
+    if (f && v) q.push("field=" + encodeURIComponent(f) + "&value=" + encodeURIComponent(v));
+    const docs = await get("/api/docs" + (q.length ? "?" + q.join("&") : "")).catch(() => []);
+    const box = $("#docs-list");
+    box.innerHTML = docs.length
+      ? `<table class="table"><thead><tr><th>name</th><th>model</th></tr></thead><tbody>${docs.map((d) => `<tr class="rowclick" data-doc="${esc(d.name)}"><td class="doc-name">${esc(d.name)}</td><td><span class="badge b-cyan">${esc(d.model)}</span></td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty"><div class="big">▤</div>No documents. Create one on the right.</div>`;
+    $$("#docs-list tr.rowclick").forEach((tr) => tr.onclick = () => showDoc(tr.dataset.doc, models));
+  };
+  $("#doc-filter-go").onclick = loadDocs;
+  $("#doc-model-filter").onchange = loadDocs;
+
+  const fillFields = () => {
+    const m = models.find((x) => x.name === $("#new-model").value);
+    if (!m) return;
+    const f = {};
+    for (const k of Object.keys(m.fields || {})) f[k] = "";
+    $("#new-fields").value = JSON.stringify(f, null, 2);
+  };
+  $("#new-model").onchange = fillFields;
+  fillFields();
+  $("#new-doc-create").onclick = async () => {
+    try {
+      const name = $("#new-name").value.trim();
+      const model = $("#new-model").value;
+      let fields; try { fields = JSON.parse($("#new-fields").value || "{}"); } catch { return toast("invalid JSON in fields", true); }
+      fields.name = name;
+      await post("/api/docs", { name, model, fields });
+      toast("created " + name);
+      loadDocs();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  await loadDocs();
+}
+
+function showDoc(name, models) {
+  (async () => {
+    try {
+      const d = await get("/api/docs/" + encodeURIComponent(name));
+      const card = $("#doc-detail-card");
+      card.style.display = "";
+      const fields = Object.entries(d.fields || {}).map(([k, v]) => `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${esc(JSON.stringify(v))}</span></div>`).join("");
+      card.innerHTML = `<h3>Document</h3>
+        <div class="kv"><span class="k">name</span><span class="v">${esc(d.name)}</span></div>
+        <div class="kv"><span class="k">model</span><span class="v">${esc(d.model)}</span></div>
+        <div class="divider"></div>${fields}
+        <div class="divider"></div>
+        <h3>Actions</h3>
+        <div class="field"><span>a field to update</span><div class="field-row"><input id="act-field" placeholder="status"><input id="act-value" placeholder="accepted"></div></div>
+        <button class="btn" id="act-set">set field</button>
+        <div class="muted" style="font-size:11px;margin-top:8px">e.g. set status=accepted to fire any processor watching that</div>`;
+      $("#act-set").onclick = async () => {
+        try {
+          const f = $("#act-field").value.trim(), v = $("#act-value").value.trim();
+          if (!f) return;
+          const m = models.find((x) => x.name === d.model);
+          // Prefer a model-specific set-<field> reducer; fall back to the generic set.
+          const kind = (m && m.fields && m.fields[f] && Object.keys(m.reducers || {}).includes("set-" + f)) ? "set-" + f : "set";
+          const payload = kind === "set" ? { field: f, value: v } : { [f]: v };
+          await post("/api/docs/action", { name: d.name, model: d.model, kind, payload });
+          toast("updated " + f + " → " + v);
+          showDoc(name, models);
+        } catch (e) { toast(e.message, true); }
+      };
+    } catch (e) { toast(e.message, true); }
+  })();
+}
+
+/* ============================ TYPES ============================ */
+async function renderTypes() {
+  const models = await get("/api/models").catch(() => []);
+  const el = document.createElement("div");
+  el.innerHTML = head("types") + `
+  <div class="grid g-2fr">
+    <div class="card"><h3>Registered types</h3><div id="types-list"></div></div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card"><h3>✦ Draft a type with the LLM</h3>
+        <label class="field"><span>describe the document</span><textarea id="type-desc" class="mono" rows="3" placeholder="an invoice: number, customer, total, currency, status"></textarea></label>
+        <button class="btn primary" id="type-draft">Generate definition</button>
+        <div class="divider"></div>
+        <div id="type-preview-wrap" style="display:none">
+          <label class="field"><span>generated definition — edit, then register</span><textarea id="type-preview" class="mono" rows="12"></textarea></label>
+          <div style="display:flex;gap:10px"><button class="btn primary" id="type-register">Register type</button><button class="btn ghost" id="type-cancel">cancel</button></div>
+        </div>
+      </div>
+      <div class="card"><h3>Manual / use a type</h3>
+        <div class="pill-row" id="type-use-row" style="margin-bottom:10px"></div>
+        <div class="muted" style="font-size:12px">Register a custom definition, then create documents under it from the Documents tab.</div>
+      </div>
+    </div>
+  </div>`;
+  $("#content").replaceChildren(el);
+
+  const renderList = () => {
+    const box = $("#types-list");
+    box.innerHTML = models.length
+      ? `<table class="table"><thead><tr><th>type</th><th>fields</th></tr></thead><tbody>${models.map((m) => `<tr><td><span class="badge b-violet mono">${esc(m.name)}@${esc(m.version)}</span></td><td class="muted mono" style="font-size:12px">${esc(Object.keys(m.fields || {}).join(", "))}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty"><div class="big">❖</div>No types.</div>`;
+  };
+  renderList();
+
+  $("#type-draft").onclick = async () => {
+    const desc = $("#type-desc").value.trim();
+    if (!desc) return toast("describe the document first", true);
+    const btn = $("#type-draft"); btn.disabled = true; btn.textContent = "… drafting";
+    try {
+      const r = await post("/api/llm/draft-type", { description: desc });
+      if (!r.ok) { toast(r.error || "draft failed", true); btn.disabled = false; btn.textContent = "Generate definition"; return; }
+      $("#type-preview").value = JSON.stringify(r.definition, null, 2);
+      $("#type-preview-wrap").style.display = "";
+      btn.disabled = false; btn.textContent = "Generate definition";
+    } catch (e) { toast(e.message, true); btn.disabled = false; btn.textContent = "Generate definition"; }
+  };
+  $("#type-cancel").onclick = () => { $("#type-preview-wrap").style.display = "none"; };
+  $("#type-register").onclick = async () => {
+    try {
+      let def; try { def = JSON.parse($("#type-preview").value); } catch { return toast("invalid JSON", true); }
+      const r = await post("/api/models/register", { definition: def });
+      if (r && r.ok === false) { toast(r.error || "register failed", true); return; }
+      toast("registered " + (def.name || "type"));
+      $("#type-preview-wrap").style.display = "none";
+      const fresh = await get("/api/models");
+      models.length = 0; fresh.forEach((m) => models.push(m));
+      renderList();
+    } catch (e) { toast(e.message, true); }
+  };
+
+  // "use a type": create a doc under a registered model (pre-fills the Documents tab).
+  const useRow = $("#type-use-row");
+  useRow.innerHTML = models.map((m) => `<button class="btn ghost sm" data-use="${esc(m.name)}">use ${esc(m.name)}</button>`).join("");
+  $$("#type-use-row button").forEach((b) => b.onclick = () => {
+    const m = models.find((x) => x.name === b.dataset.use);
+    const f = {}; for (const k of Object.keys(m.fields || {})) f[k] = "";
+    localStorage.setItem("reactor-prefill", JSON.stringify({ model: m.name, fields: JSON.stringify(f, null, 2) }));
+    switchTab("documents");
+  });
+}
+
+/* ============================ FOLDERS ============================ */
+async function renderFolders() {
+  const folders = await get("/api/folders").catch(() => []);
+  const el = document.createElement("div");
+  el.innerHTML = head("folders") + `
+  <div class="grid g-2fr">
+    <div class="card"><h3>Folders</h3><div id="folders-list"></div></div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card"><h3>Create folder</h3>
+        <label class="field"><span>name</span><input id="fold-name" placeholder="invoices-2026"></label>
+        <label class="field"><span>description</span><input id="fold-desc" placeholder="Q2 invoices"></label>
+        <button class="btn primary" id="fold-create">+ Create folder</button>
+      </div>
+      <div class="card" id="folder-detail" style="display:none"></div>
+    </div>
+  </div>`;
+  $("#content").replaceChildren(el);
+  const load = () => {
+    const box = $("#folders-list");
+    box.innerHTML = folders.length
+      ? `<table class="table"><thead><tr><th>name</th><th>docs</th></tr></thead><tbody>${folders.map((f) => `<tr class="rowclick" data-fold="${esc(f.name)}"><td class="doc-name">${esc(f.name)}</td><td>${f.memberCount}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty"><div class="big">▣</div>No folders. Create one on the right.</div>`;
+    $$("#folders-list tr.rowclick").forEach((tr) => tr.onclick = () => showFolder(tr.dataset.fold));
+  };
+  load();
+  $("#fold-create").onclick = async () => {
+    const name = $("#fold-name").value.trim();
+    if (!name) return toast("name required", true);
+    try {
+      await post("/api/folders", { name, description: $("#fold-desc").value.trim(), members: [] });
+      toast("created folder " + name);
+      const fresh = await get("/api/folders"); folders.length = 0; fresh.forEach((f) => folders.push(f));
+      load();
+    } catch (e) { toast(e.message, true); }
+  };
+  function showFolder(name) {
+    const f = folders.find((x) => x.name === name);
+    const card = $("#folder-detail"); card.style.display = "";
+    card.innerHTML = `<h3>${esc(name)}</h3>
+      <div class="kv"><span class="k">description</span><span class="v">${esc(f?.description || "—")}</span></div>
+      <div class="divider"></div>
+      <h3>Move a document in</h3>
+      <div class="field"><span>document name</span><input id="fold-member" placeholder="invoice-42"></div>
+      <button class="btn" id="fold-add">+ Add to folder</button>
+      <div class="divider"></div>
+      <h3>Members</h3>
+      <div class="pill-row">${(f?.members || []).map((m) => `<span class="badge b-cyan mono">${esc(m)}</span>`).join("") || '<span class="muted">none</span>'}</div>`;
+    $("#fold-add").onclick = async () => {
+      const member = $("#fold-member").value.trim();
+      if (!member) return;
+      try {
+        await post(`/api/folders/${encodeURIComponent(name)}/action`, { kind: "add-member", payload: { member } });
+        toast("added " + member + " to " + name);
+        showFolder(name);
+      } catch (e) { toast(e.message, true); }
+    };
+  }
+}
+
+/* ============================ GROUPS ============================ */
+async function renderGroups() {
+  const groups = await get("/api/groups").catch(() => []);
+  const el = document.createElement("div");
+  el.innerHTML = head("groups") + `
+  <div class="grid g-2fr">
+    <div class="card"><h3>Groups</h3><div id="groups-list"></div></div>
+    <div style="display:flex;flex-direction:column;gap:14px">
+      <div class="card"><h3>Create group</h3>
+        <label class="field"><span>name</span><input id="grp-name" placeholder="core-team"></label>
+        <label class="field"><span>members (comma-separated)</span><input id="grp-members" placeholder="alice, bob, carol"></label>
+        <button class="btn primary" id="grp-create">+ Create group</button>
+      </div>
+      <div class="card" id="group-detail" style="display:none"></div>
+      <div class="card" id="quorum-note">
+        <h3>Two-person rule</h3>
+        <div class="muted" style="font-size:12.5px">Adding a <b>manager</b> to a group requires a quorum: at least <b>two distinct existing members</b> (other than the proposer) must co-sign the action. A single node cannot add a second manager by itself. This is the multi-sig guarantee.</div>
+      </div>
+    </div>
+  </div>`;
+  $("#content").replaceChildren(el);
+  const load = () => {
+    const box = $("#groups-list");
+    box.innerHTML = groups.length
+      ? `<table class="table"><thead><tr><th>name</th><th>members</th><th>managers</th></tr></thead><tbody>${groups.map((g) => `<tr class="rowclick" data-grp="${esc(g.name)}"><td class="doc-name">${esc(g.name)}</td><td>${g.memberCount}</td><td>${g.managerCount}</td></tr>`).join("")}</tbody></table>`
+      : `<div class="empty"><div class="big">⬡</div>No groups. Create one on the right.</div>`;
+    $$("#groups-list tr.rowclick").forEach((tr) => tr.onclick = () => showGroup(tr.dataset.grp));
+  };
+  load();
+  $("#grp-create").onclick = async () => {
+    const name = $("#grp-name").value.trim();
+    if (!name) return toast("name required", true);
+    const members = $("#grp-members").value.split(",").map((s) => s.trim()).filter(Boolean);
+    try {
+      await post("/api/groups", { name, members, managers: [] });
+      toast("created group " + name + " (you are a manager)");
+      const fresh = await get("/api/groups"); groups.length = 0; fresh.forEach((g) => groups.push(g));
+      load();
+    } catch (e) { toast(e.message, true); }
+  };
+  async function showGroup(name) {
+    const g = groups.find((x) => x.name === name);
+    const card = $("#group-detail"); card.style.display = "";
+    card.innerHTML = `<h3>${esc(name)}</h3>
+      <div class="kv"><span class="k">members</span><span class="v">${esc((g?.members || []).join(", ") || "—")}</span></div>
+      <div class="kv"><span class="k">managers</span><span class="v">${esc((g?.managers || []).join(", ") || "—")}</span></div>
+      <div class="divider"></div>
+      <div class="field"><span>add member</span><div class="field-row"><input id="grp-add" placeholder="name"><button class="btn sm" id="grp-add-go">add</button></div></div>
+      <div class="divider"></div>
+      <h3>Signed activity</h3><div class="term" id="grp-activity" style="height:280px"></div>`;
+    $("#grp-add-go").onclick = async () => {
+      const m = $("#grp-add").value.trim();
+      if (!m) return;
+      try {
+        await post(`/api/groups/${encodeURIComponent(name)}/action`, { kind: "add-member", payload: { member: m } });
+        toast("added " + m);
+        const fresh = await get("/api/groups"); groups.length = 0; fresh.forEach((x) => groups.push(x));
+        showGroup(name);
+      } catch (e) { toast(e.message, true); }
+    };
+    try {
+      const acts = await get(`/api/groups/${encodeURIComponent(name)}/activity`);
+      const term = $("#grp-activity");
+      term.innerHTML = acts.length
+        ? acts.map((a) => {
+            const cs = a.cosigners && a.cosigners.length ? `  <span class="t-notify">+${esc(a.cosigners.join(", "))} cosigned</span>` : "";
+            return `<div class="line"><span class="t-time">${esc(a.ts ?? "")}</span> <span class="t-fire">⬡</span> <span class="t-log">${esc(a.kind)}</span> <span class="dim">by ${esc(a.actor)}${cs}</span></div>`;
+          }).join("")
+        : `<div class="empty">no activity</div>`;
+    } catch {}
+  }
+}
+
+/* ============================ SETTINGS ============================ */
+async function renderSettings() {
+  const [cfg, ov] = await Promise.all([get("/api/config").catch(() => ({})), get("/api/overview").catch(() => ({}))]);
+  const llm = cfg.llm || {}, inst = cfg.instance || {};
+  const el = document.createElement("div");
+  el.innerHTML = head("settings") + `
+  <div class="grid g2">
+    <div class="card"><h3>Identity</h3>
+      <div class="kv"><span class="k">peer id</span><span class="v">${esc(ov.peerId || "—")}</span></div>
+      <div class="kv"><span class="k">peers in DHT</span><span class="v">${ov.peerCount ?? "—"}</span></div>
+      <div class="kv"><span class="k">live docs</span><span class="v">${ov.liveDocCount ?? "—"}</span></div>
+      <div class="kv"><span class="k">docs dir</span><span class="v">${esc(ov.docsDir || "—")}</span></div>
+    </div>
+    <div class="card"><h3>LLM</h3>
+      <label class="field"><span>base URL</span><input id="llm-base" value="${esc(llm.baseUrl || "")}"></label>
+      <label class="field"><span>model</span><input id="llm-model" value="${esc(llm.model || "")}"></label>
+      <label class="field"><span>API key (env var name — the key itself is never stored)</span><input id="llm-keyenv" value="${esc(llm.apiKeyEnv || "")}"></label>
+      <button class="btn" id="llm-test">Test connection</button>
+      <div id="llm-test-out" class="muted" style="font-size:12px;margin-top:8px"></div>
+    </div>
+    <div class="card" style="grid-column:1 / -1"><h3>Drive &amp; instance</h3>
+      <div class="field-row">
+        <label class="field"><span>drive URL</span><input id="set-url" value="${esc(inst.driveUrl || "")}"></label>
+        <label class="field"><span>token (env var name)</span><input id="set-token" value="${esc(inst.tokenEnv || "")}"></label>
+      </div>
+      <div class="kv"><span class="k">listen</span><span class="v">${esc(inst.listen || "—")}</span></div>
+      <div class="kv"><span class="k">pause sync</span><span class="v">${inst.pauseSync ? "yes" : "no"}</span></div>
+      <div style="margin-top:14px;display:flex;gap:10px">
+        <button class="btn primary" id="set-save">Save &amp; apply</button>
+        <button class="btn ghost" id="set-pause">${inst.pauseSync ? "Resume sync" : "Pause sync"}</button>
+      </div>
+    </div>
+  </div>`;
+  $("#content").replaceChildren(el);
+
+  $("#llm-test").onclick = async () => {
+    const out = $("#llm-test-out");
+    out.textContent = "… contacting " + $("#llm-base").value;
+    try {
+      const r = await post("/api/llm/test", { baseUrl: $("#llm-base").value, apiKeyEnv: $("#llm-keyenv").value, model: $("#llm-model").value });
+      out.innerHTML = r.ok
+        ? `<span class="b-green badge">ok</span> <span class="mono">${esc(r.url)}</span> · ${r.models?.length ?? 0} models`
+        : `<span class="b-red badge">fail</span> ${esc(r.error)}`;
+    } catch (e) { out.innerHTML = `<span class="b-red badge">fail</span> ${esc(e.message)}`; }
+  };
+
+  const save = async () => {
+    const payload = {
+      llm: { baseUrl: $("#llm-base").value.trim(), model: $("#llm-model").value.trim(), apiKeyEnv: $("#llm-keyenv").value.trim() },
+      instance: { driveUrl: $("#set-url").value.trim(), tokenEnv: $("#set-token").value.trim(), listen: inst.listen, pauseSync: inst.pauseSync },
+    };
+    try {
+      await post("/api/config", { op: "replace", payload });
+      toast("saved and applied");
+    } catch (e) { toast(e.message, true); }
+  };
+  $("#set-save").onclick = save;
+  $("#set-pause").onclick = async () => {
+    try {
+      await post("/api/config", { op: inst.pauseSync ? "resume" : "pause" });
+      toast(inst.pauseSync ? "sync resumed" : "sync paused");
+      renderSettings();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+/* ============================ DISPATCH ============================ */
+const RENDER = {
+  overview: renderOverview,
+  documents: renderDocuments,
+  types: renderTypes,
+  folders: renderFolders,
+  groups: renderGroups,
+  settings: renderSettings,
+};
+function render() { $$(".view").forEach((v) => v.remove()); (RENDER[state.tab] || renderOverview)(); }
+
+$$(".nav-item").forEach((n) => (n.onclick = () => switchTab(n.dataset.tab)));
+render();
+</script>
+</body>
+</html>

@@ -74,7 +74,8 @@ impl Settings {
             .await
             .with_context(|| format!("bind {host}:{port}"))?;
         let app = Router::new()
-            .route("/", get(page))
+            .route("/", get(page_v2))
+            .route("/console", get(page))
             .route("/api/status", get(status_api))
             .route("/api/drives", post(add_drive))
             .route("/api/drives/:name", delete(remove_drive))
@@ -108,6 +109,7 @@ impl Settings {
             .route("/api/docs/:name", get(doc_detail))
             .route("/api/llm/test", post(llm_test))
             .route("/api/models", get(models_api).post(register_model))
+            .route("/api/models/register", post(register_model))
             .route("/api/llm/draft-type", post(llm_draft_type))
             .with_state(Arc::new(self));
         let task = tokio::spawn(async move {
@@ -290,6 +292,10 @@ struct DocBody {
     name: String,
     #[serde(default)]
     fields: BTreeMap<String, serde_json::Value>,
+    /// Optional model (`name` or `name@version`) to create the doc under its
+    /// `init` reducer. When absent, a generic `open`-model doc is created.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 /// Synchronous doc creation (unlike the drive mutations): the CLI awaits
@@ -304,6 +310,27 @@ async fn add_doc(
             "doc name may be any characters except '/' (max 64)",
         )
             .into_response();
+    }
+    if let Some(model) = body.model {
+        let model = if model.contains('@') {
+            model
+        } else {
+            match state
+                .store
+                .model_refs()
+                .into_iter()
+                .find(|r| r.name == model)
+            {
+                Some(r) => format!("{}@{}", r.name, r.version),
+                None => model,
+            }
+        };
+        let mut payload =
+            serde_json::to_value(&body.fields).unwrap_or_else(|_| json!({}));
+        if !payload.get("name").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+            payload["name"] = json!(body.name);
+        }
+        return run_create_doc_model(&state, &body.name, &model, payload).await;
     }
     let (reply, wait) = oneshot::channel();
     let cmd = Command::CreateDoc {
@@ -362,7 +389,15 @@ async fn action_doc(
     let model = if body.model.trim().is_empty() {
         "open@1".to_string()
     } else {
-        body.model.clone()
+        let m = body.model.trim();
+        if m.contains('@') {
+            m.to_string()
+        } else {
+            match state.store.model_refs().into_iter().find(|r| r.name == m) {
+                Some(r) => format!("{}@{}", r.name, r.version),
+                None => m.to_string(),
+            }
+        }
     };
     let (reply, wait) = oneshot::channel();
     let cmd = Command::CreateAction {
@@ -1141,65 +1176,86 @@ async fn llm_draft_type(
         "{}/chat/completions",
         cfg.llm.base_url.trim_end_matches('/')
     );
-    match client
-        .post(&url)
-        .bearer_auth(&key)
-        .json(&json!({
-            "model": cfg.llm.model,
-            "temperature": 0.2,
-            "messages": [
-                {"role": "system", "content": sys},
-                {"role": "user", "content": body.description},
-            ],
-        }))
-        .send()
-        .await
-    {
-        Ok(r) if r.status().is_success() => {
-            let v: Value = r.json().await.unwrap_or(Value::Null);
-            let content = v
-                .get("choices")
-                .and_then(|c| c.get(0))
-                .and_then(|c| c.get("message"))
-                .and_then(|m| m.get("content"))
-                .and_then(|c| c.as_str())
-                .unwrap_or("")
-                .to_string();
-            match extract_json_object(&content) {
-                Some(d) => (
-                    StatusCode::OK,
-                    axum::Json(json!({ "ok": true, "definition": d })),
+    let mut last_raw = String::new();
+    // A mid-size model occasionally truncates or mis-frames the JSON; retry a
+    // couple of times with a "complete, valid JSON" nudge before giving up.
+    for attempt in 0..3u32 {
+        let user = if attempt == 0 {
+            body.description.clone()
+        } else {
+            format!(
+                "{} — Return ONLY a single complete, well-formed JSON object \
+                 (no markdown fences, no trailing prose). Do not truncate the \
+                 output.",
+                body.description
+            )
+        };
+        match client
+            .post(&url)
+            .bearer_auth(&key)
+            .json(&json!({
+                "model": cfg.llm.model,
+                "temperature": 0.2,
+                "max_tokens": 4096,
+                "messages": [
+                    {"role": "system", "content": sys},
+                    {"role": "user", "content": user},
+                ],
+            }))
+            .send()
+            .await
+        {
+            Ok(r) if r.status().is_success() => {
+                let v: Value = r.json().await.unwrap_or(Value::Null);
+                let content = v
+                    .get("choices")
+                    .and_then(|c| c.get(0))
+                    .and_then(|c| c.get("message"))
+                    .and_then(|m| m.get("content"))
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                if let Some(d) = extract_json_object(&content) {
+                    return (
+                        StatusCode::OK,
+                        axum::Json(json!({ "ok": true, "definition": d })),
+                    )
+                        .into_response();
+                }
+                last_raw = content;
+            }
+            Ok(r) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({ "ok": false, "error": format!("LLM returned HTTP {}", r.status()) })),
                 )
-                    .into_response(),
-                None => (
-                    StatusCode::BAD_REQUEST,
-                    axum::Json(json!({
-                        "ok": false,
-                        "error": "the model did not return a valid JSON definition",
-                        "raw": content,
-                    })),
+                    .into_response();
+            }
+            Err(e) => {
+                return (
+                    StatusCode::BAD_GATEWAY,
+                    axum::Json(json!({ "ok": false, "error": format!("LLM request failed: {e}") })),
                 )
-                    .into_response(),
+                    .into_response();
             }
         }
-        Ok(r) => (
-            StatusCode::BAD_GATEWAY,
-            axum::Json(json!({ "ok": false, "error": format!("LLM returned HTTP {}", r.status()) })),
-        )
-            .into_response(),
-        Err(e) => (
-            StatusCode::BAD_GATEWAY,
-            axum::Json(json!({ "ok": false, "error": format!("LLM request failed: {e}") })),
-        )
-            .into_response(),
     }
+    (
+        StatusCode::BAD_REQUEST,
+        axum::Json(json!({
+            "ok": false,
+            "error": "the model did not return a valid JSON definition after 3 attempts",
+            "raw": last_raw,
+        })),
+    )
+        .into_response()
 }
 
 /// Pull the first balanced JSON object out of a model response that may be
 /// wrapped in prose or markdown fences.
 fn extract_json_object(s: &str) -> Option<Value> {
     let s = s.trim();
-    if let Some(v) = serde_json::from_str::<Value>(s).ok() {
+    if let Ok(v) = serde_json::from_str::<Value>(s) {
         if v.is_object() {
             return Some(v);
         }
@@ -1214,7 +1270,7 @@ fn extract_json_object(s: &str) -> Option<Value> {
         .strip_suffix("```")
         .unwrap_or(un.unwrap_or(s))
         .trim();
-    if let Some(v) = serde_json::from_str::<Value>(un).ok() {
+    if let Ok(v) = serde_json::from_str::<Value>(un) {
         if v.is_object() {
             return Some(v);
         }
@@ -1257,4 +1313,10 @@ async fn page() -> Html<&'static str> {
     Html(PAGE)
 }
 
+/// The redesigned console (v2) - the default landing page.
+async fn page_v2() -> Html<&'static str> {
+    Html(PAGE_V2)
+}
+
 const PAGE: &str = include_str!("console.html");
+const PAGE_V2: &str = include_str!("../../console/v2.html");

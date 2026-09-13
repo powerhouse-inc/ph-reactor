@@ -293,7 +293,7 @@ async fn dispatch(
         if !spec.filter().matches(change) {
             continue;
         }
-        let detail = perform(store, &spec, change).await;
+        let detail = perform(store, spec, change).await;
         let fire = Fire {
             spec: spec.name.clone(),
             doc: change.name.clone(),
