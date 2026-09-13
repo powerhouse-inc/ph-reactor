@@ -202,6 +202,10 @@ pub enum EngineEvent {
     /// A peer was auto-banned after repeated failed auth attempts; the
     /// daemon should persist it to the ban list.
     PeerAutoBanned { peer: String },
+    /// A joiner was accepted on a valid join-proof that carried a group
+    /// grant; the daemon resolves the grant (nonce -> groups) and applies
+    /// it. `nonce` is the invite's challenge echoed in the join-proof.
+    InviteAccepted { peer: PeerId, nonce: Vec<u8> },
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +641,10 @@ impl SyncEngine {
         tracing::info!(%peer, "join proof accepted; adding a drive for the joiner");
         self.add_drive_internal(drive);
         let _ = self.evt_tx.send(EngineEvent::DriveJoined { name, addr });
+        let _ = self.evt_tx.send(EngineEvent::InviteAccepted {
+            peer,
+            nonce: accept.nonce.clone(),
+        });
     }
 
     fn set_status(&self, name: &str, status: DriveStatus, detail: Option<String>) {
