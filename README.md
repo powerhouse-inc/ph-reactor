@@ -27,12 +27,20 @@ No Node, no npm, no child processes: the daemon *is* the reactor.
 **Snap** (primary): see [Build the snap](#build-the-snap) below — the
 store channel is published from the GitHub release assets.
 
-**Binary** (brew-style, manual):
+**One-liner** (brew-style; builds from a source checkout and installs for the
+current user — binary to `~/.local/bin`, tray `.desktop` + autostart entry):
 
 ```sh
-# from a release tag, or from source:
-cargo build --release --target x86_64-unknown-linux-musl
-install -Dm755 target/x86_64-unknown-linux-musl/release/ph-reactor ~/.local/bin/ph-reactor
+curl -fsSL https://<host>/ph-reactor/install.sh | bash
+# or from a local checkout:
+PH_REACTOR_SRC=$PWD ./scripts/install.sh
+```
+
+**Manual**:
+
+```sh
+cargo build --release --locked
+install -Dm755 target/release/ph-reactor ~/.local/bin/ph-reactor
 ```
 
 ```sh
@@ -53,6 +61,25 @@ On first start the daemon creates its identity key (one ed25519 keypair
 for the whole instance) under `~/.ph/reactor/` and starts listening on
 `/ip4/0.0.0.0/tcp/4201`. Peers on the LAN can also be found via mDNS
 (`p2p.mdns`); everything else is explicit multiaddr.
+
+### Syncing a knowledge vault
+
+The native reactor is self-contained (no Node, no switchboard process). A
+"knowledge vault" is therefore a **group of reactors** that share a set of
+drives, not a switchboard URL. To join one (e.g. the `powerhouse-knowledge`
+vault):
+
+```sh
+# on the vault host, once:
+ph-reactor invite                 # prints a one-shot invite string
+
+# on your machine:
+ph-reactor join <invite-string>   # pins the inviter (TOFU) + adds the shared drives
+```
+
+For a single peer instead of a group, `ph-reactor drive add <multiaddr>`
+works too. The vault's document model packages are fetched from the registry
+on first sync and installed into the local store automatically.
 
 ## CLI
 
@@ -231,20 +258,20 @@ are happy with the new instance.
 
 ## Build the snap
 
-From the repository root, on an Ubuntu host with `snapcraft` (LXD) and
-`musl-tools` (a transitive C dependency builds under `musl-gcc`; `apt
-install musl-tools`):
+The package definition is [`snap/snapcraft.yaml`](snap/snapcraft.yaml).
+It is a **classic** snap (it needs the session D-Bus for the tray icon and
+`~/.ph/reactor` for its state). From an Ubuntu host with `snapcraft` and a
+Rust toolchain:
 
 ```sh
-CC_x86_64_unknown_linux_musl=musl-gcc \
-  cargo build --release --target x86_64-unknown-linux-musl
-mkdir -p dist && cp target/x86_64-unknown-linux-musl/release/ph-reactor dist/
-snapcraft --use-lxd        # produces ph-reactor_1.0.0_amd64.snap
+snapcraft --use-lxd          # compiles with cargo build --release --locked
 ```
 
-The snap is `strict`-confined: state under `$SNAP_USER_DATA/ph-reactor`,
-plugs `home`/`network`/`network-bind`/`dbus` (session bus for the tray),
-and starts on session autostart (the daemonized start).
+produces `ph-reactor_1.0.0_amd64.snap`. The `dump` part's `override-build`
+runs `cargo build --release --locked` and installs the binary to
+`$SNAP/bin/ph-reactor` plus the tray `.desktop` file to
+`$SNAP/share/applications/`. The app runs `ph-reactor run` on session
+autostart (the `.desktop` file carries `X-GNOME-Autostart-Enabled=true`).
 
 ## Troubleshooting
 

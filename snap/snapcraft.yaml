@@ -1,48 +1,51 @@
 name: ph-reactor
 base: core24
 version: "1.0.0"
-summary: Local Powerhouse reactor with a tray icon
+summary: Native Powerhouse reactor - event-sourced document store + P2P drive sync
 description: |
-  Runs the Powerhouse reactor in the background: a single native Rust
-  process that keeps remote knowledge-vault drives (e.g. the
-  powerhouse-knowledge vault) mirrored locally over a libp2p p2p mesh
-  (gossip + catch-up), with no separate Node.js runtime. A status-bar tray
-  icon (StatusNotifierItem) shows reactor and drive state; the menu and the
-  local settings page (http://127.0.0.1:4002/) configure drives — including
-  joining a vault with a one-shot signed invite (ph-reactor invite / join).
-  All state lives under $SNAP_USER_DATA/ph-reactor
-  (~/.ph/reactor outside the snap).
+  The ph-reactor is a native event-sourced document store with libp2p drive
+  sync, running as a Linux status-bar background daemon. It keeps your local
+  documents in sync with remote Powerhouse drives (for example a knowledge
+  vault group), shows a tray icon with a per-drive menu, and auto-installs
+  missing document model packages from the registry.
+license: MIT
+confinement: classic
 grade: stable
-confinement: strict
 
+# Classic confinement is required: the reactor runs as a user-session daemon
+# that (a) needs broad network access (libp2p TCP/QUIC + the registry), (b)
+# publishes a StatusNotifierItem on the *session* D-Bus for the tray icon,
+# and (c) keeps its store under the user's home. A classic snap gives it the
+# session bus and home access a strict snap would restrict.
+assumes:
+  - classic
+
+# A user-session desktop app, started at login and shown in the tray.
+# `restart-condition: always` keeps it alive if it ever exits.
 apps:
   ph-reactor:
-    command: bin/ph-reactor run --daemonize
-    autostart: ph-reactor
-    environment:
-      PH_REACTOR_STATE_DIR: $SNAP_USER_DATA/ph-reactor
-    plugs:
-      - home
-      - network
-      - network-bind
-      - dbus
-
-desktop:
-  ph-reactor:
-    name: Powerhouse Reactor
-    comment: Runs the local Powerhouse switchboard in the background
-    categories:
-      - Network
-      - Utility
-    Terminal: "false"
-    Environment: PH_REACTOR_STATE_DIR=$SNAP_USER_DATA/ph-reactor
+    command: bin/ph-reactor run
+    desktop: ph-reactor.desktop
 
 parts:
-  # The binary is a static musl build; CI builds it into dist/ before
-  # running snapcraft (see README "Build the snap").
   ph-reactor:
-    plugin: nil
+    plugin: dump
+    source: .
+    # The build step does the actual compilation; `dump` then ships the
+    # produced binary and the .desktop file.
     override-build: |
-      set -ex
-      test -x $CRAFT_PROJECT_DIR/dist/ph-reactor
-      install -Dm755 $CRAFT_PROJECT_DIR/dist/ph-reactor $CRAFT_PART_INSTALL/bin/ph-reactor
+      set -eux
+      cargo build --release --locked
+      install -Dm755 target/release/ph-reactor $SNAP/bin/ph-reactor
+      install -Dm644 packaging/ph-reactor.desktop \
+        $SNAP/share/applications/ph-reactor.desktop
+
+# --- Plugs ---------------------------------------------------------------
+plugs:
+  # libp2p listens on a TCP/QUIC port and dials peers.
+  network:
+  network-bind:
+  # The tray icon is a StatusNotifierItem on the session D-Bus.
+  dbus:
+  # The store + identity live under ~/.ph/reactor.
+  home:

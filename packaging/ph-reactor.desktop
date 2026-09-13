@@ -1,0 +1,14 @@
+[Desktop Entry]
+Type=Application
+Name=ph-reactor
+GenericName=Powerhouse Reactor
+Comment=Native event-sourced document store with P2P drive sync (tray daemon)
+Exec=ph-reactor run
+Icon=ph-reactor
+Terminal=false
+Categories=Network;Office;
+# Start at login, a few seconds after the session settles, so the tray icon
+# appears in the status bar.
+X-GNOME-Autostart-Enabled=true
+X-GNOME-Autostart-Delay=5
+X-KDE-StartupNotify=false
