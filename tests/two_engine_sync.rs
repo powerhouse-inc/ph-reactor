@@ -263,3 +263,92 @@ async fn drive_added_after_peer_already_connected_completes_handshake() {
     a.cmd_tx.send(EngineCommand::Shutdown).unwrap();
     b.cmd_tx.send(EngineCommand::Shutdown).unwrap();
 }
+
+/// Model distribution over the mesh: alpha hosts a custom `task@1` model
+/// (built-ins alone are not enough for beta). After alpha creates a task
+/// doc, beta must (a) notice it cannot reduce the action, (b) request the
+/// model definition from alpha over the request-response protocol, (c)
+/// verify the reply against the hash stamped on the action, (d) register
+/// the model, and (e) re-apply the action. The doc then appears on beta
+/// with its fields intact, and beta's registry now carries the model.
+#[tokio::test]
+async fn custom_model_is_distributed_over_the_mesh() {
+    use ph_reactor::doc::ModelRef;
+    use ph_reactor::model::l1::L1;
+    use ph_reactor::model::realistic::task_def;
+
+    init_log();
+    let a = spawn_node("alpha").await; // hosts the task model
+    let b = spawn_node("beta").await; // built-ins only; must fetch task@1
+
+    // A knows the task model; B does not.
+    let task = L1::from_def(task_def()).expect("task model is well-formed");
+    a.store.add_model(std::sync::Arc::new(task));
+    assert!(a.store.model_available(&ModelRef::new("task", "1")));
+    assert!(!b.store.model_available(&ModelRef::new("task", "1")));
+
+    // Cross-link the drives; both dials the other.
+    a.cmd_tx
+        .send(EngineCommand::AddDrive(drive("beta", &b)))
+        .unwrap();
+    b.cmd_tx
+        .send(EngineCommand::AddDrive(drive("alpha", &a)))
+        .unwrap();
+
+    let mut a_evt = a.evt_rx;
+    let mut b_evt = b.evt_rx;
+    tokio::time::timeout(Duration::from_secs(30), async {
+        wait_status(&mut a_evt, "beta", DriveStatus::Synced).await;
+        wait_status(&mut b_evt, "alpha", DriveStatus::Synced).await;
+    })
+    .await
+    .expect("handshake did not complete");
+
+    // A creates a task doc. B lacks the model, so it requests the
+    // definition over the mesh and re-applies once verified.
+    let payload = serde_json::json!({
+        "name": "write-the-reactor",
+        "title": "Reactor in Rust",
+        "status": "doing",
+        "assignee": "froid",
+        "project": "native",
+        "priority": 2
+    });
+    a.store
+        .create_doc_model("write-the-reactor", &ModelRef::new("task", "1"), &payload)
+        .unwrap();
+
+    // The reduced doc must appear on B with its fields intact.
+    tokio::time::timeout(Duration::from_secs(30), async {
+        wait_field(
+            &b.store,
+            "write-the-reactor",
+            "title",
+            &serde_json::json!("Reactor in Rust"),
+        )
+        .await;
+        wait_field(
+            &b.store,
+            "write-the-reactor",
+            "status",
+            &serde_json::json!("doing"),
+        )
+        .await;
+        wait_field(
+            &b.store,
+            "write-the-reactor",
+            "priority",
+            &serde_json::json!(2),
+        )
+        .await;
+    })
+    .await
+    .expect("task doc did not reach beta (the model was not distributed)");
+
+    // The proof of distribution: B now has the task model (it did not at
+    // start), and a later doc under the same model applies directly.
+    assert!(b.store.model_available(&ModelRef::new("task", "1")));
+
+    a.cmd_tx.send(EngineCommand::Shutdown).unwrap();
+    b.cmd_tx.send(EngineCommand::Shutdown).unwrap();
+}
