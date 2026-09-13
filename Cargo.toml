@@ -6,6 +6,10 @@ rust-version = "1.83"
 description = "Native event-sourced document store and libp2p drive sync, running as a status-bar background daemon"
 license = "SEE LICENSE IN LICENSE"
 
+[workspace]
+members = ["views"]
+resolver = "2"
+
 [lib]
 name = "ph_reactor"
 path = "src/lib.rs"

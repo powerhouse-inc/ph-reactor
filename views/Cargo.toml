@@ -1,0 +1,29 @@
+[package]
+name = "ph-reactor-views"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.83"
+description = "CQRS read models, processors, and query API over ph-reactor's document store"
+license = "SEE LICENSE IN LICENSE"
+
+[lib]
+name = "ph_reactor_views"
+
+[dependencies]
+ph-reactor = { path = ".." }
+tokio = { version = "1", features = [
+  "rt-multi-thread",
+  "macros",
+  "sync",
+  "time",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+thiserror = "1"
+tracing = "0.1"
+parking_lot = "0.12"
+hex = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+ed25519-dalek = "2"
