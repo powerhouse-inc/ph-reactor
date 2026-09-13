@@ -56,6 +56,12 @@ pub struct ReactorStatus {
     /// Most recent noteworthy event (one line, for the tray menu and
     /// the settings page).
     pub last_event: Option<String>,
+    /// Drives actively syncing (status `synced` or `connecting`).
+    #[serde(default)]
+    pub active_drives: usize,
+    /// The most recently applied or changed document name.
+    #[serde(default)]
+    pub last_doc: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -84,6 +90,8 @@ impl StatusSnapshot {
                 peer_id: None,
                 listen,
                 docs: 0,
+                active_drives: 0,
+                last_doc: None,
                 last_event: None,
             },
             drives: Vec::new(),
@@ -174,6 +182,8 @@ mod tests {
                 peer_id: Some("12D3KooWg8111".into()),
                 listen: "/ip4/0.0.0.0/tcp/4201".into(),
                 docs: 3,
+                active_drives: 1,
+                last_doc: Some("note-1".into()),
                 last_event: Some("op applied: note-1".into()),
             },
             drives: vec![DriveStatusEntry {
@@ -206,6 +216,8 @@ mod tests {
             "listen",
             "docs",
             "last_event",
+            "active_drives",
+            "last_doc",
         ] {
             assert!(r.get(key).is_some(), "missing reactor key {key}");
         }

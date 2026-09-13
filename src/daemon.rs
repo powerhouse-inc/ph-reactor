@@ -37,7 +37,7 @@ use crate::store::Store;
 use crate::tray;
 
 /// How often the daemon refreshes the status snapshot.
-const POLL_INTERVAL: Duration = Duration::from_secs(5);
+pub(crate) const POLL_INTERVAL: Duration = Duration::from_secs(5);
 /// How long `run --daemonize` waits for the child to become ready.
 const DAEMONIZE_TIMEOUT: Duration = Duration::from_secs(30);
 /// How long `stop` waits for a graceful exit before SIGKILL.
@@ -243,15 +243,20 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
     let (cmd_tx, mut cmd_rx) = mpsc::unbounded_channel();
 
     // The loopback settings server.
-    let settings = Settings::new(cmd_tx.clone(), snap_rx.clone(), store.clone())
-        .start(&config.settings.host, config.settings.port)
-        .await
-        .with_context(|| {
-            format!(
-                "starting the settings server on {}:{}",
-                config.settings.host, config.settings.port
-            )
-        })?;
+    let settings = Settings::new(
+        cmd_tx.clone(),
+        snap_rx.clone(),
+        store.clone(),
+        paths.clone(),
+    )
+    .start(&config.settings.host, config.settings.port)
+    .await
+    .with_context(|| {
+        format!(
+            "starting the settings server on {}:{}",
+            config.settings.host, config.settings.port
+        )
+    })?;
 
     // The status-bar tray (headless environments continue without it).
     let tray = tray::start(snap_rx, cmd_tx).await;
@@ -275,6 +280,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         drive_views: HashMap::new(),
         reactor_healthy: false,
         last_event: None,
+        last_doc: None,
         stopping: false,
     };
 
@@ -393,6 +399,8 @@ struct Ctx {
     reactor_healthy: bool,
     /// Most recent one-line event (status page + tray).
     last_event: Option<String>,
+    /// The most recently applied or changed document name.
+    last_doc: Option<String>,
     /// Set on shutdown signals / Quit; ends the loop.
     stopping: bool,
 }
@@ -428,7 +436,8 @@ fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
             tracing::debug!("engine: drive {name} -> {}", status.as_str());
         }
         EngineEvent::DocChanged { name } => {
-            ctx.last_event = Some(match name {
+            ctx.last_doc = name.clone();
+            ctx.last_event = Some(match &name {
                 Some(n) => format!("doc updated: {n}"),
                 None => "remote doc change".into(),
             });
@@ -606,6 +615,7 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
             reply,
         } => match ctx.store.create_doc(&name, fields) {
             Ok(id) => {
+                ctx.last_doc = Some(name.clone());
                 tracing::info!("created doc '{name}' ({id})");
                 ctx.last_event = Some(format!("created doc '{name}'"));
                 let _ = reply.send(Ok(()));
@@ -625,12 +635,32 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
             .and_then(|mr| ctx.store.apply_local_action(&name, &mr, &kind, &payload))
         {
             Ok(action) => {
+                ctx.last_doc = Some(name.clone());
                 tracing::info!("applied {kind} action to '{name}'");
                 ctx.last_event = Some(format!("applied {kind} to '{name}'"));
                 let _ = reply.send(Ok(action));
             }
             Err(e) => {
                 tracing::warn!("model action '{kind}' on '{name}' failed: {e}");
+                let _ = reply.send(Err(e));
+            }
+        },
+        Command::CreateDocModel {
+            name,
+            model,
+            payload,
+            reply,
+        } => match crate::doc::ModelRef::parse(&model)
+            .and_then(|mr| ctx.store.create_doc_model(&name, &mr, &payload).map(|_| ()))
+        {
+            Ok(()) => {
+                ctx.last_doc = Some(name.clone());
+                ctx.last_event = Some(format!("created {name} ({model})"));
+                tracing::info!("created {name} under {model}");
+                let _ = reply.send(Ok(()));
+            }
+            Err(e) => {
+                tracing::warn!("model doc create '{name}' failed: {e}");
                 let _ = reply.send(Err(e));
             }
         },
@@ -917,14 +947,6 @@ fn adopt_external(ctx: &mut Ctx, preserve_drives: bool) {
 /// Builds the next snapshot: engine view + one entry per configured
 /// drive.
 fn refresh_status(ctx: &Ctx, settings_url: &str) -> StatusSnapshot {
-    let reactor = ReactorStatus {
-        running: true,
-        healthy: ctx.reactor_healthy,
-        peer_id: Some(ctx.peer_id.to_base58()),
-        listen: ctx.config.instance.listen.clone(),
-        docs: ctx.store.live_doc_count() as u64,
-        last_event: ctx.last_event.clone(),
-    };
     let mut drives = Vec::with_capacity(ctx.config.drives.len());
     for d in &ctx.config.drives {
         let (status, detail) = ctx
@@ -945,6 +967,20 @@ fn refresh_status(ctx: &Ctx, settings_url: &str) -> StatusSnapshot {
             detail: detail.unwrap_or_default(),
         });
     }
+    let active_drives = drives
+        .iter()
+        .filter(|d| d.status == "synced" || d.status == "connecting")
+        .count();
+    let reactor = ReactorStatus {
+        running: true,
+        healthy: ctx.reactor_healthy,
+        peer_id: Some(ctx.peer_id.to_base58()),
+        listen: ctx.config.instance.listen.clone(),
+        docs: ctx.store.live_doc_count() as u64,
+        active_drives,
+        last_doc: ctx.last_doc.clone(),
+        last_event: ctx.last_event.clone(),
+    };
     StatusSnapshot {
         version: crate::VERSION.to_string(),
         reactor,
@@ -2081,6 +2117,8 @@ mod tests {
                 peer_id: Some("12D3KooWg8111".into()),
                 listen: "/ip4/0.0.0.0/tcp/4201".into(),
                 docs: 4,
+                active_drives: 0,
+                last_doc: None,
                 last_event: Some("drive vault: synced".into()),
             },
             drives: vec![DriveStatusEntry {
