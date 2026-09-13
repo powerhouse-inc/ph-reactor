@@ -198,3 +198,46 @@ nonce binding, TOFU key mismatch).
   unchanged in `snap/snapcraft.yaml`; size delta to be recorded at the
   release.
 - QUIC feature (off by default; not exercised).
+
+## 2026-09-13: `query` CLI + `/api/query`
+
+One daemonized instance (`--state-dir /tmp/phq`, release build), two
+open-model docs created with `doc add`:
+
+```
+$ ph-reactor query
+[
+  { "fields": { "n": 42, "name": "task1", "status": "todo" }, "model": "open", "name": "task1" },
+  { "fields": { "name": "task2", "status": "doing" },        "model": "open", "name": "task2" }
+]
+
+$ ph-reactor query "" --filter status=doing     # string field
+[ { "fields": { "name": "task2", "status": "doing" }, "model": "open", "name": "task2" } ]
+
+$ ph-reactor query open --filter n=42           # JSON-number field
+[ { "fields": { "n": 42, "name": "task1", "status": "todo" }, "model": "open", "name": "task1" } ]
+
+$ curl '127.0.0.1:4002/api/query?model=open&field=status&value=doing'
+[{"fields":{"name":"task2","status":"doing"},"model":"open","name":"task2"}]
+```
+
+The CLI opens the store read-only (no daemon required); `/api/query` is
+answered from the daemon's live store. Unit tests (in `src/query.rs`)
+pin the numeric-vs-string distinction and the model selection.
+
+## 2026-09-13: ten-client E2E
+
+`views/tests/e2e.rs`: ten reactors in one process, 90 drives, full mesh,
+real ed25519 keys, distinct ports. Two peers create a realistic
+project-management + finance set (7 + 2 docs across 4 L1 models with
+field types, preconditions, and a reverse-index); the test asserts all
+ten converge on the same doc set and read models and that every read
+model answers the same queries (2 projects, 2 accounts, 3 tasks,
+2 transactions). Passes in ~13 s.
+
+**Finding (documented, not asserted):** the connect-time catch-up
+converges all ten reliably, but *ongoing* changes to an already-converged
+set are lossy in a ten-peer full mesh — a gossip-missing peer can wait a
+full 30 s reconciliation tick, and DHT-discovered (non-bootstrap) peers
+lean on that path. The two-peer engine test covers the reliable update
+path. Tightening live convergence for large meshes is the follow-up.
