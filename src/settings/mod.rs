@@ -102,6 +102,9 @@ impl Settings {
             )
             .route("/api/processors/:name/fires", get(processor_fires_api))
             .route("/api/groups", get(groups_api).post(create_group))
+            .route("/api/groups/:name", get(group_detail))
+            .route("/api/groups/:name/drive", get(drive_list).post(drive_add))
+            .route("/api/groups/:name/drive/:doc", delete(drive_remove))
             .route("/api/groups/:name/action", post(group_action))
             .route("/api/groups/:name/activity", get(group_activity))
             .route("/api/folders", get(folders_api).post(create_folder))
@@ -326,9 +329,12 @@ async fn add_doc(
                 None => model,
             }
         };
-        let mut payload =
-            serde_json::to_value(&body.fields).unwrap_or_else(|_| json!({}));
-        if !payload.get("name").and_then(|v| v.as_str()).is_some_and(|s| !s.is_empty()) {
+        let mut payload = serde_json::to_value(&body.fields).unwrap_or_else(|_| json!({}));
+        if !payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty())
+        {
             payload["name"] = json!(body.name);
         }
         return run_create_doc_model(&state, &body.name, &model, payload).await;
@@ -723,12 +729,24 @@ async fn groups_api(state: axum::extract::State<Arc<Settings>>) -> Response {
             .and_then(|v| v.as_array())
             .cloned()
             .unwrap_or_default();
+        let msgs = f
+            .get("msg_text")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let drive = f
+            .get("drive")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
         groups.push(json!({
             "name": d.get("name").cloned().unwrap_or_default(),
             "members": members,
             "managers": managers,
             "memberCount": members.len(),
             "managerCount": managers.len(),
+            "msgCount": msgs.len(),
+            "driveCount": drive.len(),
         }));
     }
     axum::Json(groups).into_response()
@@ -822,22 +840,29 @@ struct GroupBody {
 }
 
 /// `POST /api/groups` — bootstrap a `group@1` document via its `init` reducer.
-/// The local vault is the group's owner: its own peer id is added to the
-/// managers so it can edit membership from the console. The two-person rule
-/// (quorum) still gates adding a *second* manager.
+/// The local vault is the group's owner: its own peer id is added as both a
+/// member and a manager, so it can use the channel and drive and edit
+/// membership from the console. The two-person rule (quorum) still gates
+/// adding a *second* manager.
 async fn create_group(
     state: axum::extract::State<Arc<Settings>>,
     axum::extract::Json(body): axum::extract::Json<GroupBody>,
 ) -> Response {
+    let mut members = body.members;
     let mut managers = body.managers;
     if let Some(local) = state.snap_rx.borrow().reactor.peer_id.clone() {
+        // A manager is always a member: the creator needs the channel/drive
+        // (member-gated) as well as membership control (manager-gated).
+        if !members.iter().any(|m| m == &local) {
+            members.push(local.clone());
+        }
         if !managers.iter().any(|m| m == &local) {
             managers.push(local);
         }
     }
     let payload = json!({
         "name": body.name,
-        "members": body.members,
+        "members": members,
         "managers": managers,
     });
     run_create_doc_model(&state, &body.name, "group@1", payload).await
@@ -887,6 +912,156 @@ async fn group_activity(
     axum::Json(out).into_response()
 }
 
+/// `GET /api/groups/:name` — the group's full state: membership plus its
+/// channel (the `msg_*` arrays) and its drive (the `drive` doc names). This is
+/// what the console renders as the shared space.
+async fn group_detail(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let store = &state.store;
+    let doc = match store.get(&name) {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let st = match store.full_state(doc.id) {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let fields: BTreeMap<String, Value> = st
+        .doc
+        .fields
+        .iter()
+        .map(|(k, v)| (k.clone(), v.value.clone()))
+        .collect();
+    let arr = |k: &str| -> Value { fields.get(k).cloned().unwrap_or_else(|| json!([])) };
+    axum::Json(json!({
+        "name": st.doc.name,
+        "members": arr("members"),
+        "managers": arr("managers"),
+        "msgFrom": arr("msg_from"),
+        "msgText": arr("msg_text"),
+        "msgTs": arr("msg_ts"),
+        "msgChannel": arr("msg_channel"),
+        "drive": arr("drive"),
+    }))
+    .into_response()
+}
+
+/// `GET /api/groups/:name/drive` — the docs in the group's drive (each doc's
+/// name/model/fields, or `missing` when the referenced doc is gone).
+async fn drive_list(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let store = &state.store;
+    let gdoc = match store.get(&name) {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let gst = match store.full_state(gdoc.id) {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let drive = gst
+        .doc
+        .fields
+        .get("drive")
+        .map(|f| f.value.clone())
+        .unwrap_or_else(|| json!([]));
+    let mut out = Vec::new();
+    for entry in drive.as_array().cloned().unwrap_or_default() {
+        let docname = entry.as_str().unwrap_or("").to_string();
+        let ddoc = match store.get(&docname) {
+            Some(d) => d,
+            None => {
+                out.push(json!({ "name": docname, "missing": true }));
+                continue;
+            }
+        };
+        let dstate = match store.full_state(ddoc.id) {
+            Some(s) => s,
+            None => {
+                out.push(json!({ "name": docname, "missing": true }));
+                continue;
+            }
+        };
+        let fields: BTreeMap<String, Value> = dstate
+            .doc
+            .fields
+            .iter()
+            .map(|(k, v)| (k.clone(), v.value.clone()))
+            .collect();
+        out.push(json!({
+            "name": docname,
+            "model": dstate.model.name,
+            "fields": fields
+        }));
+    }
+    axum::Json(out).into_response()
+}
+
+#[derive(Deserialize)]
+struct DriveAddBody {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    title: String,
+    #[serde(default)]
+    body: String,
+}
+
+/// `POST /api/groups/:name/drive` — create a `note` doc and add it to the
+/// group's drive in one call (the "new file" action).
+async fn drive_add(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<DriveAddBody>,
+) -> Response {
+    let note_name = match &body.name {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("note-{ms}")
+        }
+    };
+    let title = if body.title.trim().is_empty() {
+        note_name.clone()
+    } else {
+        body.title.clone()
+    };
+    let payload = json!({ "name": note_name, "title": title, "body": body.body });
+    let created = run_create_doc_model(&state, &note_name, "note@1", payload).await;
+    if created.status() != StatusCode::OK {
+        return created;
+    }
+    run_create_action(
+        &state,
+        &name,
+        "group@1",
+        "add-doc",
+        json!({ "name": note_name }),
+    )
+    .await
+}
+
+/// `DELETE /api/groups/:name/drive/:doc` — remove a doc from the group's drive.
+async fn drive_remove(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path((name, doc)): axum::extract::Path<(String, String)>,
+) -> Response {
+    run_create_action(
+        &state,
+        &name,
+        "group@1",
+        "remove-doc",
+        json!({ "name": doc }),
+    )
+    .await
+}
 
 /// `GET /api/folders` — the registered folder documents.
 async fn folders_api(state: axum::extract::State<Arc<Settings>>) -> Response {
@@ -1103,7 +1278,6 @@ fn pick(override_: &str, default: &str) -> String {
 // Single-page UI
 // ---------------------------------------------------------------------------
 
-
 /// `GET /api/models` — the registered document-model types (for the
 /// create-document picker).
 async fn models_api(state: axum::extract::State<Arc<Settings>>) -> Response {
@@ -1135,7 +1309,10 @@ async fn register_model(
         Ok(m) => {
             let name = crate::model::Model::ref_(&m).name.clone();
             state.store.add_model(Arc::new(m));
-            (StatusCode::CREATED, axum::Json(json!({ "ok": true, "name": name })))
+            (
+                StatusCode::CREATED,
+                axum::Json(json!({ "ok": true, "name": name })),
+            )
                 .into_response()
         }
         Err(e) => (
@@ -1336,7 +1513,10 @@ async fn llm_draft_processor(
             .and_then(|v| v.as_object())
             .map(|o| o.keys().cloned().collect::<Vec<_>>().join(", "))
             .unwrap_or_default();
-        model_lines.push(format!("- {} : fields {} ; reducers [{}]", r.name, fields, reducers));
+        model_lines.push(format!(
+            "- {} : fields {} ; reducers [{}]",
+            r.name, fields, reducers
+        ));
     }
     let sys = format!(
         r#"You write "subscriptions" for an event-sourced document store. A subscription watches for a specific change to documents and, when it matches, runs a reaction. Given a short description of what the user wants, return ONE valid JSON object and nothing else: no prose, no markdown fences, no trailing commas.
