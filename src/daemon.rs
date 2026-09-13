@@ -192,6 +192,7 @@ async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
         listen,
         config.p2p.mdns,
         config.p2p.dht,
+        config.p2p.relay,
         token,
         eng_cmd_rx,
         evt_tx,
@@ -412,6 +413,9 @@ fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
             let _ = &key; // the key is the doc id; the daemon dials `peer` to fetch it
             ctx.last_event = Some(format!("dht: {peer} provides a doc"));
             tracing::info!(%peer, "engine: dht provider discovered");
+        }
+        EngineEvent::PeerConnected { peer } => {
+            tracing::debug!(%peer, "engine: peer connected");
         }
     }
 }

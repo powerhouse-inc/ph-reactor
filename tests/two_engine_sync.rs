@@ -52,6 +52,7 @@ async fn spawn_node(tag: &str) -> Node {
         listen,
         false,    // no mDNS in the test
         false,    // no DHT in the test
+        false,    // no relay in the test
         None,     // no shared token
         cmd_rx,
         evt_tx,

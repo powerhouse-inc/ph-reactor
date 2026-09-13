@@ -51,7 +51,8 @@ async fn spawn_dht_node(tag: &str) -> Node {
         tag,
         listen,
         false, // no mDNS
-        true,  // DHT enabled
+        true,   // DHT enabled
+        false,  // no relay
         None,  // no shared token
         cmd_rx,
         evt_tx,

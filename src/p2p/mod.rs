@@ -27,6 +27,7 @@ use futures_util::StreamExt;
 use libp2p::gossipsub;
 use libp2p::identify;
 use libp2p::kad;
+use libp2p::relay;
 use libp2p::identity::Keypair;
 use libp2p::request_response::{self, OutboundRequestId};
 use libp2p::swarm::behaviour::toggle::Toggle;
@@ -171,6 +172,8 @@ pub enum EngineEvent {
     DhtBootstrap(bool),
     /// The DHT reported a provider for a key (doc id bytes).
     DhtProvider { key: Vec<u8>, peer: PeerId },
+    /// A connection to a peer was established (direct or relayed).
+    PeerConnected { peer: PeerId },
 }
 
 // ---------------------------------------------------------------------------
@@ -226,63 +229,13 @@ struct SyncBehaviour {
     mdns: Toggle<mdns::tokio::Behaviour>,
     identify: identify::Behaviour,
     kad: Toggle<kad::Behaviour<kad::store::MemoryStore>>,
+    /// Circuit relay server: lets this node forward connections for peers
+    /// behind NAT. Config-gated (`p2p.relay`).
+    relay_server: Toggle<relay::Behaviour>,
+    /// Circuit relay client: dials through a relay for NAT traversal.
+    relay_client: relay::client::Behaviour,
 }
 
-impl SyncBehaviour {
-    fn new(key: &Keypair, mdns_enabled: bool, dht_enabled: bool) -> anyhow::Result<Self> {
-        let peer_id = peer_id_of(key);
-
-        let config = gossipsub::ConfigBuilder::default()
-            .heartbeat_interval(Duration::from_secs(1))
-            .duplicate_cache_time(Duration::from_secs(15))
-            .flood_publish(true)
-            .validation_mode(gossipsub::ValidationMode::Strict)
-            .build()
-            .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
-        let gossipsub =
-            gossipsub::Behaviour::new(gossipsub::MessageAuthenticity::Signed(key.clone()), config)
-                .map_err(|e| anyhow::anyhow!("gossipsub behaviour: {e}"))?;
-
-        let sync = request_response::Behaviour::new(
-            [(SYNC_PROTO, request_response::ProtocolSupport::Full)],
-            request_response::Config::default(),
-        );
-
-        let mdns = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
-            .map_err(anyhow::Error::from)?;
-        let mdns = Toggle::from(if mdns_enabled { Some(mdns) } else { None });
-
-        // Identify: advertises our protocols and listen addresses to
-        // connected peers; the DHT consumes the received addresses for
-        // routing (`kad.add_address`).
-        let id_cfg = identify::Config::new("1.0.0".to_string(), key.public())
-            .with_agent_version("ph-reactor/1.0.0".to_string());
-        let identify = identify::Behaviour::new(id_cfg);
-
-        // Kademlia: peer routing + provider records. `dht: false` -> the
-        // behaviour is absent (not advertised), so the node is truly off
-        // the DHT.
-        let kad = if dht_enabled {
-            let mut cfg = kad::Config::new(kad::PROTOCOL_NAME);
-            cfg.set_query_timeout(Duration::from_secs(30));
-            let store = kad::store::MemoryStore::new(peer_id);
-            let mut kad = kad::Behaviour::with_config(peer_id, store, cfg);
-            kad.set_mode(Some(kad::Mode::Server));
-            Some(kad)
-        } else {
-            None
-        };
-        let kad = Toggle::from(kad);
-
-        Ok(Self {
-            gossipsub,
-            sync,
-            mdns,
-            identify,
-            kad,
-        })
-    }
-}
 
 impl SyncEngine {
     /// Builds the engine. `listen` is the configured listen multiaddr.
@@ -295,13 +248,54 @@ impl SyncEngine {
         listen: Multiaddr,
         mdns_enabled: bool,
         dht_enabled: bool,
+        relay_enabled: bool,
         token: Option<String>,
         cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
         evt_tx: mpsc::UnboundedSender<EngineEvent>,
     ) -> anyhow::Result<Self> {
         let peer_id = peer_id_of(key);
 
-        let behaviour = SyncBehaviour::new(key, mdns_enabled, dht_enabled)?;
+        // Pre-build the fallible behaviours before the builder (the relay
+        // client is only available inside the `with_behaviour` closure, and
+        // that closure must return a plain behaviour).
+        let gs_config = gossipsub::ConfigBuilder::default()
+            .heartbeat_interval(Duration::from_secs(1))
+            .duplicate_cache_time(Duration::from_secs(15))
+            .flood_publish(true)
+            .validation_mode(gossipsub::ValidationMode::Strict)
+            .build()
+            .map_err(|e| anyhow::anyhow!("gossipsub config: {e}"))?;
+        let gossipsub = gossipsub::Behaviour::new(
+            gossipsub::MessageAuthenticity::Signed(key.clone()),
+            gs_config,
+        )
+        .map_err(|e| anyhow::anyhow!("gossipsub behaviour: {e}"))?;
+        let sync = request_response::Behaviour::new(
+            [(SYNC_PROTO, request_response::ProtocolSupport::Full)],
+            request_response::Config::default(),
+        );
+        let mdns = {
+            let m = mdns::tokio::Behaviour::new(mdns::Config::default(), peer_id)
+                .map_err(anyhow::Error::from)?;
+            Toggle::from(if mdns_enabled { Some(m) } else { None })
+        };
+        let id_cfg = identify::Config::new("1.0.0".to_string(), key.public())
+            .with_agent_version("ph-reactor/1.0.0".to_string());
+        let identify = identify::Behaviour::new(id_cfg);
+        let kad = {
+            let k = if dht_enabled {
+                let mut cfg = kad::Config::new(kad::PROTOCOL_NAME);
+                cfg.set_query_timeout(Duration::from_secs(30));
+                let store = kad::store::MemoryStore::new(peer_id);
+                let mut k = kad::Behaviour::with_config(peer_id, store, cfg);
+                k.set_mode(Some(kad::Mode::Server));
+                Some(k)
+            } else {
+                None
+            };
+            Toggle::from(k)
+        };
+
         let swarm = SwarmBuilder::with_existing_identity(key.clone())
             .with_tokio()
             .with_tcp(
@@ -310,7 +304,22 @@ impl SyncEngine {
                 yamux::Config::default,
             )
             .map_err(|e| anyhow::anyhow!("tcp transport: {e}"))?
-            .with_behaviour(|_kp| behaviour)
+            .with_relay_client(noise::Config::new, yamux::Config::default)
+            .map_err(|e| anyhow::anyhow!("relay client: {e}"))?
+            .with_behaviour(move |_kp, relay_client| {
+                let relay_server = Toggle::from(relay_enabled.then(|| {
+                    relay::Behaviour::new(peer_id_of(_kp), relay::Config::default())
+                }));
+                SyncBehaviour {
+                    gossipsub,
+                    sync,
+                    mdns,
+                    identify,
+                    kad,
+                    relay_server,
+                    relay_client,
+                }
+            })
             .map_err(|e| anyhow::anyhow!("behaviour: {e}"))?
             .build();
 
@@ -621,6 +630,7 @@ impl SyncEngine {
                 }
             }
             SwarmEvent::ConnectionEstablished { peer_id, .. } => {
+                let _ = self.evt_tx.send(EngineEvent::PeerConnected { peer: peer_id });
                 let Some(name) = self.drive_name_by_peer(peer_id) else {
                     return;
                 };
@@ -709,6 +719,10 @@ impl SyncEngine {
                     tracing::debug!("dht: routing table updated for {peer}");
                 }
                 SyncBehaviourEvent::Kad(_) => {}
+                // Relay events (client + server) are handled internally by
+                // the behaviours; nothing to fold into the engine here yet.
+                SyncBehaviourEvent::RelayServer(_) => {}
+                SyncBehaviourEvent::RelayClient(_) => {}
             },
             _ => {}
         }
