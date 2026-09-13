@@ -74,6 +74,7 @@ pub enum HelloError {
     BadVersion { expected: u32, got: u32 },
     AuthRequired,
     BadToken,
+    KeyMismatch,
 }
 
 impl HelloError {
@@ -82,6 +83,7 @@ impl HelloError {
             HelloError::BadVersion { .. } => "bad-version",
             HelloError::AuthRequired => "auth-required",
             HelloError::BadToken => "bad-token",
+            HelloError::KeyMismatch => "key-mismatch",
         }
     }
 }

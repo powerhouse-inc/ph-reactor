@@ -279,9 +279,22 @@ impl Store {
     }
 
     /// Record a peer's public key (from a Hello handshake) so its actions
-    /// verify.
-    pub fn register_peer_key(&self, origin: &str, key: [u8; 32]) {
-        self.inner.lock().known_keys.insert(origin.to_string(), key);
+    /// verify. Trust-on-first-use: the first key seen for a peer id is
+    /// pinned; a later *different* key is a mismatch (the peer is refusing
+    /// to verify) and returns `Err` so the caller can reject it. A matching
+    /// key is idempotent.
+    pub fn register_peer_key(&self, origin: &str, key: [u8; 32]) -> Result<(), String> {
+        let mut inner = self.inner.lock();
+        match inner.known_keys.get(origin) {
+            Some(pinned) if *pinned == key => Ok(()),
+            Some(_) => Err(format!(
+                "key mismatch for peer {origin}: a different key was pinned on first contact (TOFU)"
+            )),
+            None => {
+                inner.known_keys.insert(origin.to_string(), key);
+                Ok(())
+            }
+        }
     }
 
     pub fn create_doc(
@@ -1058,6 +1071,31 @@ mod tests {
         Store::open(dir, &identity(9), "test-origin").expect("store opens")
     }
 
+    #[test]
+    fn tofu_pinning_rejects_key_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_store(dir.path());
+        let origin = "peer-x";
+        let good = identity(11);
+        let evil = identity(12);
+
+        // First contact pins the key; re-pinning the same key is idempotent.
+        s.register_peer_key(origin, good.verifying_key().to_bytes()).unwrap();
+        s.register_peer_key(origin, good.verifying_key().to_bytes()).unwrap();
+
+        // A different key for the same origin is a TOFU mismatch (rejected,
+        // and does not replace the pinned key).
+        let err = s
+            .register_peer_key(origin, evil.verifying_key().to_bytes())
+            .unwrap_err();
+        assert!(err.contains("TOFU"), "mismatch should mention TOFU: {err}");
+
+        // The pinned (good) key still wins: re-registering it succeeds, and
+        // the evil key is still rejected (it never got pinned).
+        s.register_peer_key(origin, good.verifying_key().to_bytes()).unwrap();
+        s.register_peer_key(origin, evil.verifying_key().to_bytes()).unwrap_err();
+    }
+
     /// Build a signed open@1 `set` action from `origin` with `key`.
     fn make_set_action(
         id: DocId,
@@ -1222,7 +1260,7 @@ mod tests {
         // a remote peer (different origin) signs actions
         let remote_key = identity(7);
         let remote_origin = "remote-peer";
-        s.register_peer_key(remote_origin, remote_key.verifying_key().to_bytes());
+        s.register_peer_key(remote_origin, remote_key.verifying_key().to_bytes()).unwrap();
 
         let id = s.create_doc("shared", BM::new()).unwrap();
         let entry_clock0 = s.summary()[&id].clone();
@@ -1253,7 +1291,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let s = open_store(dir.path());
         let rogue = identity(3);
-        s.register_peer_key("rogue", rogue.verifying_key().to_bytes());
+        s.register_peer_key("rogue", rogue.verifying_key().to_bytes()).unwrap();
         let id = s.create_doc("t", BM::new()).unwrap();
         let mut clock = s.summary()[&id].clone();
         clock.tick("rogue");
@@ -1310,7 +1348,7 @@ mod tests {
             ("carol", &k_carol),
             ("mallory", &k_mallory),
         ] {
-            s.register_peer_key(name, k.verifying_key().to_bytes());
+            s.register_peer_key(name, k.verifying_key().to_bytes()).unwrap();
         }
 
         // Bootstrap: members [alice bob carol], managers [alice].
@@ -1477,7 +1515,7 @@ mod tests {
         let k_bob = identity(2);
         let k_carol = identity(3);
         for (name, k) in [("alice", &k_alice), ("bob", &k_bob), ("carol", &k_carol)] {
-            s.register_peer_key(name, k.verifying_key().to_bytes());
+            s.register_peer_key(name, k.verifying_key().to_bytes()).unwrap();
         }
         let id = DocId::new();
         let init = make_group_action(

@@ -849,7 +849,15 @@ impl SyncEngine {
                         // exists yet (a drive added later completes the
                         // handshake from this record).
                         self.guests.insert(peer);
-                        self.store.register_peer_key(&peer.to_base58(), arr);
+                        if self.store.register_peer_key(&peer.to_base58(), arr).is_err() {
+                            tracing::warn!(%peer, "TOFU key mismatch: refusing the handshake");
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .sync
+                                .send_response(channel, SyncMsg::HelloErr(HelloError::KeyMismatch));
+                            return;
+                        }
                     }
                 }
                 // Ack with our full doc summary: the dialer plans
@@ -932,7 +940,25 @@ impl SyncEngine {
                         if kb.len() == 32 {
                             let mut arr = [0u8; 32];
                             arr.copy_from_slice(&kb);
-                            self.store.register_peer_key(&peer.to_base58(), arr);
+                            if self
+                                .store
+                                .register_peer_key(&peer.to_base58(), arr)
+                                .is_err()
+                            {
+                                self.set_status(
+                                    &name,
+                                    DriveStatus::Error,
+                                    Some(
+                                        "TOFU key mismatch: the peer presented a different key \
+                                         than was pinned on first contact".to_string(),
+                                    ),
+                                );
+                                tracing::warn!(
+                                    %peer,
+                                    "TOFU key mismatch on HelloAck: drive marked as error"
+                                );
+                                return;
+                            }
                         }
                     }
                 }
@@ -995,6 +1021,10 @@ impl SyncEngine {
                     HelloError::BadToken => (
                         DriveStatus::RequiresAuth,
                         "token rejected by the drive".to_string(),
+                    ),
+                    HelloError::KeyMismatch => (
+                        DriveStatus::Error,
+                        "TOFU key mismatch: the peer's key differs from the pinned key".to_string(),
                     ),
                 };
                 if let Some(rt) = self.drives.get_mut(&name) {
