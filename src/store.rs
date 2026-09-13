@@ -809,6 +809,10 @@ impl Inner {
                         let (applied, deleted) =
                             apply_ops_to_entry(&mut entry, model.as_ref(), &action);
                         entry.deleted = deleted;
+                        // Mirror the live apply path (apply_action): the doc's
+                        // governing model is the model of its actions, not the
+                        // open@1 default an unsnapshotted entry starts with.
+                        entry.model = action.model.clone();
                         if applied {
                             entry.log.push(action);
                         }
@@ -1362,6 +1366,38 @@ mod tests {
         assert_eq!(doc.name, "persist");
         assert_eq!(doc.fields["a"].value, 99);
         assert_eq!(doc.fields["b"].value, 2);
+        assert_eq!(s2.doc_count(), 1);
+    }
+
+    /// A doc created under a specific model (via its `init` reducer) must
+    /// replay with *that* model after a restart, not the `open@1` default an
+    /// unsnapshotted entry starts with. Regression: `replay_doc` reduced an
+    /// action's ops but never set `entry.model`, so a `group` created before
+    /// its first snapshot came back as an `open` doc and dropped out of the
+    /// group projection.
+    #[test]
+    fn replay_preserves_model_of_model_created_doc() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_store(dir.path());
+        let group_ref = ModelRef::parse("group@1").unwrap();
+        s.create_doc_model(
+            "devs",
+            &group_ref,
+            &serde_json::json!({
+                "name": "devs",
+                "members": ["alice", "bob"],
+                "managers": ["carol"],
+            }),
+        )
+        .unwrap();
+        drop(s);
+
+        let s2 = open_store(dir.path());
+        let id = s2.get("devs").expect("the group survives a restart").id;
+        let state = s2.full_state(id).expect("the group has a full state");
+        assert_eq!(state.model.name, "group", "replay must preserve the group model");
+        assert_eq!(state.model.version, "1");
+        assert_eq!(state.doc.fields["members"].value, serde_json::json!(["alice", "bob"]));
         assert_eq!(s2.doc_count(), 1);
     }
 
