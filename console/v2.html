@@ -477,25 +477,28 @@ function showDoc(name, models) {
       const card = $("#doc-detail-card");
       card.style.display = "";
       const fields = Object.entries(d.fields || {}).map(([k, v]) => `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${esc(JSON.stringify(v))}</span></div>`).join("");
+      const m = models.find((x) => x.name === d.model);
+      const setFields = (m && m.reducers ? Object.keys(m.reducers) : []).filter((k) => k.startsWith("set-")).map((k) => k.slice(4));
+      const fieldControl = setFields.length
+        ? `<select id="act-field">${setFields.map((f) => `<option value="${esc(f)}">${esc(f)}</option>`).join("")}</select>`
+        : `<input id="act-field" placeholder="a field to set">`;
       card.innerHTML = `<h3>Document</h3>
         <div class="kv"><span class="k">name</span><span class="v">${esc(d.name)}</span></div>
         <div class="kv"><span class="k">model</span><span class="v">${esc(d.model)}</span></div>
         <div class="divider"></div>${fields}
         <div class="divider"></div>
         <h3>Actions</h3>
-        <div class="field"><span>a field to update</span><div class="field-row"><input id="act-field" placeholder="status"><input id="act-value" placeholder="accepted"></div></div>
-        <button class="btn" id="act-set">set field</button>
-        <div class="muted" style="font-size:11px;margin-top:8px">e.g. set status=accepted to fire any processor watching that</div>`;
+        <div class="field"><span>${setFields.length ? "action" : "field"}</span><div class="field-row">${fieldControl}<input id="act-value" placeholder="value"></div></div>
+        <button class="btn" id="act-set">apply</button>
+        <div class="muted" style="font-size:11px;margin-top:8px">${setFields.length ? "this model exposes: " + setFields.map((f) => "set-" + f).join(", ") + " (fire any processor watching them)" : "open doc — any field can be set"}</div>`;
       $("#act-set").onclick = async () => {
         try {
           const f = $("#act-field").value.trim(), v = $("#act-value").value.trim();
           if (!f) return;
-          const m = models.find((x) => x.name === d.model);
-          // Prefer a model-specific set-<field> reducer; fall back to the generic set.
-          const kind = (m && m.fields && m.fields[f] && Object.keys(m.reducers || {}).includes("set-" + f)) ? "set-" + f : "set";
+          const kind = setFields.includes(f) ? "set-" + f : "set";
           const payload = kind === "set" ? { field: f, value: v } : { [f]: v };
           await post("/api/docs/action", { name: d.name, model: d.model, kind, payload });
-          toast("updated " + f + " → " + v);
+          toast("set " + f + " → " + v);
           showDoc(name, models);
         } catch (e) { toast(e.message, true); }
       };

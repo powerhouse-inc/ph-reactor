@@ -1113,6 +1113,7 @@ async fn models_api(state: axum::extract::State<Arc<Settings>>) -> Response {
             "name": r.name,
             "version": r.version,
             "fields": def.get("fields").cloned().unwrap_or(json!({})),
+            "reducers": def.get("reducers").cloned().unwrap_or(json!({})),
         }));
     }
     axum::Json(out).into_response()
