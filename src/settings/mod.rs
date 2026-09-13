@@ -12,10 +12,11 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use axum::extract::Path;
 use axum::http::StatusCode;
-use axum::response::{IntoResponse, Response};
+use axum::response::{Html, IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use axum::Router;
 use serde::Deserialize;
+use serde_json::{json, Value};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot, watch};
 
@@ -24,11 +25,17 @@ use crate::query::{parse_filter, query_docs};
 use crate::status::StatusSnapshot;
 use crate::store::Store;
 
+use crate::config;
+use crate::doc::VecClock;
+use crate::paths::StatePaths;
+
 pub struct Settings {
     cmd_tx: mpsc::UnboundedSender<Command>,
     snap_rx: watch::Receiver<StatusSnapshot>,
     /// The doc store — the source of truth behind `/api/query`.
     store: Arc<Store>,
+    /// The state paths (config file, log file) — read by the API handlers.
+    paths: StatePaths,
 }
 
 pub struct SettingsHandle {
@@ -47,11 +54,13 @@ impl Settings {
         cmd_tx: mpsc::UnboundedSender<Command>,
         snap_rx: watch::Receiver<StatusSnapshot>,
         store: Arc<Store>,
+        paths: StatePaths,
     ) -> Self {
         Self {
             cmd_tx,
             snap_rx,
             store,
+            paths,
         }
     }
 
@@ -68,15 +77,21 @@ impl Settings {
             .route("/api/drives/:name/pause", post(pause_drive))
             .route("/api/drives/:name/resume", post(resume_drive))
             .route("/api/drives/:name/resync", post(resync_drive))
-            .route("/api/config", post(set_config))
+            .route("/api/config", get(config_api).post(set_config))
             .route("/api/quit", post(quit))
-            .route("/api/docs", post(add_doc))
+            .route("/api/docs", get(docs_api).post(add_doc))
             .route("/api/docs/action", post(action_doc))
             .route("/api/query", get(query_api))
             .route("/api/invite", post(make_invite))
             .route("/api/join", post(join_invite))
             .route("/api/ban", post(ban_peer))
             .route("/api/unban", post(unban_peer))
+            .route("/api/processors", get(processors_api))
+            .route("/api/groups", get(groups_api).post(create_group))
+            .route("/api/groups/:name/action", post(group_action))
+            .route("/api/groups/:name/activity", get(group_activity))
+            .route("/api/docs/:name", get(doc_detail))
+            .route("/api/llm/test", post(llm_test))
             .with_state(Arc::new(self));
         let task = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
@@ -491,235 +506,413 @@ async fn unban_peer(
     }
 }
 // ---------------------------------------------------------------------------
+// Console API (config, processors, groups, documents, llm)
+// ---------------------------------------------------------------------------
+
+/// `GET /api/config` — the current configuration (for the Settings form).
+async fn config_api(state: axum::extract::State<Arc<Settings>>) -> Response {
+    match config::load(&state.paths) {
+        Ok(cfg) => (
+            StatusCode::OK,
+            axum::Json(serde_json::to_value(&cfg).unwrap_or_else(|_| json!({}))),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            format!("loading config: {e}"),
+        )
+            .into_response(),
+    }
+}
+
+/// `GET /api/processors` — the daemon's live background subsystems.
+async fn processors_api(state: axum::extract::State<Arc<Settings>>) -> Response {
+    let snap = state.snap_rx.borrow().clone();
+    let cfg = config::load(&state.paths).unwrap_or_default();
+    let log_path = state.paths.reactor_log();
+    let log_size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    let body = json!({
+        "syncEngine": {
+            "running": snap.reactor.running,
+            "healthy": snap.reactor.healthy,
+            "peerId": snap.reactor.peer_id,
+            "listen": snap.reactor.listen,
+            "configuredDrives": snap.drives.len(),
+            "activeDrives": snap.reactor.active_drives,
+            "lastEvent": snap.reactor.last_event,
+            "mdns": cfg.p2p.mdns,
+            "dht": cfg.p2p.dht,
+            "relay": cfg.p2p.relay,
+        },
+        "store": {
+            "docs": snap.reactor.docs,
+            "lastDoc": snap.reactor.last_doc,
+        },
+        "settingsServer": {
+            "url": snap.settings.url,
+        },
+        "logRotation": {
+            "file": log_path.to_string_lossy(),
+            "sizeBytes": log_size,
+            "logLevel": cfg.log_level,
+        },
+        "statusPoller": {
+            "intervalSec": crate::daemon::POLL_INTERVAL.as_secs(),
+            "lastRefresh": snap.updated_at,
+        },
+        "llm": {
+            "baseUrl": cfg.llm.base_url,
+            "model": cfg.llm.model,
+            "apiKeyEnv": cfg.llm.api_key_env,
+        },
+    });
+    axum::Json(body).into_response()
+}
+
+/// `GET /api/groups` — every `group` document, with its membership.
+async fn groups_api(state: axum::extract::State<Arc<Settings>>) -> Response {
+    let docs = query_docs(&state.store, "group", None);
+    let mut groups = Vec::new();
+    for d in docs {
+        let f = d.get("fields").cloned().unwrap_or_else(|| json!({}));
+        let members = f
+            .get("members")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        let managers = f
+            .get("managers")
+            .and_then(|v| v.as_array())
+            .cloned()
+            .unwrap_or_default();
+        groups.push(json!({
+            "name": d.get("name").cloned().unwrap_or_default(),
+            "members": members,
+            "managers": managers,
+            "memberCount": members.len(),
+            "managerCount": managers.len(),
+        }));
+    }
+    axum::Json(groups).into_response()
+}
+
+/// Sends a `CreateAction` (model + kind + payload) through the single-writer
+/// command channel and awaits the one-shot reply.
+async fn run_create_action(
+    state: &axum::extract::State<Arc<Settings>>,
+    name: &str,
+    model: &str,
+    kind: &str,
+    payload: Value,
+) -> Response {
+    if !valid_name(name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "name may be any characters except '/' (max 64)",
+        )
+            .into_response();
+    }
+    let (reply, wait) = oneshot::channel();
+    let cmd = Command::CreateAction {
+        name: name.to_string(),
+        model: model.to_string(),
+        kind: kind.to_string(),
+        payload,
+        reply,
+    };
+    if state.cmd_tx.send(cmd).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(Ok(Ok(action))) => {
+            let j = serde_json::to_value(&action).unwrap_or_else(|_| json!({ "ok": true }));
+            (StatusCode::OK, axum::Json(j)).into_response()
+        }
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "action timed out").into_response(),
+    }
+}
+
+/// Sends a `CreateDocModel` (model + init payload) through the command
+/// channel and awaits the one-shot reply. Used to bootstrap a doc under a
+/// specific model (e.g. a `group@1` group) via its `init` reducer.
+async fn run_create_doc_model(
+    state: &axum::extract::State<Arc<Settings>>,
+    name: &str,
+    model: &str,
+    payload: Value,
+) -> Response {
+    if !valid_name(name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "name may be any characters except '/' (max 64)",
+        )
+            .into_response();
+    }
+    let (reply, wait) = oneshot::channel();
+    let cmd = Command::CreateDocModel {
+        name: name.to_string(),
+        model: model.to_string(),
+        payload,
+        reply,
+    };
+    if state.cmd_tx.send(cmd).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(10), wait).await {
+        Ok(Ok(Ok(()))) => (StatusCode::OK, axum::Json(json!({ "ok": true }))).into_response(),
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "create timed out").into_response(),
+    }
+}
+
+#[derive(Deserialize)]
+struct GroupBody {
+    name: String,
+    #[serde(default)]
+    members: Vec<String>,
+    #[serde(default)]
+    managers: Vec<String>,
+}
+
+/// `POST /api/groups` — bootstrap a `group@1` document via its `init` reducer.
+/// The local vault is the group's owner: its own peer id is added to the
+/// managers so it can edit membership from the console. The two-person rule
+/// (quorum) still gates adding a *second* manager.
+async fn create_group(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<GroupBody>,
+) -> Response {
+    let mut managers = body.managers;
+    if let Some(local) = state.snap_rx.borrow().reactor.peer_id.clone() {
+        if !managers.iter().any(|m| m == &local) {
+            managers.push(local);
+        }
+    }
+    let payload = json!({
+        "name": body.name,
+        "members": body.members,
+        "managers": managers,
+    });
+    run_create_doc_model(&state, &body.name, "group@1", payload).await
+}
+
+#[derive(Deserialize)]
+struct GroupActionBody {
+    kind: String,
+    payload: Value,
+}
+
+/// `POST /api/groups/:name/action` — a group action (add-member, remove-member,
+/// add-manager). The two-person rule is enforced by the model.
+async fn group_action(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<GroupActionBody>,
+) -> Response {
+    run_create_action(&state, &name, "group@1", &body.kind, body.payload).await
+}
+
+/// `GET /api/groups/:name/activity` — the group's recent signed actions.
+async fn group_activity(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let store = &state.store;
+    let doc = match store.get(&name) {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let (_, actions) = store.catch_up(doc.id, &VecClock::default());
+    let out: Vec<Value> = actions
+        .iter()
+        .rev()
+        .take(50)
+        .map(|a| {
+            json!({
+                "kind": a.kind,
+                "actor": a.origin,
+                "ts": a.ts,
+                "cosigners": a.cosig.iter().map(|c| c.origin.clone()).collect::<Vec<_>>(),
+                "payload": a.payload,
+            })
+        })
+        .collect();
+    axum::Json(out).into_response()
+}
+
+#[derive(Deserialize)]
+struct DocsQuery {
+    #[serde(default)]
+    model: Option<String>,
+    #[serde(default)]
+    field: Option<String>,
+    #[serde(default)]
+    value: Option<String>,
+}
+
+/// `GET /api/docs` — every document (optionally filtered by model / field).
+async fn docs_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Query(params): axum::extract::Query<DocsQuery>,
+) -> Response {
+    let filter = match (&params.field, &params.value) {
+        (Some(f), Some(v)) => parse_filter(&format!("{f}={v}")),
+        _ => None,
+    };
+    axum::Json(query_docs(
+        &state.store,
+        params.model.as_deref().unwrap_or(""),
+        filter.as_ref(),
+    ))
+    .into_response()
+}
+
+/// `GET /api/docs/:name` — one document's full state.
+async fn doc_detail(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+) -> Response {
+    let store = &state.store;
+    let doc = match store.get(&name) {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "no such document").into_response(),
+    };
+    let st = match store.full_state(doc.id) {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "no such document").into_response(),
+    };
+    let fields: BTreeMap<String, Value> = st
+        .doc
+        .fields
+        .iter()
+        .map(|(k, v)| (k.clone(), v.value.clone()))
+        .collect();
+    axum::Json(json!({
+        "name": st.doc.name,
+        "model": st.model.name,
+        "fields": fields,
+    }))
+    .into_response()
+}
+
+#[derive(Deserialize)]
+struct LlmTestBody {
+    #[serde(default)]
+    #[serde(rename = "baseUrl")]
+    base_url: String,
+    #[serde(default)]
+    #[serde(rename = "apiKeyEnv")]
+    api_key_env: String,
+    #[serde(default)]
+    model: String,
+}
+
+/// `POST /api/llm/test` — round-trip the configured OpenAI-compatible endpoint.
+/// Optional body fields override the config (to test unsaved form values); the
+/// API key is always read from the environment (never stored).
+async fn llm_test(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<LlmTestBody>,
+) -> Response {
+    let cfg = config::load(&state.paths).unwrap_or_default();
+    let base = pick(&body.base_url, &cfg.llm.base_url);
+    let model = pick(&body.model, &cfg.llm.model);
+    let key_env = pick(&body.api_key_env, &cfg.llm.api_key_env);
+
+    if key_env.is_empty() {
+        return (
+            StatusCode::OK,
+            axum::Json(json!({
+                "ok": false, "model": model, "baseUrl": base,
+                "error": "no apiKeyEnv configured",
+            })),
+        )
+            .into_response();
+    }
+    let key = match std::env::var(&key_env) {
+        Ok(k) if !k.is_empty() => k,
+        _ => {
+            return (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "ok": false, "model": model, "baseUrl": base,
+                    "error": format!("environment variable {key_env} is not set"),
+                })),
+            )
+                .into_response();
+        }
+    };
+
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .unwrap_or_default();
+    let trimmed = base.trim_end_matches('/');
+    let candidates = [format!("{trimmed}/models"), format!("{trimmed}/v1/models")];
+    let mut last_err = String::new();
+    for url in candidates {
+        match client.get(&url).bearer_auth(&key).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                let text = resp.text().await.unwrap_or_default();
+                let v: Value =
+                    serde_json::from_str(&text).unwrap_or_else(|_| Value::String(text.clone()));
+                let models = v
+                    .get("data")
+                    .and_then(|d| d.as_array())
+                    .map(|arr| {
+                        arr.iter()
+                            .filter_map(|m| {
+                                m.get("id").and_then(|i| i.as_str()).map(str::to_string)
+                            })
+                            .collect::<Vec<_>>()
+                    })
+                    .unwrap_or_default();
+                return (
+                    StatusCode::OK,
+                    axum::Json(json!({
+                        "ok": true, "model": model, "baseUrl": base,
+                        "url": url, "models": models,
+                    })),
+                )
+                    .into_response();
+            }
+            Ok(resp) => last_err = format!("HTTP {}", resp.status()),
+            Err(e) => last_err = e.to_string(),
+        }
+    }
+    (
+        StatusCode::OK,
+        axum::Json(json!({
+            "ok": false, "model": model, "baseUrl": base, "error": last_err,
+        })),
+    )
+        .into_response()
+}
+
+/// The first non-empty of (`override`, `default`).
+fn pick(override_: &str, default: &str) -> String {
+    if override_.trim().is_empty() {
+        default.to_string()
+    } else {
+        override_.trim().to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Single-page UI
 // ---------------------------------------------------------------------------
 
-async fn page() -> &'static str {
-    PAGE
+async fn page() -> Html<&'static str> {
+    Html(PAGE)
 }
 
-const PAGE: &str = r#"<!doctype html>
-<html>
-<head>
-<meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>ph-reactor</title>
-<style>
-  :root { color-scheme: dark; --bg:#101418; --panel:#1a2129; --line:#2a3441;
-          --fg:#dce3ea; --dim:#8b98a5; --ok:#4caf7d; --warn:#d9a441; --err:#d96a5f; }
-  body { margin:0; font:14px/1.5 system-ui, sans-serif; background:var(--bg); color:var(--fg); }
-  header { padding:16px 24px; border-bottom:1px solid var(--line); }
-  h1 { font-size:16px; margin:0 0 4px; font-weight:600; }
-  .sub { color:var(--dim); font-size:12px; }
-  main { padding:24px; max-width:960px; }
-  .reactor { background:var(--panel); border:1px solid var(--line); border-radius:8px;
-             padding:12px 16px; margin-bottom:24px; }
-  .reactor .state { font-weight:600; }
-  .chip { display:inline-block; padding:1px 8px; border-radius:10px; font-size:12px;
-          background:var(--line); color:var(--dim); }
-  .chip.synced, .chip.ok { background:rgba(76,175,125,.15); color:var(--ok); }
-  .chip.error, .chip.paused, .chip.requires-auth { background:rgba(217,106,95,.15); color:var(--err); }
-  .chip.offline, .chip.connecting { background:rgba(217,164,65,.15); color:var(--warn); }
-  table { width:100%; border-collapse:collapse; }
-  th, td { text-align:left; padding:8px 10px; border-bottom:1px solid var(--line); vertical-align:top; }
-  th { color:var(--dim); font-weight:500; font-size:12px; text-transform:uppercase; letter-spacing:.04em; }
-  td.addr { color:var(--dim); font-size:12px; word-break:break-all; max-width:340px; }
-  td.detail { color:var(--dim); font-size:12px; max-width:300px; }
-  button { background:var(--panel); color:var(--fg); border:1px solid var(--line);
-           border-radius:6px; padding:3px 10px; margin:0 4px 0 0; cursor:pointer; font-size:12px; }
-  button:hover { border-color:var(--dim); }
-  button.danger { color:var(--err); }
-  form.add { display:flex; gap:8px; flex-wrap:wrap; margin-top:8px; }
-  input { background:var(--panel); border:1px solid var(--line); border-radius:6px;
-          color:var(--fg); padding:6px 10px; font-size:13px; }
-  input[name=addr] { flex:1; min-width:280px; }
-  .hint { color:var(--dim); font-size:12px; margin-top:12px; }
-  .toast { position:fixed; bottom:16px; left:16px; background:var(--panel);
-           border:1px solid var(--line); border-radius:8px; padding:8px 14px;
-           font-size:13px; opacity:0; transition:opacity .3s; pointer-events:none; }
-  .toast.show { opacity:1; }
-</style>
-</head>
-<body>
-<header>
-  <h1>ph-reactor <span class="chip" id="ver"></span></h1>
-  <div class="sub" id="settingsline"></div>
-</header>
-<main>
-  <div class="reactor">
-    <span class="state" id="rxstate">…</span>
-    <span class="sub" id="rxdetail"></span>
-  </div>
-
-  <h2 style="font-size:14px; margin:0 0 8px;">Drives</h2>
-  <table>
-    <thead><tr><th>Name</th><th>Address</th><th>Status</th><th></th></tr></thead>
-    <tbody id="drives"></tbody>
-  </table>
-
-  <h2 style="font-size:14px; margin:24px 0 8px;">Add a drive</h2>
-  <form class="add" id="addform">
-    <input name="addr" placeholder="/ip4/10.0.0.2/tcp/4201/p2p/12D3Koo…" required>
-    <input name="name" placeholder="name (optional)">
-    <input name="tokenEnv" placeholder="token env (optional)" style="width:150px">
-    <label class="sub" style="align-self:center;"><input type="checkbox" name="offline"> offline</label>
-    <button type="submit">Add</button>
-  </form>
-  <div class="hint">
-    The address is a multiaddr of the remote ph-reactor (the peer part is
-    optional — it is resolved on connect). Tokens are read from the named
-    environment variable; they are never stored. Pausing stops syncing but
-    keeps the local docs.
-  </div>
-
-  <h2 style="font-size:14px; margin:24px 0 8px;">Banned peers</h2>
-  <table>
-    <thead><tr><th>Peer</th><th></th></tr></thead>
-    <tbody id="bans"></tbody>
-  </table>
-  <form class="add" id="banform">
-    <input name="peer" placeholder="peer id to ban (12D3Koo…)" required style="flex:1; min-width:280px">
-    <button type="submit">Ban</button>
-  </form>
-  <div class="hint">
-    A banned peer cannot sync with this vault: its handshakes are refused and
-    syncing stops. A peer is also banned automatically after 3 failed auth
-    attempts within 10 minutes.
-  </div>
-</main>
-<div class="toast" id="toast"></div>
-<script>
-const $ = (id) => document.getElementById(id);
-const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => (
-  {"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-
-async function get(url) {
-  const res = await fetch(url, { headers: { "Accept": "application/json" } });
-  if (!res.ok) throw new Error(url + " -> " + res.status);
-  return res.json();
-}
-async function post(url, body) {
-  const res = await fetch(url, {
-    method: "POST",
-    headers: { "Content-Type": "application/json" },
-    body: body === undefined ? undefined : JSON.stringify(body),
-  });
-  if (!res.ok) throw new Error(url + " -> " + res.status);
-  return res.status;
-}
-
-let toastTimer = 0;
-function toast(msg) {
-  const el = $("toast");
-  el.textContent = msg;
-  el.classList.add("show");
-  clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => el.classList.remove("show"), 3500);
-}
-
-function renderDrive(d) {
-  const tr = document.createElement("tr");
-  const actions = [
-    ["resync", "resync", post(`/api/drives/${encodeURIComponent(d.name)}/resync`)],
-    d.paused ? ["resume", "resume", post(`/api/drives/${encodeURIComponent(d.name)}/resume`)]
-             : ["pause", "pause", post(`/api/drives/${encodeURIComponent(d.name)}/pause`)],
-    ["remove", "remove", post(`/api/drives/${encodeURIComponent(d.name)}`, { method: "DELETE" })],
-  ];
-  tr.innerHTML =
-    `<td>${esc(d.name)}</td>` +
-    `<td class="addr">${esc(d.addr)}</td>` +
-    `<td><span class="chip ${esc(d.status)}">${esc(d.status)}</span>` +
-    `<div class="detail">${esc(d.detail)}</div></td>` +
-    `<td>${actions
-      .map(([k, label, fn]) =>
-        `<button class="${k === "remove" ? "danger" : ""}" data-a="${k}">${label}</button>`)
-      .join("")}</td>`;
-  tr.querySelectorAll("button").forEach((btn) => {
-    btn.addEventListener("click", async () => {
-      const [k, , fn] = actions.find(([x]) => x === btn.dataset.a);
-      try { await fn(); toast(k + " " + d.name); await refresh(); }
-      catch (e) { toast(String(e)); }
-    });
-  });
-  return tr;
-}
-
-async function refresh() {
-  try {
-    const s = await get("/api/status");
-    $("ver").textContent = s.version;
-    $("settingsline").textContent =
-      "settings: " + s.settings.url + "  ·  updated " + s.updated_at;
-    const r = s.reactor;
-    const state = !r.running ? "stopped" : r.healthy ? "healthy" : "starting";
-    $("rxstate").textContent = "reactor: " + state;
-    $("rxstate").className = "state";
-    $("rxdetail").textContent =
-      `peer ${r.peer_id ?? "?"} · listen ${r.listen} · ${r.docs} docs` +
-      (r.last_event ? ` · ${r.last_event}` : "");
-    const tbody = $("drives");
-    tbody.innerHTML = "";
-    for (const d of s.drives) tbody.appendChild(renderDrive(d));
-    if (!s.drives.length) {
-      tbody.innerHTML =
-        `<tr><td colspan="4" class="detail">no drives configured</td></tr>`;
-    }
-    const btbody = $("bans");
-    btbody.innerHTML = "";
-    const bans = s.bans || [];
-    for (const b of bans) {
-      const tr = document.createElement("tr");
-      tr.innerHTML =
-        `<td class="addr">${esc(b)}</td>` +
-        `<td><button class="danger" data-b="${esc(b)}">unban</button></td>`;
-      tr.querySelector("button").addEventListener("click", async (ev) => {
-        try {
-          await post("/api/unban", { peer: ev.target.dataset.b });
-          toast("unbanned");
-          await refresh();
-        } catch (err) { toast(String(err)); }
-      });
-      btbody.appendChild(tr);
-    }
-    if (!bans.length) {
-      btbody.innerHTML =
-        `<tr><td colspan="2" class="detail">no banned peers</td></tr>`;
-    }
-  } catch (e) {
-    $("rxstate").textContent = "daemon unreachable";
-  }
-}
-
-$("addform").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const f = new FormData(e.target);
-  try {
-    await post("/api/drives", {
-      addr: f.get("addr"),
-      name: f.get("name") || "",
-      tokenEnv: f.get("tokenEnv") || null,
-      availableOffline: f.get("offline") === "on",
-    });
-    e.target.reset();
-    toast("drive added");
-    await refresh();
-  } catch (err) { toast(String(err)); }
-});
-
-$("banform").addEventListener("submit", async (e) => {
-  e.preventDefault();
-  const f = new FormData(e.target);
-  try {
-    await post("/api/ban", { peer: f.get("peer") });
-    e.target.reset();
-    toast("banned");
-    await refresh();
-  } catch (err) { toast(String(err)); }
-});
-
-refresh();
-setInterval(refresh, 5000);
-</script>
-</body>
-</html>
-"#;
+const PAGE: &str = include_str!("console.html");

@@ -48,6 +48,16 @@ pub enum Command {
         payload: Value,
         reply: tokio::sync::oneshot::Sender<std::result::Result<crate::action::Action, String>>,
     },
+    /// Create a document under a specific model's `init` reducer (the
+    /// model-aware counterpart to `CreateDoc`, which is always `open@1`).
+    /// Synchronous, like `CreateDoc`: the sender awaits the outcome.
+    CreateDocModel {
+        name: String,
+        /// The governing model, as a `name@version` ref.
+        model: String,
+        payload: Value,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
     /// Generate a signed invite (the daemon's identity + a challenge) for a
     /// peer to join this vault. Synchronous: the sender awaits the encoded
     /// token on `reply`.

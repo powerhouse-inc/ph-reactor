@@ -1,0 +1,805 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>ph-reactor</title>
+<style>
+  :root, [data-theme="dark"] {
+    --background: #101418; --foreground: #e6edf3;
+    --card: #171d24; --card-foreground: #e6edf3;
+    --muted: #1d242d; --muted-foreground: #8b98a5;
+    --border: #2a3441; --ring: #4caf7d;
+    --primary: #4caf7d; --primary-foreground: #0b0f12;
+    --success: #4caf7d; --info: #5aa0d9; --warning: #d9a441; --destructive: #d96a5f;
+    --radius: 8px; color-scheme: dark;
+  }
+  [data-theme="light"] {
+    --background: #f7f9fb; --foreground: #1a2129;
+    --card: #ffffff; --card-foreground: #1a2129;
+    --muted: #eef1f4; --muted-foreground: #64748b;
+    --border: #d7dde3; --ring: #2f9e6b;
+    --primary: #2f9e6b; --primary-foreground: #ffffff;
+    --success: #2f9e6b; --info: #2b7bbf; --warning: #b58224; --destructive: #c24438;
+    color-scheme: light;
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; }
+  body {
+    margin: 0;
+    font: 14px/1.5 Inter, system-ui, -apple-system, "Segoe UI", Roboto, sans-serif;
+    background: var(--background); color: var(--foreground);
+  }
+  a { color: inherit; }
+  code { font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 12px;
+         background: var(--muted); padding: 1px 5px; border-radius: 4px; word-break: break-all; }
+
+  .app { display: flex; height: 100vh; }
+  .sidebar { width: 232px; flex-shrink: 0; border-right: 1px solid var(--border);
+             display: flex; flex-direction: column; background: var(--card); }
+  .main { flex: 1; overflow-y: auto; padding: 24px 28px; }
+
+  .brand { padding: 16px; border-bottom: 1px solid var(--border); }
+  .brand h1 { font-size: 15px; margin: 0 0 6px; font-weight: 600; display: flex;
+              align-items: center; gap: 8px; }
+  .brand .sub { color: var(--muted-foreground); font-size: 11px; word-break: break-all; }
+
+  .nav { flex: 1; padding: 8px; overflow-y: auto; }
+  .nav a { display: flex; align-items: center; gap: 10px; padding: 8px 10px; border-radius: 6px;
+           color: var(--muted-foreground); text-decoration: none; cursor: pointer; font-size: 13px; }
+  .nav a:hover { background: var(--muted); color: var(--foreground); }
+  .nav a.active { background: var(--muted); color: var(--foreground); font-weight: 500; }
+  .nav .count { margin-left: auto; font-size: 11px; background: var(--muted);
+                border-radius: 10px; padding: 1px 7px; color: var(--muted-foreground); }
+
+  .foot { padding: 12px 14px; border-top: 1px solid var(--border); font-size: 11px;
+          color: var(--muted-foreground); }
+  .theme { display: flex; gap: 4px; margin-bottom: 10px; }
+  .theme button { flex: 1; padding: 4px 0; font-size: 11px; }
+  .theme button.active { background: var(--primary); color: var(--primary-foreground);
+                         border-color: transparent; }
+  .foot .url { word-break: break-all; }
+
+  .view-title { display: flex; align-items: baseline; gap: 10px; margin: 0 0 16px; }
+  .view-title h1 { font-size: 18px; margin: 0; font-weight: 600; }
+  .view-title .sub { color: var(--muted-foreground); font-size: 12px; }
+
+  .card { background: var(--card); border: 1px solid var(--border);
+          border-radius: var(--radius); padding: 16px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+          gap: 16px; align-items: start; }
+  h2 { font-size: 12px; text-transform: uppercase; letter-spacing: .05em;
+       color: var(--muted-foreground); margin: 0 0 12px; }
+
+  .kv { display: grid; grid-template-columns: 130px 1fr; gap: 7px 16px; align-items: baseline; }
+  .kv .k { color: var(--muted-foreground); font-size: 12px; }
+  .kv .v { font-size: 13px; word-break: break-word; }
+
+  table { width: 100%; border-collapse: collapse; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--border);
+           vertical-align: top; }
+  th { color: var(--muted-foreground); font-weight: 500; font-size: 11px;
+       text-transform: uppercase; letter-spacing: .04em; }
+  tbody tr:last-child td { border-bottom: none; }
+
+  .chip { display: inline-block; padding: 1px 9px; border-radius: 10px; font-size: 11px;
+          background: var(--muted); color: var(--muted-foreground); white-space: nowrap; }
+  .chip.healthy, .chip.ok, .chip.synced, .chip.up { color: var(--success);
+          background: color-mix(in srgb, var(--success) 16%, transparent); }
+  .chip.error, .chip.requires-auth, .chip.down { color: var(--destructive);
+          background: color-mix(in srgb, var(--destructive) 16%, transparent); }
+  .chip.offline, .chip.connecting, .chip.paused, .chip.starting { color: var(--warning);
+          background: color-mix(in srgb, var(--warning) 16%, transparent); }
+  .chip.stopped { color: var(--muted-foreground); }
+
+  button { background: var(--muted); color: var(--foreground); border: 1px solid var(--border);
+           border-radius: 6px; padding: 5px 12px; cursor: pointer; font-size: 12px;
+           font-family: inherit; }
+  button:hover { border-color: var(--muted-foreground); }
+  button.primary { background: var(--primary); color: var(--primary-foreground);
+                   border-color: transparent; }
+  button.danger { color: var(--destructive); }
+  button:disabled { opacity: .5; cursor: default; }
+  input, select { background: var(--background); border: 1px solid var(--border);
+           border-radius: 6px; color: var(--foreground); padding: 6px 10px;
+           font-size: 13px; font-family: inherit; }
+  input:focus, select:focus { outline: 2px solid var(--ring); outline-offset: -1px; }
+  .form { display: flex; gap: 8px; flex-wrap: wrap; align-items: center; margin-top: 14px; }
+  .form label { font-size: 12px; color: var(--muted-foreground); display: flex;
+                align-items: center; gap: 5px; }
+  .hint { color: var(--muted-foreground); font-size: 12px; margin-top: 10px; line-height: 1.4; }
+  .empty { color: var(--muted-foreground); font-size: 13px; padding: 6px 0; }
+  .detail { color: var(--muted-foreground); font-size: 12px; }
+
+  .toast { position: fixed; bottom: 16px; right: 16px; background: var(--card);
+           border: 1px solid var(--border); border-radius: 8px; padding: 10px 14px;
+           font-size: 13px; opacity: 0; transition: opacity .3s; pointer-events: none;
+           z-index: 50; max-width: 420px; }
+  .toast.show { opacity: 1; }
+  .toast.ok { border-color: var(--success); }
+  .toast.err { border-color: var(--destructive); }
+
+  .activity li { list-style: none; padding: 8px 0; border-bottom: 1px solid var(--border);
+                 font-size: 12px; }
+  .activity ul { margin: 0; padding: 0; }
+  .activity li:last-child { border-bottom: none; }
+  .activity .a-kind { color: var(--muted-foreground); }
+</style>
+</head>
+<body>
+<div class="app">
+  <aside class="sidebar">
+    <div class="brand">
+      <h1>ph-reactor <span class="chip" id="ver"></span></h1>
+      <div class="sub" id="peerline">connecting…</div>
+    </div>
+    <nav class="nav" id="nav"></nav>
+    <div class="foot">
+      <div class="theme" id="theme">
+        <button data-t="system">System</button>
+        <button data-t="light">Light</button>
+        <button data-t="dark">Dark</button>
+      </div>
+      <div class="url" id="settingsline"></div>
+    </div>
+  </aside>
+  <main class="main" id="main"></main>
+</div>
+<div class="toast" id="toast"></div>
+<script>
+"use strict";
+const $ = (id) => document.getElementById(id);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g,
+  (c) => ({"&":"&amp;","<":"&lt;",">":"&gt;","'":"&#39;",'"':"&quot;"}[c]));
+const humanSize = (b) => {
+  if (b == null) return "—";
+  if (b < 1024) return b + " B";
+  if (b < 1048576) return (b/1024).toFixed(1) + " KB";
+  return (b/1048576).toFixed(1) + " MB";
+};
+
+/// Read a response's error body (falls back to the URL + status).
+async function errText(r) {
+  try {
+    const t = await r.text();
+    if (t.trim()) return t.trim();
+  } catch {}
+  return r.url ? r.url + " -> HTTP " + r.status : "HTTP " + r.status;
+}
+async function get(url) {
+  const r = await fetch(url, { headers: { Accept: "application/json" } });
+  if (!r.ok) throw new Error(await errText(r));
+  return r.json();
+}
+async function post(url, body) {
+  const r = await fetch(url, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: body === undefined ? undefined : JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error(await errText(r));
+  let d; try { d = await r.json(); } catch { d = {}; }
+  return d;
+}
+async function del(url) {
+  const r = await fetch(url, { method: "DELETE" });
+  if (!r.ok) throw new Error(await errText(r));
+}
+let toastTimer = 0;
+function toast(msg, kind) {
+  const el = $("toast");
+  el.textContent = msg;
+  el.className = "toast show" + (kind ? " " + kind : "");
+  clearTimeout(toastTimer);
+  toastTimer = setTimeout(() => el.classList.remove("show"), 3800);
+}
+
+// ----- theme (shadcn-style light/dark/system) -----
+const THEME_KEY = "ph-reactor-theme";
+function applyTheme(t) {
+  let mode = t;
+  if (t === "system")
+    mode = matchMedia("(prefers-color-scheme: light)").matches ? "light" : "dark";
+  document.documentElement.dataset.theme = mode;
+  try { localStorage.setItem(THEME_KEY, t); } catch {}
+  document.querySelectorAll("#theme button").forEach(
+    (b) => b.classList.toggle("active", b.dataset.t === t));
+}
+function initTheme() {
+  let t = "system";
+  try { t = localStorage.getItem(THEME_KEY) || "system"; } catch {}
+  applyTheme(t);
+  document.querySelectorAll("#theme button").forEach(
+    (b) => b.addEventListener("click", () => applyTheme(b.dataset.t)));
+  matchMedia("(prefers-color-scheme: light)").addEventListener("change", () => {
+    let cur = "system";
+    try { cur = localStorage.getItem(THEME_KEY) || "system"; } catch {}
+    if (cur === "system") applyTheme("system");
+  });
+}
+
+// ----- routing -----
+const VIEWS = [
+  ["overview", "Overview"],
+  ["drives", "Drives"],
+  ["groups", "Groups"],
+  ["processors", "Processors"],
+  ["documents", "Documents"],
+  ["settings", "Settings"],
+];
+function parseRoute() {
+  const h = location.hash.replace(/^#\/?/, "");
+  const parts = h.split("/");
+  return { name: parts[0] || "overview", sub: parts[1] || null };
+}
+function isView(n) { return VIEWS.some(([r]) => r === n); }
+
+let snap = null;
+let activeRefresh = null;
+let routeSeq = 0; // bumped by route(); a view is stale once a newer route() runs
+
+async function refreshStatus() {
+  try {
+    snap = await get("/api/status");
+    renderHeader();
+    renderNav();
+  } catch {
+    $("peerline").textContent = "daemon unreachable";
+    $("settingsline").textContent = "";
+  }
+}
+
+/// Re-fetch the status and re-render the active view's live data. Called
+/// after every mutation so the UI reflects changes without waiting for the
+/// 5s poll.
+async function bump() {
+  await refreshStatus();
+  if (activeRefresh) { try { await activeRefresh(); } catch {} }
+}
+function renderHeader() {
+  const s = snap; if (!s) return;
+  const r = s.reactor;
+  $("ver").textContent = s.version;
+  $("ver").className = "chip " + (r.healthy ? "healthy" : r.running ? "starting" : "stopped");
+  $("peerline").textContent =
+    (r.peer_id ? r.peer_id.slice(0, 14) + "…" : "no peer") + "  ·  " + r.listen;
+  $("settingsline").textContent = s.settings.url;
+}
+function renderNav() {
+  const s = snap || {};
+  const counts = {
+    drives: (s.drives || []).length,
+    documents: s.reactor ? s.reactor.docs : 0,
+  };
+  const route = parseRoute().name;
+  const nav = $("nav");
+  nav.innerHTML = VIEWS.map(([r, label]) => {
+    const c = counts[r];
+    const chip = (r === "drives" || r === "documents") && c
+      ? `<span class="count">${c}</span>` : "";
+    return `<a data-r="${r}" class="${r === route ? "active" : ""}">${label}${chip}</a>`;
+  }).join("");
+  nav.querySelectorAll("a").forEach(
+    (a) => a.addEventListener("click", () => { location.hash = "#/" + a.dataset.r; }));
+}
+
+// ----- views -----
+
+async function viewOverview(el) {
+  el.innerHTML = `<div class="view-title"><h1>Overview</h1><span class="sub" id="ov-upd"></span></div>
+    <div class="grid" id="ov"></div>`;
+  activeRefresh = renderOverview;
+  await renderOverview();
+}
+
+/// Re-renders the whole overview from the current snapshot (plus a live
+/// LLM-endpoint probe). Called on view entry and on every status tick, so
+/// it also recovers from the initial-boot race where `snap` is still null.
+async function renderOverview() {
+  if (!$("ov")) return; // the overview view is no longer active (a newer route superseded it)
+  const s = snap;
+  if (!s) {
+    $("ov").innerHTML = `<div class="card"><div class="empty">waiting for the daemon…</div></div>`;
+    return;
+  }
+  const r = s.reactor;
+  const dc = {};
+  (s.drives || []).forEach((d) => { dc[d.status] = (dc[d.status] || 0) + 1; });
+  $("ov-upd").textContent = "updated " + s.updated_at;
+  $("ov").innerHTML = `
+    <div class="card"><h2>Reactor</h2><div class="kv">
+      <div class="k">state</div><div class="v"><span class="chip ${r.healthy?"healthy":r.running?"starting":"stopped"}">${r.running?(r.healthy?"healthy":"starting"):"stopped"}</span></div>
+      <div class="k">peer</div><div class="v">${esc(r.peer_id || "—")}</div>
+      <div class="k">listen</div><div class="v">${esc(r.listen)}</div>
+      <div class="k">documents</div><div class="v">${r.docs}</div>
+      <div class="k">last event</div><div class="v">${esc(r.last_event || "—")}</div>
+    </div></div>
+    <div class="card"><h2>Drives</h2><div class="kv">
+      <div class="k">configured</div><div class="v">${(s.drives || []).length}</div>
+      ${Object.entries(dc).map(([k, v]) => `<div class="k">${esc(k)}</div><div class="v">${v}</div>`).join("")
+        || `<div class="k">—</div><div class="v empty">none configured</div>`}
+    </div></div>
+    <div class="card"><h2>LLM endpoint</h2><div class="kv" id="ov-llm"><div class="k">status</div><div class="v">…</div></div></div>`;
+  try {
+    const p = await get("/api/processors");
+    const l = p.llm || {};
+    const envSet = l.apiKeyEnv ? "(env: " + l.apiKeyEnv + ")" : "(no env set)";
+    const card = $("ov-llm");
+    if (card) card.innerHTML = `
+      <div class="k">model</div><div class="v">${esc(l.model || "—")}</div>
+      <div class="k">base URL</div><div class="v">${esc(l.baseUrl || "—")}</div>
+      <div class="k">key</div><div class="v">${envSet}</div>`;
+  } catch {}
+}
+
+function driveRow(d) {
+  const tr = document.createElement("tr");
+  const paused = d.status === "paused";
+  tr.innerHTML =
+    `<td>${esc(d.name)}${paused ? ' <span class="chip paused">paused</span>' : ""}</td>
+     <td><code>${esc(d.addr)}</code></td>
+     <td><span class="chip ${d.status}">${esc(d.status)}</span></td>`;
+  const cells = tr.children;
+  const actionsTd = document.createElement("td");
+  actionsTd.style.textAlign = "right";
+  const mk = (label, cls, fn) => {
+    const b = document.createElement("button");
+    b.textContent = label; if (cls) b.className = cls;
+    b.style.marginLeft = "6px";
+    b.addEventListener("click", async () => { b.disabled = true; try { await fn(); toast(label + " ✓", "ok"); bump(); } catch (e) { toast(e.message, "err"); } b.disabled = false; });
+    return b;
+  };
+  actionsTd.appendChild(mk(paused ? "Resume" : "Pause", "", () =>
+    post("/api/drives/" + encodeURIComponent(d.name) + "/" + (paused ? "resume" : "pause"))));
+  actionsTd.appendChild(mk("Resync", "", () =>
+    post("/api/drives/" + encodeURIComponent(d.name) + "/resync")));
+  actionsTd.appendChild(mk("Remove", "danger", () =>
+    del("/api/drives/" + encodeURIComponent(d.name))));
+  tr.appendChild(actionsTd);
+  return tr;
+}
+
+async function viewDrives(el) {
+  el.innerHTML = `
+    <div class="view-title"><h1>Drives</h1><span class="sub">remote peers this vault syncs with</span></div>
+    <div class="card">
+      <table><thead><tr><th>Name</th><th>Address</th><th>Status</th><th></th></tr></thead>
+      <tbody id="dv-body"></tbody></table>
+      <form class="form" id="dv-add">
+        <input name="addr" placeholder="/ip4/10.0.0.2/tcp/4201/p2p/12D3Koo…" required style="flex:1;min-width:280px">
+        <input name="name" placeholder="name (optional)" style="width:150px">
+        <input name="tokenEnv" placeholder="token env" style="width:130px">
+        <label><input type="checkbox" name="availableOffline" checked> available offline</label>
+        <button class="primary" type="submit">Add drive</button>
+      </form>
+    </div>
+    <div class="card" style="margin-top:16px">
+      <h2>Banned peers</h2>
+      <table><thead><tr><th>Peer</th><th></th></th></tr></thead><tbody id="bn-body"></tbody></table>
+      <form class="form" id="bn-add">
+        <input name="peer" placeholder="peer id (12D3Koo…)" required style="flex:1;min-width:280px">
+        <button class="danger" type="submit">Ban</button>
+      </form>
+    </div>`;
+  const render = () => {
+    const s = snap || { drives: [], bans: [] };
+    const tb = $("dv-body");
+    tb.innerHTML = "";
+    for (const d of (s.drives || [])) tb.appendChild(driveRow(d));
+    if (!(s.drives || []).length)
+      tb.innerHTML = `<tr><td colspan="4" class="empty">no drives configured</td></tr>`;
+    const bb = $("bn-body");
+    bb.innerHTML = "";
+    for (const b of (s.bans || [])) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = `<td><code>${esc(b)}</code></td>`;
+      const td = document.createElement("td"); td.style.textAlign = "right";
+      const btn = document.createElement("button"); btn.textContent = "Unban";
+      btn.addEventListener("click", async () => {
+        btn.disabled = true;
+        try { await post("/api/unban/" + encodeURIComponent(b)); toast("unbanned", "ok"); bump(); }
+        catch (e) { toast(e.message, "err"); }
+        btn.disabled = false;
+      });
+      td.appendChild(btn); tr.appendChild(td); bb.appendChild(tr);
+    }
+    if (!(s.bans || []).length)
+      bb.innerHTML = `<tr><td colspan="2" class="empty">none</td></tr>`;
+  };
+  render();
+  activeRefresh = render;
+  $("dv-add").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try {
+      await post("/api/drives", {
+        addr: f.addr.value.trim(), name: f.name.value.trim() || null,
+        tokenEnv: f.tokenEnv.value.trim() || null, availableOffline: f.availableOffline.checked,
+      });
+      toast("drive added", "ok"); f.reset(); bump();
+    } catch (err) { toast(err.message, "err"); }
+  });
+  $("bn-add").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    try { await post("/api/ban", { peer: f.peer.value.trim() }); toast("banned", "ok"); bump(); }
+    catch (err) { toast(err.message, "err"); }
+  });
+}
+
+async function viewGroups(el, stale = () => false) {
+  el.innerHTML = `
+    <div class="view-title"><h1>Groups</h1><span class="sub">signed membership + quorum</span></div>
+    <div class="card">
+      <table><thead><tr><th>Name</th><th>Members</th><th>Managers</th><th></th></tr></thead>
+      <tbody id="gr-body"></tbody></table>
+      <form class="form" id="gr-add">
+        <input name="name" placeholder="group name" required style="width:180px">
+        <input name="members" placeholder="members, comma-sep" style="flex:1;min-width:190px">
+        <input name="managers" placeholder="managers, comma-sep" style="flex:1;min-width:190px">
+        <button class="primary" type="submit">Create group</button>
+      </form>
+    </div>`;
+  const render = async () => {
+    const groups = await get("/api/groups").catch(() => []);
+    if (stale()) return;
+    const tb = $("gr-body"); tb.innerHTML = "";
+    for (const g of groups) {
+      const tr = document.createElement("tr");
+      tr.innerHTML =
+        `<td><a href="#/groups/${encodeURIComponent(g.name)}" style="color:var(--foreground)">${esc(g.name)}</a></td>
+         <td>${g.memberCount}</td><td>${g.managerCount}</td>`;
+      const td = document.createElement("td"); td.style.textAlign = "right";
+      const open = document.createElement("button"); open.textContent = "Open";
+      open.addEventListener("click", () => { location.hash = "#/groups/" + encodeURIComponent(g.name); });
+      td.appendChild(open); tr.appendChild(td); tb.appendChild(tr);
+    }
+    if (!groups.length)
+      tb.innerHTML = `<tr><td colspan="4" class="empty">no groups — create one below</td></tr>`;
+  };
+  await render();
+  activeRefresh = render;
+  if (stale()) return;
+  $("gr-add").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const csv = (s) => s.split(",").map((x) => x.trim()).filter(Boolean);
+    try {
+      await post("/api/groups", {
+        name: f.name.value.trim(),
+        members: csv(f.members.value), managers: csv(f.managers.value),
+      });
+      toast("group created", "ok"); f.reset(); bump();
+    } catch (err) { toast(err.message, "err"); }
+  });
+}
+
+async function viewGroupDetail(el, name, stale = () => false) {
+  el.innerHTML = `<div class="view-title"><h1>${esc(name)}</h1>
+      <button id="back">← Groups</button></div><div id="gd">loading…</div>`;
+  $("back").addEventListener("click", () => { location.hash = "#/groups"; });
+  const [groups, activity] = await Promise.all([
+    get("/api/groups").catch(() => []),
+    get("/api/groups/" + encodeURIComponent(name) + "/activity").catch(() => []),
+  ]);
+  if (stale()) return;
+  const g = groups.find((x) => x.name === name);
+  if (!g) { $("gd").innerHTML = `<div class="empty">no such group</div>`; return; }
+  const act = activity.slice(0, 30).map((a) =>
+    `<li><span class="a-kind">${esc(a.kind)}</span> · ${esc(a.actor)}${a.cosigners && a.cosigners.length
+      ? " + " + a.cosigners.map(esc).join(", ") : ""} <span class="detail">${esc(a.ts)}</span></li>`
+  ).join("");
+  $("gd").innerHTML = `
+    <div class="grid">
+      <div class="card"><h2>Members</h2>
+        <table><tbody>${g.members.map((m) => `<tr><td>${esc(m)}</td>
+          <td style="text-align:right"><button class="danger" data-m="${esc(m)}">remove</button></td></tr>`).join("")
+          || '<tr><td class="empty">none</td></tr>'}</tbody></table>
+        <form class="form" id="gd-add"><input name="m" placeholder="add member" required style="flex:1">
+          <button class="primary" type="submit">Add member</button></form>
+      </div>
+      <div class="card"><h2>Managers</h2>
+        <table><tbody>${g.managers.map((m) => `<tr><td>${esc(m)}</td>
+          <td style="text-align:right"><button class="danger" data-mg="${esc(m)}">remove</button></td></tr>`).join("")
+          || '<tr><td class="empty">none</td></tr>'}</tbody></table>
+        <div class="hint">Adding a second manager requires a quorum (two existing managers).</div>
+        <form class="form" id="gd-addm"><input name="m" placeholder="add manager" required style="flex:1">
+          <button class="primary" type="submit">Add manager</button></form>
+      </div>
+      <div class="card"><h2>Activity</h2>
+        <ul class="activity">${act || '<li class="empty">no actions yet</li>'}</ul>
+      </div>
+    </div>`;
+  activeRefresh = () => {};
+  const act2 = (kind, sel) => {
+    $(sel).addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const m = e.target.m.value.trim();
+      const btn = e.target.querySelector("button");
+      try {
+        await post("/api/groups/" + encodeURIComponent(name) + "/action",
+          { kind, payload: { member: m } });
+        toast(kind + " ✓", "ok"); e.target.reset();
+        activeRefresh = null; viewGroupDetail(el, name);
+      } catch (err) { toast(err.message, "err"); }
+      if (btn) btn.disabled = false;
+    });
+  };
+  act2("add-member", "gd-add");
+  act2("add-manager", "gd-addm");
+  document.querySelectorAll("#gd button[data-m]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      b.disabled = true;
+      try { await post("/api/groups/" + encodeURIComponent(name) + "/action",
+          { kind: "remove-member", payload: { member: b.dataset.m } });
+        toast("member removed", "ok"); activeRefresh = null; viewGroupDetail(el, name); }
+      catch (err) { toast(err.message, "err"); b.disabled = false; }
+    }));
+  document.querySelectorAll("#gd button[data-mg]").forEach((b) =>
+    b.addEventListener("click", async () => {
+      b.disabled = true;
+      try { await post("/api/groups/" + encodeURIComponent(name) + "/action",
+          { kind: "remove-manager", payload: { member: b.dataset.m } });
+        toast("manager removed", "ok"); activeRefresh = null; viewGroupDetail(el, name); }
+      catch (err) { toast(err.message, "err"); b.disabled = false; }
+    }));
+}
+
+async function viewProcessors(el, stale = () => false) {
+  el.innerHTML = `<div class="view-title"><h1>Processors</h1>
+    <span class="sub">the daemon's local processing layer</span></div>
+    <div class="grid" id="proc">loading…</div>`;
+  const render = async () => {
+    const p = await get("/api/processors");
+    if (stale()) return;
+    const se = p.syncEngine, st = p.store;
+    $("proc").innerHTML = `
+      <div class="card"><h2>Sync engine</h2><div class="kv">
+        <div class="k">state</div><div class="v"><span class="chip ${se.healthy?"healthy":se.running?"starting":"stopped"}">${se.running?(se.healthy?"up":"starting"):"stopped"}</span></div>
+        <div class="k">drives</div><div class="v">${se.activeDrives} active / ${se.configuredDrives} configured</div>
+        <div class="k">last event</div><div class="v">${esc(se.lastEvent || "—")}</div>
+        <div class="k">mDNS / DHT / relay</div><div class="v">${se.mdns} / ${se.dht} / ${se.relay}</div>
+      </div></div>
+      <div class="card"><h2>Document store</h2><div class="kv">
+        <div class="k">live docs</div><div class="v">${st.docs}</div>
+        <div class="k">last doc</div><div class="v">${esc(st.lastDoc || "—")}</div>
+      </div></div>
+      <div class="card"><h2>Settings server</h2><div class="kv">
+        <div class="k">url</div><div class="v">${esc(p.settingsServer.url)}</div>
+      </div></div>
+      <div class="card"><h2>Log rotation</h2><div class="kv">
+        <div class="k">file</div><div class="v">${esc(p.logRotation.file)}</div>
+        <div class="k">size</div><div class="v">${humanSize(p.logRotation.sizeBytes)}</div>
+        <div class="k">level</div><div class="v">${esc(p.logRotation.logLevel)}</div>
+      </div></div>
+      <div class="card"><h2>Status poller</h2><div class="kv">
+        <div class="k">interval</div><div class="v">${p.statusPoller.intervalSec}s</div>
+        <div class="k">last refresh</div><div class="v">${esc(p.statusPoller.lastRefresh)}</div>
+      </div></div>`;
+  };
+  await render();
+  activeRefresh = render;
+}
+
+let docModelFilter = "";
+async function viewDocuments(el, stale = () => false) {
+  el.innerHTML = `
+    <div class="view-title"><h1>Documents</h1><span class="sub" id="dc-count"></span></div>
+    <div class="card">
+      <div class="form" style="margin-top:0">
+        <select id="dc-model" style="width:170px"><option value="">all models</option></select>
+        <button class="primary" id="dc-refresh">Refresh</button>
+      </div>
+      <table style="margin-top:14px"><thead><tr><th>Name</th><th>Model</th><th>Summary</th></tr></thead>
+        <tbody id="dc-body"></tbody></table>
+      <form class="form" id="dc-add">
+        <input name="name" placeholder="name" required style="width:180px">
+        <input name="fields" placeholder="fields: k=v k2=v2" style="flex:1;min-width:280px">
+        <button class="primary" type="submit">Create document</button>
+      </form>
+    </div>`;
+  const render = async () => {
+    const docs = await get("/api/docs" + (docModelFilter ? "?model=" + encodeURIComponent(docModelFilter) : "")).catch(() => []);
+    if (stale()) return;
+    const sel = $("dc-model"); const cur = docModelFilter;
+    const models = [...new Set(docs.map((d) => d.model))].sort();
+    sel.innerHTML = `<option value="">all models</option>` +
+      models.map((m) => `<option value="${esc(m)}">${esc(m)}</option>`).join("");
+    sel.value = cur;
+    $("dc-count").textContent = docs.length + " documents";
+    const tb = $("dc-body"); tb.innerHTML = "";
+    for (const d of docs) {
+      const tr = document.createElement("tr");
+      const summary = Object.entries(d.fields || {}).slice(0, 3)
+        .map(([k, v]) => `${k}=${JSON.stringify(v)}`).join("  ");
+      tr.innerHTML =
+        `<td><a href="#/documents/${encodeURIComponent(d.name)}" style="color:var(--foreground)">${esc(d.name)}</a></td>
+         <td><code>${esc(d.model)}</code></td><td class="detail">${esc(summary || "—")}</td>`;
+      tb.appendChild(tr);
+    }
+    if (!docs.length)
+      tb.innerHTML = `<tr><td colspan="3" class="empty">no documents${docModelFilter ? " for " + docModelFilter : ""}</td></tr>`;
+  };
+  await render();
+  activeRefresh = render;
+  if (stale()) return;
+  $("dc-model").addEventListener("change", async (e) => { docModelFilter = e.target.value; await render(); });
+  $("dc-refresh").addEventListener("click", render);
+  $("dc-add").addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const f = e.target;
+    const fields = {};
+    for (const tok of f.fields.value.trim().split(/\s+/)) {
+      if (!tok) continue;
+      const i = tok.indexOf("=");
+      if (i < 0) continue;
+      const k = tok.slice(0, i); let v = tok.slice(i + 1);
+      try { v = JSON.parse(v); } catch { /* keep as string */ }
+      fields[k] = v;
+    }
+    try {
+      await post("/api/docs", { name: f.name.value.trim(), fields });
+      toast("document created", "ok"); f.reset(); bump();
+    } catch (err) { toast(err.message, "err"); }
+  });
+}
+
+async function viewDocDetail(el, name, stale = () => false) {
+  el.innerHTML = `<div class="view-title"><h1>${esc(name)}</h1>
+    <button id="back">← Documents</button></div><div id="dd">loading…</div>`;
+  $("back").addEventListener("click", () => { location.hash = "#/documents"; });
+  const d = await get("/api/docs/" + encodeURIComponent(name)).catch(() => null);
+  if (stale()) return;
+  if (!d) { $("dd").innerHTML = `<div class="empty">no such document</div>`; return; }
+  $("dd").innerHTML = `<div class="card">
+    <div class="kv"><div class="k">model</div><div class="v"><code>${esc(d.model)}</code></div></div>
+    <h2 style="margin-top:16px">Fields</h2>
+    <table><thead><tr><th>Field</th><th>Value</th></tr></thead><tbody>
+      ${Object.entries(d.fields || {}).map(([k, v]) =>
+        `<tr><td><code>${esc(k)}</code></td><td>${esc(JSON.stringify(v))}</td></tr>`).join("")
+        || '<tr><td colspan="2" class="empty">no fields</td></tr>'}
+    </tbody></table>
+  </div>`;
+  activeRefresh = () => {};
+}
+
+const LOG_LEVELS = ["verbose", "debug", "info", "warn", "error", "silent"];
+async function viewSettings(el, stale = () => false) {
+  const cfg = await get("/api/config").catch(() => null);
+  if (!cfg) { el.innerHTML = `<div class="empty">could not load config</div>`; return; }
+  if (stale()) return; // a newer route superseded us; don't clobber its #main
+  el.innerHTML = `
+    <div class="view-title"><h1>Settings</h1><span class="sub">saved to the config file</span></div>
+    <div class="grid">
+      <div class="card"><h2>Instance</h2><div class="kv">
+        <div class="k">name</div><div class="v"><input id="s-name" value="${esc(cfg.instance.name)}" style="width:100%"></div>
+        <div class="k">listen</div><div class="v"><input id="s-listen" value="${esc(cfg.instance.listen)}" style="width:100%"></div>
+      </div>
+      <button class="primary" id="save-instance" data-action="save-instance" style="margin-top:12px">Save</button></div>
+      <div class="card"><h2>Network (p2p)</h2><div class="kv">
+        <div class="k">mDNS</div><div class="v"><label><input type="checkbox" id="s-mdns" ${cfg.p2p.mdns ? "checked" : ""}></label></div>
+        <div class="k">DHT</div><div class="v"><label><input type="checkbox" id="s-dht" ${cfg.p2p.dht ? "checked" : ""}></label></div>
+        <div class="k">relay</div><div class="v"><label><input type="checkbox" id="s-relay" ${cfg.p2p.relay ? "checked" : ""}></label></div>
+        <div class="k">token env</div><div class="v"><input id="s-tokenenv" value="${esc(cfg.p2p.tokenEnv || "")}" placeholder="(none)" style="width:100%"></div>
+      </div>
+      <button class="primary" id="save-p2p" data-action="save-p2p" style="margin-top:12px">Save</button></div>
+      <div class="card"><h2>LLM (OpenAI-compatible)</h2><div class="kv">
+        <div class="k">base URL</div><div class="v"><input id="s-baseurl" value="${esc(cfg.llm.baseUrl)}" placeholder="https://api.openai.com/v1" style="width:100%"></div>
+        <div class="k">key env</div><div class="v"><input id="s-apikeyenv" value="${esc(cfg.llm.apiKeyEnv)}" placeholder="LLM_API_KEY" style="width:100%"></div>
+        <div class="k">model</div><div class="v"><input id="s-model" value="${esc(cfg.llm.model)}" placeholder="gpt-4o-mini" style="width:100%"></div>
+      </div>
+      <div class="hint">The API key is read from the environment variable named in "key env"; it is never stored on disk.</div>
+      <div class="form">
+        <button class="primary" id="save-llm" data-action="save-llm">Save</button>
+        <button id="test-llm" data-action="test-llm">Save &amp; test</button>
+      </div>
+      <div id="llm-test" class="hint"></div></div>
+      <div class="card"><h2>Logging</h2><div class="kv">
+        <div class="k">level</div><div class="v">
+          <select id="s-loglevel">${LOG_LEVELS.map((l) => `<option value="${l}" ${cfg.logLevel === l ? "selected" : ""}>${l}</option>`).join("")}</select></div>
+      </div>
+      <button class="primary" id="save-log" data-action="save-log" style="margin-top:12px">Save</button></div>
+      <div class="card"><h2>Server</h2><div class="kv">
+        <div class="k">host</div><div class="v">${esc(cfg.settings.host)}</div>
+        <div class="k">port</div><div class="v">${cfg.settings.port}</div>
+      </div>
+      <div class="hint">Changing the settings-server host/port requires a restart; edit the config file directly.</div></div>
+    </div>`;
+  activeRefresh = () => {};
+}
+
+// ----- router -----
+async function route() {
+  const { name, sub } = parseRoute();
+  routeSeq++;
+  const seq = routeSeq;
+  const stale = () => seq !== routeSeq; // a newer route() superseded this one
+  const el = $("main");
+  el.innerHTML = `<div class="empty" style="padding-top:40px">loading…</div>`;
+  activeRefresh = null;
+  try {
+    if (name === "overview") await viewOverview(el, stale);
+    else if (name === "drives") await viewDrives(el, stale);
+    else if (name === "groups" && !sub) await viewGroups(el, stale);
+    else if (name === "groups" && sub) await viewGroupDetail(el, decodeURIComponent(sub), stale);
+    else if (name === "processors") await viewProcessors(el, stale);
+    else if (name === "documents" && !sub) await viewDocuments(el, stale);
+    else if (name === "documents" && sub) await viewDocDetail(el, decodeURIComponent(sub), stale);
+    else if (name === "settings") await viewSettings(el, stale);
+    else { location.hash = "#/overview"; return; }
+  } catch (e) {
+    if (!stale()) el.innerHTML = `<div class="empty">error: ${esc(e.message)}</div>`;
+  }
+  if (!stale()) renderNav();
+}
+
+async function tick() {
+  await bump();
+}
+
+// ----- settings actions (event delegation on #main) -----
+// The settings save/test buttons are handled by a single delegated listener on
+// the persistent #main container, not per-element. That keeps them working even
+// if a concurrent view render re-creates the buttons, because the listener never
+// depends on finding a specific transient button node at a specific moment.
+async function testLlmEndpoint() {
+  const body = {
+    baseUrl: $("s-baseurl").value.trim(),
+    apiKeyEnv: $("s-apikeyenv").value.trim(),
+    model: $("s-model").value.trim(),
+  };
+  // persist the LLM settings (one key-value request each) before testing
+  await Promise.all([
+    post("/api/config", { key: "llm.baseUrl", value: $("s-baseurl").value.trim() }),
+    post("/api/config", { key: "llm.apiKeyEnv", value: $("s-apikeyenv").value.trim() }),
+    post("/api/config", { key: "llm.model", value: $("s-model").value.trim() }),
+  ]).catch(() => {});
+  const out = $("llm-test");
+  if (!out) return;
+  out.textContent = "testing…";
+  try {
+    const r = await post("/api/llm/test", body);
+    if (r.ok) {
+      const models = (r.models || []).slice(0, 8).join(", ");
+      out.innerHTML = `<span class="chip ok">OK</span> ${esc(r.url)} — ${models || "no model list"}`;
+      toast("LLM endpoint reachable", "ok");
+    } else {
+      out.innerHTML = `<span class="chip error">FAIL</span> ${esc(r.error)}`;
+      toast(r.error, "err");
+    }
+  } catch (e) {
+    out.innerHTML = `<span class="chip error">ERROR</span> ${esc(e.message)}`;
+    toast(e.message, "err");
+  }
+}
+function handleSettingsAction(action) {
+  const save = (keys) => {
+    const ops = keys.map(([k, getter]) =>
+      post("/api/config", { key: k, value: getter() }));
+    return Promise.all(ops)
+      .then(() => toast("saved", "ok"))
+      .catch((e) => toast(e.message, "err"));
+  };
+  if (action === "save-instance")
+    return save([["instance.name", () => $("s-name").value], ["instance.listen", () => $("s-listen").value]]);
+  if (action === "save-p2p")
+    return save([["p2p.mdns", () => $("s-mdns").checked], ["p2p.dht", () => $("s-dht").checked], ["p2p.relay", () => $("s-relay").checked], ["p2p.tokenEnv", () => $("s-tokenenv").value.trim()]]);
+  if (action === "save-llm")
+    return save([["llm.baseUrl", () => $("s-baseurl").value.trim()], ["llm.apiKeyEnv", () => $("s-apikeyenv").value.trim()], ["llm.model", () => $("s-model").value.trim()]]);
+  if (action === "save-log")
+    return save([["logLevel", () => $("s-loglevel").value]]);
+  if (action === "test-llm")
+    return testLlmEndpoint();
+}
+$("main").addEventListener("click", (e) => {
+  const b = e.target.closest("[data-action]");
+  if (b && b.dataset.action) handleSettingsAction(b.dataset.action);
+});
+
+initTheme();
+(async () => { await refreshStatus(); await route(); })();
+window.addEventListener("hashchange", route);
+setInterval(tick, 5000);
+</script>
+</body>
+</html>
