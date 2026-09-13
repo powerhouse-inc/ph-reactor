@@ -105,6 +105,8 @@ impl Settings {
             .route("/api/groups/:name/activity", get(group_activity))
             .route("/api/docs/:name", get(doc_detail))
             .route("/api/llm/test", post(llm_test))
+            .route("/api/models", get(models_api).post(register_model))
+            .route("/api/llm/draft-type", post(llm_draft_type))
             .with_state(Arc::new(self));
         let task = tokio::spawn(async move {
             if let Err(err) = axum::serve(listener, app).await {
@@ -1008,6 +1010,192 @@ fn pick(override_: &str, default: &str) -> String {
 // ---------------------------------------------------------------------------
 // Single-page UI
 // ---------------------------------------------------------------------------
+
+
+/// `GET /api/models` — the registered document-model types (for the
+/// create-document picker).
+async fn models_api(state: axum::extract::State<Arc<Settings>>) -> Response {
+    let mut out = Vec::new();
+    for r in state.store.model_refs() {
+        let def = state.store.model_definition(&r).unwrap_or(Value::Null);
+        out.push(json!({
+            "name": r.name,
+            "version": r.version,
+            "fields": def.get("fields").cloned().unwrap_or(json!({})),
+        }));
+    }
+    axum::Json(out).into_response()
+}
+
+/// `POST /api/models/register` — validate and register a model definition
+/// (from the LLM draft or the manual editor) as an `L1` interpreter.
+#[derive(Deserialize)]
+struct RegisterModelBody {
+    definition: Value,
+}
+
+async fn register_model(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<RegisterModelBody>,
+) -> Response {
+    match crate::model::l1::L1::from_def(body.definition.clone()) {
+        Ok(m) => {
+            let name = crate::model::Model::ref_(&m).name.clone();
+            state.store.add_model(Arc::new(m));
+            (StatusCode::CREATED, axum::Json(json!({ "ok": true, "name": name })))
+                .into_response()
+        }
+        Err(e) => (
+            StatusCode::BAD_REQUEST,
+            axum::Json(json!({ "ok": false, "error": e })),
+        )
+            .into_response(),
+    }
+}
+
+/// `POST /api/llm/draft-type` — ask the configured LLM to draft a model
+/// definition from a description (returned for review, not yet registered).
+#[derive(Deserialize)]
+struct DraftTypeBody {
+    description: String,
+}
+
+async fn llm_draft_type(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<DraftTypeBody>,
+) -> Response {
+    let cfg = config::load(&state.paths).unwrap_or_default();
+    let key = std::env::var(&cfg.llm.api_key_env).unwrap_or_default();
+    if key.is_empty() {
+        return (
+            StatusCode::OK,
+            axum::Json(json!({
+                "ok": false,
+                "error": "no LLM API key set (the value of the configured apiKeyEnv); use the manual type editor",
+            })),
+        )
+            .into_response();
+    }
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(45))
+        .build()
+        .unwrap_or_default();
+    let sys = r#"You design document models. Given a short description of a document, return ONLY a JSON object of the exact shape: {"name":"<lowercase-hyphenated>","version":"1","fields":{"<field>":"<string|number|boolean|object|array>"}},"reducers":{"init":{"payload":{"name":"string", plus one entry per field},"writes":{"__name__":{"set":"$payload.name"}, plus one entry per field},"pre":[]},"set-<field>":{"payload":{"<field>":"<type>"},"writes":{"<field>":{"set":"$payload.<field>"}},"pre":[]}}}. No prose, no markdown fences."#;
+    let url = format!(
+        "{}/chat/completions",
+        cfg.llm.base_url.trim_end_matches('/')
+    );
+    match client
+        .post(&url)
+        .bearer_auth(&key)
+        .json(&json!({
+            "model": cfg.llm.model,
+            "temperature": 0.2,
+            "messages": [
+                {"role": "system", "content": sys},
+                {"role": "user", "content": body.description},
+            ],
+        }))
+        .send()
+        .await
+    {
+        Ok(r) if r.status().is_success() => {
+            let v: Value = r.json().await.unwrap_or(Value::Null);
+            let content = v
+                .get("choices")
+                .and_then(|c| c.get(0))
+                .and_then(|c| c.get("message"))
+                .and_then(|m| m.get("content"))
+                .and_then(|c| c.as_str())
+                .unwrap_or("")
+                .to_string();
+            match extract_json_object(&content) {
+                Some(d) => (
+                    StatusCode::OK,
+                    axum::Json(json!({ "ok": true, "definition": d })),
+                )
+                    .into_response(),
+                None => (
+                    StatusCode::BAD_REQUEST,
+                    axum::Json(json!({
+                        "ok": false,
+                        "error": "the model did not return a valid JSON definition",
+                        "raw": content,
+                    })),
+                )
+                    .into_response(),
+            }
+        }
+        Ok(r) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(json!({ "ok": false, "error": format!("LLM returned HTTP {}", r.status()) })),
+        )
+            .into_response(),
+        Err(e) => (
+            StatusCode::BAD_GATEWAY,
+            axum::Json(json!({ "ok": false, "error": format!("LLM request failed: {e}") })),
+        )
+            .into_response(),
+    }
+}
+
+/// Pull the first balanced JSON object out of a model response that may be
+/// wrapped in prose or markdown fences.
+fn extract_json_object(s: &str) -> Option<Value> {
+    let s = s.trim();
+    if let Some(v) = serde_json::from_str::<Value>(s).ok() {
+        if v.is_object() {
+            return Some(v);
+        }
+    }
+    // Strip a markdown fence if present.
+    let un = s
+        .strip_prefix("```")
+        .map(|rest| rest.strip_prefix("json").unwrap_or(rest));
+    let un = un
+        .unwrap_or(s)
+        .trim_end()
+        .strip_suffix("```")
+        .unwrap_or(un.unwrap_or(s))
+        .trim();
+    if let Some(v) = serde_json::from_str::<Value>(un).ok() {
+        if v.is_object() {
+            return Some(v);
+        }
+    }
+    // Scan for the first balanced {...} block (string-aware).
+    let chars: Vec<char> = s.chars().collect();
+    let start = chars.iter().position(|&c| c == '{')?;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut esc = false;
+    for i in start..chars.len() {
+        let c = chars[i];
+        if in_str {
+            if esc {
+                esc = false;
+            } else if c == '\\' {
+                esc = true;
+            } else if c == '"' {
+                in_str = false;
+            }
+            continue;
+        }
+        match c {
+            '"' => in_str = true,
+            '{' => depth += 1,
+            '}' => {
+                depth -= 1;
+                if depth == 0 {
+                    let block: String = chars[start..=i].iter().collect();
+                    return serde_json::from_str::<Value>(&block).ok();
+                }
+            }
+            _ => {}
+        }
+    }
+    None
+}
 
 async fn page() -> Html<&'static str> {
     Html(PAGE)

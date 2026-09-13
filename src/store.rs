@@ -1025,14 +1025,27 @@ impl Inner {
             return;
         };
         let (action_kind, action_field, action_value) = match action {
-            Some(a) => (
-                Some(a.kind.clone()),
-                a.payload
-                    .get("field")
-                    .and_then(|v| v.as_str())
-                    .map(String::from),
-                a.payload.get("value").cloned(),
-            ),
+            Some(a) => {
+                let (action_field, action_value) = if let Some(f) =
+                    a.payload.get("field").and_then(|v| v.as_str())
+                {
+                    // An explicit `field`/`value` action (the `open` model).
+                    (Some(f.to_string()), a.payload.get("value").cloned())
+                } else if let Some(obj) = a.payload.as_object() {
+                    // A single-field reducer (e.g. `set-status`): the lone
+                    // payload key is the field being written, so a processor
+                    // can match a transition on the field + value.
+                    if obj.len() == 1 {
+                        let (k, v) = obj.iter().next().expect("len == 1");
+                        (Some(k.clone()), Some(v.clone()))
+                    } else {
+                        (None, None)
+                    }
+                } else {
+                    (None, None)
+                };
+                (Some(a.kind.clone()), action_field, action_value)
+            }
             None => (None, None, None),
         };
         let change = DocChange {

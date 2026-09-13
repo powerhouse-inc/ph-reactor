@@ -193,6 +193,59 @@ pub fn transaction_def() -> serde_json::Value {
     })
 }
 
+/// The JSON definition of the `invoice@1` model: an invoice with a status
+/// lifecycle (draft -> sent -> accepted -> paid). The reference processor
+/// example listens to `set-status` and fires when `status` becomes `accepted`.
+pub fn invoice_def() -> serde_json::Value {
+    json!({
+        "name": "invoice",
+        "version": "1",
+        "fields": {
+            "number": "string",
+            "customer": "string",
+            "total": "number",
+            "currency": "string",
+            "status": "string"
+        },
+        "reducers": {
+            "init": {
+                "payload": {
+                    "name": "string",
+                    "number": "string",
+                    "customer": "string",
+                    "total": "number",
+                    "currency": "string",
+                    "status": "string"
+                },
+                "writes": {
+                    "__name__": { "set": "$payload.name" },
+                    "number": { "set": "$payload.number" },
+                    "customer": { "set": "$payload.customer" },
+                    "total": { "set": "$payload.total" },
+                    "currency": { "set": "$payload.currency" },
+                    "status": { "set": "$payload.status" }
+                },
+                "pre": []
+            },
+            "set-status": {
+                "payload": { "status": "string" },
+                "writes": { "status": { "set": "$payload.status" } },
+                "pre": []
+            },
+            "set-customer": {
+                "payload": { "customer": "string" },
+                "writes": { "customer": { "set": "$payload.customer" } },
+                "pre": []
+            },
+            "set-total": {
+                "payload": { "total": "number" },
+                "writes": { "total": { "set": "$payload.total" } },
+                "pre": []
+            }
+        }
+    })
+}
+
 /// Every realistic model, as ready-to-register [`L1`] interpreters.
 pub fn realistic_models() -> Vec<L1> {
     vec![
@@ -200,6 +253,7 @@ pub fn realistic_models() -> Vec<L1> {
         L1::from_def(task_def()).expect("the task definition is well-formed"),
         L1::from_def(account_def()).expect("the account definition is well-formed"),
         L1::from_def(transaction_def()).expect("the transaction definition is well-formed"),
+        L1::from_def(invoice_def()).expect("the invoice definition is well-formed"),
     ]
 }
 
