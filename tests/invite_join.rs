@@ -56,10 +56,10 @@ async fn spawn_node(tag: &str) -> Node {
         store.clone(),
         tag,
         listen,
-        false, // no mDNS
-        false, // no DHT
-        false, // no relay
-        None,          // no shared token
+        false,          // no mDNS
+        false,          // no DHT
+        false,          // no relay
+        None,           // no shared token
         HashSet::new(), // no banned peers
         cmd_rx,
         evt_tx,
@@ -218,9 +218,7 @@ async fn banned_peer_is_refused() {
         .expect("beta creates the doc");
 
     // Beta bans alpha before any link is established.
-    b.cmd_tx
-        .send(EngineCommand::Ban { peer: a.peer })
-        .unwrap();
+    b.cmd_tx.send(EngineCommand::Ban { peer: a.peer }).unwrap();
 
     // Alpha dials beta (adds a drive for it).
     let drive = Drive {
@@ -230,22 +228,19 @@ async fn banned_peer_is_refused() {
         paused: false,
         available_offline: true,
     };
-    a.cmd_tx
-        .send(EngineCommand::AddDrive(drive))
-        .unwrap();
+    a.cmd_tx.send(EngineCommand::AddDrive(drive)).unwrap();
 
     // Beta refuses the hello; alpha's drive ends in an error state.
-    wait_for(
-        &mut a.evt_rx,
-        |ev| matches!(
+    wait_for(&mut a.evt_rx, |ev| {
+        matches!(
             ev,
             EngineEvent::DriveStatus {
                 name,
                 status,
                 ..
             } if name == "beta" && *status == DriveStatus::Error
-        ),
-    )
+        )
+    })
     .await;
 
     // Give a moment for any (blocked) propagation, then assert none happened.
@@ -255,5 +250,8 @@ async fn banned_peer_is_refused() {
         .doc_ids()
         .iter()
         .any(|id| a.store.doc_name(*id) == "b-secret");
-    assert!(!leaked, "alpha should not have received the banned peer's doc");
+    assert!(
+        !leaked,
+        "alpha should not have received the banned peer's doc"
+    );
 }

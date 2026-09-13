@@ -11,8 +11,8 @@ fn init_log() {
         .try_init();
 }
 
-use std::str::FromStr;
 use std::collections::HashSet;
+use std::str::FromStr;
 use std::time::Duration;
 
 use libp2p::identity::Keypair;
@@ -46,10 +46,14 @@ async fn spawn_dht_node(tag: &str) -> Node {
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
     let listen = Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").expect("listen addr");
     let engine = SyncEngine::new(
-        &key, store, tag, listen, false, // no mDNS
-        true,  // DHT enabled
-        false, // no relay
-        None,         // no shared token
+        &key,
+        store,
+        tag,
+        listen,
+        false,          // no mDNS
+        true,           // DHT enabled
+        false,          // no relay
+        None,           // no shared token
         HashSet::new(), // no banned peers
         cmd_rx,
         evt_tx,

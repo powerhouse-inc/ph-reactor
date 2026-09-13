@@ -56,6 +56,12 @@ const TICK_INTERVAL: Duration = Duration::from_secs(5);
 /// A drive that has been silent this long is reported idle (the daemon
 /// may let it sleep; the store stays warm).
 const IDLE_AFTER_SILENCE: Duration = Duration::from_secs(30 * 60);
+/// A peer that fails auth (wrong token) this many times within
+/// [`AUTH_BAN_WINDOW`] is auto-banned.
+const AUTH_BAN_AFTER: u32 = 3;
+/// The window in which [`AUTH_BAN_AFTER`] failed auth attempts must occur
+/// before a peer is auto-banned.
+const AUTH_BAN_WINDOW: Duration = Duration::from_secs(10 * 60);
 
 // ---------------------------------------------------------------------------
 // Identity
@@ -189,6 +195,9 @@ pub enum EngineEvent {
     /// A joiner was accepted on a valid join-proof; the daemon should persist
     /// the resulting drive so it survives a restart.
     DriveJoined { name: String, addr: Multiaddr },
+    /// A peer was auto-banned after repeated failed auth attempts; the
+    /// daemon should persist it to the ban list.
+    PeerAutoBanned { peer: String },
 }
 
 // ---------------------------------------------------------------------------
@@ -232,6 +241,10 @@ pub struct SyncEngine {
     /// Peers the user has explicitly refused: their handshakes are rejected
     /// (no key registration, no drive added) even if their key is valid.
     banned: HashSet<PeerId>,
+    /// Failed auth (token) attempts per peer: `(count, last-attempt)`. A
+    /// peer that crosses [`AUTH_BAN_AFTER`] within [`AUTH_BAN_WINDOW`] is
+    /// auto-banned.
+    auth_failures: HashMap<PeerId, (u32, tokio::time::Instant)>,
     cmd_rx: mpsc::UnboundedReceiver<EngineCommand>,
     evt_tx: mpsc::UnboundedSender<EngineEvent>,
     running: bool,
@@ -353,6 +366,7 @@ impl SyncEngine {
             banned,
             drives: HashMap::new(),
             guests: HashSet::new(),
+            auth_failures: HashMap::new(),
             cmd_rx,
             evt_tx,
             running: true,
@@ -617,6 +631,37 @@ impl SyncEngine {
             status,
             detail,
         });
+    }
+
+    /// Records a failed auth (wrong-token) attempt from `peer`. Returns
+    /// `true` if the peer crossed [`AUTH_BAN_AFTER`] within
+    /// [`AUTH_BAN_WINDOW`] and was just auto-banned.
+    fn record_auth_failure(&mut self, peer: &PeerId) -> bool {
+        let now = tokio::time::Instant::now();
+        let count = {
+            let entry = self.auth_failures.entry(*peer).or_insert((0, now));
+            if now.duration_since(entry.1) > AUTH_BAN_WINDOW {
+                entry.0 = 0;
+            }
+            entry.0 += 1;
+            entry.1 = now;
+            entry.0
+        };
+        if count >= AUTH_BAN_AFTER {
+            self.auth_failures.remove(peer);
+            self.banned.insert(*peer);
+            let detail = format!("auto-banned after {count} failed auth attempts");
+            if let Some(name) = self.drive_name_by_peer(*peer) {
+                self.set_status(&name, DriveStatus::Error, Some(detail.clone()));
+            }
+            let _ = self.evt_tx.send(EngineEvent::PeerAutoBanned {
+                peer: peer.to_base58(),
+            });
+            tracing::warn!(%peer, "auto-banned after {count} failed auth attempts");
+            true
+        } else {
+            false
+        }
     }
 
     // -- the tick ---------------------------------------------------------
@@ -906,10 +951,26 @@ impl SyncEngine {
                     self.handle_invite_accept(peer, accept);
                 }
                 // Token gate: if we require one, the hello must carry it.
-                if let Some(need) = &self.token {
+                // A provided-but-wrong token is a failed auth attempt;
+                // crossing the threshold auto-bans the peer.
+                let need = self.token.clone();
+                if let Some(need) = &need {
                     match h.token.as_deref() {
                         Some(got) if got == need => {}
-                        _ => {
+                        Some(_) => {
+                            let err = if self.record_auth_failure(&peer) {
+                                HelloError::Banned
+                            } else {
+                                HelloError::BadToken
+                            };
+                            let _ = self
+                                .swarm
+                                .behaviour_mut()
+                                .sync
+                                .send_response(channel, SyncMsg::HelloErr(err));
+                            return;
+                        }
+                        None => {
                             let _ = self
                                 .swarm
                                 .behaviour_mut()
@@ -1136,7 +1197,8 @@ impl SyncEngine {
                     ),
                     HelloError::Banned => (
                         DriveStatus::Error,
-                        "banned: the peer is refused by the remote (or is on our ban list)".to_string(),
+                        "banned: the peer is refused by the remote (or is on our ban list)"
+                            .to_string(),
                     ),
                 };
                 if let Some(rt) = self.drives.get_mut(&name) {
@@ -1257,4 +1319,71 @@ pub(crate) fn test_peer_id() -> String {
     PeerId::from_bytes(&mh)
         .expect("ed25519 multihash")
         .to_base58()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::Store;
+    use libp2p::identity::Keypair;
+    use std::str::FromStr;
+    use tokio::sync::mpsc;
+
+    fn kp_peer_id(kp: &Keypair) -> PeerId {
+        kp.public().to_peer_id()
+    }
+
+    /// A minimal engine for exercising `record_auth_failure` without the
+    /// full handshake (no event loop is run; only the fields matter).
+    fn engine_with_token(token: Option<&str>) -> SyncEngine {
+        let key = Keypair::generate_ed25519();
+        let peer = kp_peer_id(&key);
+        let dir = tempfile::tempdir().expect("temp dir");
+        let signing = super::signing_key(&key).expect("signing key");
+        let store =
+            Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
+        let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
+        let (evt_tx, _evt_rx) = mpsc::unbounded_channel();
+        let listen = Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").expect("listen");
+        let engine = SyncEngine::new(
+            &key,
+            store,
+            "test",
+            listen,
+            false, // no mDNS
+            false, // no DHT
+            false, // no relay
+            token.map(str::to_string),
+            HashSet::new(),
+            cmd_rx,
+            evt_tx,
+        )
+        .expect("engine");
+        drop(cmd_tx);
+        engine
+    }
+
+    /// A peer that fails auth (wrong token) `AUTH_BAN_AFTER` times in a row
+    /// is auto-banned; a distinct peer is unaffected.
+    #[tokio::test]
+    async fn auto_ban_after_auth_threshold() {
+        let mut e = engine_with_token(Some("secret"));
+        let attacker = Keypair::generate_ed25519();
+        let attacker_id = kp_peer_id(&attacker);
+
+        // Below the threshold: the peer is not banned yet.
+        for _ in 0..(AUTH_BAN_AFTER - 1) {
+            assert!(!e.record_auth_failure(&attacker_id));
+            assert!(!e.banned.contains(&attacker_id));
+        }
+        // Crossing the threshold auto-bans it.
+        assert!(e.record_auth_failure(&attacker_id));
+        assert!(e.banned.contains(&attacker_id));
+
+        // A distinct peer is independent: it needs its own threshold.
+        let other = Keypair::generate_ed25519();
+        let other_id = kp_peer_id(&other);
+        assert!(!e.record_auth_failure(&other_id));
+        assert!(!e.banned.contains(&other_id));
+    }
 }

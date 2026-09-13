@@ -466,6 +466,17 @@ fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
                 }
             }
         }
+        EngineEvent::PeerAutoBanned { peer } => {
+            if ctx.bans.insert(peer.clone()) {
+                if let Err(e) = save_bans(&ctx.paths, &ctx.bans) {
+                    tracing::warn!("persisting auto-ban for {peer} failed: {e:#}");
+                } else {
+                    ctx.last_event =
+                        Some(format!("auto-banned peer {peer} (repeated auth failures)"));
+                    tracing::info!("auto-banned {peer} and persisted it to the ban list");
+                }
+            }
+        }
     }
 }
 
@@ -1521,9 +1532,7 @@ pub async fn ban_command(state_dir: Option<&Path>, peer: String, unban: bool) ->
     let endpoint = if unban { "api/unban" } else { "api/ban" };
     let url = format!(
         "http://{}:{}/{}",
-        config.settings.host,
-        config.settings.port,
-        endpoint
+        config.settings.host, config.settings.port, endpoint
     );
     let client = reqwest::Client::builder()
         .timeout(Duration::from_secs(15))
@@ -1533,7 +1542,10 @@ pub async fn ban_command(state_dir: Option<&Path>, peer: String, unban: bool) ->
     let status = r.status();
     if !status.is_success() {
         let text = r.text().await.unwrap_or_default();
-        bail!("{} failed: {status} {text}", if unban { "unban" } else { "ban" });
+        bail!(
+            "{} failed: {status} {text}",
+            if unban { "unban" } else { "ban" }
+        );
     }
     if unban {
         println!("unbanned {peer}");

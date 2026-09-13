@@ -75,7 +75,10 @@ pub struct HelloAck {
 /// Typed handshake rejection.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum HelloError {
-    BadVersion { expected: u32, got: u32 },
+    BadVersion {
+        expected: u32,
+        got: u32,
+    },
     AuthRequired,
     BadToken,
     KeyMismatch,
