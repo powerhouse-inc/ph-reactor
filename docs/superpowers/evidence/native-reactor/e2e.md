@@ -241,3 +241,29 @@ set are lossy in a ten-peer full mesh — a gossip-missing peer can wait a
 full 30 s reconciliation tick, and DHT-discovered (non-bootstrap) peers
 lean on that path. The two-peer engine test covers the reliable update
 path. Tightening live convergence for large meshes is the follow-up.
+
+## 2026-09-13: document-model distribution over the mesh
+
+A peer that receives an action under a model it does not have requests
+the definition over the request-response protocol, verifies the reply
+against the hash stamped on the action, registers the model, and
+re-applies the held action — so a custom model (and any doc written
+under it) propagates across the mesh with no central registry.
+
+Proven by `tests/two_engine_sync.rs::custom_model_is_distributed_over_the_mesh`
+(10 s): alpha registers the `task@1` L1 model and creates a task doc;
+beta starts with built-ins only (`open@1`/`group@1`). After the handshake,
+beta cannot reduce alpha's `init` action, so it requests the `task@1`
+definition from alpha over `/ph-reactor/sync/2.0.0`, verifies the reply
+against the action's pinned hash, registers `task@1`, and re-applies the
+action. The doc then appears on beta with `title`, `status`, and `priority`
+intact, and beta's registry now carries the model (its pre-state had only
+the two built-ins).
+
+The model's identity is the content hash of its canonical JSON definition
+(`model_def_hash`); every action's `ModelRef` is stamped with it on build
+(`canonical_model_ref`), which is what lets a receiver verify a distributed
+definition against the exact model the doc was written under. A responder
+only answers a request for a model whose loaded hash matches the requested
+one, and the requester drops any reply whose recomputed hash does not match
+— a tampered definition is never registered.
