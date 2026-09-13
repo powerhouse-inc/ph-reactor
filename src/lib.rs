@@ -12,6 +12,8 @@
 //! - [`doc`] — the doc/op/clock model (shared by the store and p2p)
 //! - [`p2p`] — the libp2p sync engine (gossipsub + hello/catch-up +
 //!   mDNS) and the daemon identity
+//! - [`processor`] — user-configurable subscriptions on doc changes (the
+//!   invoice → payment engine)
 //! - [`drives`] — drive config + status vocabulary
 //! - [`status`] — the shared status snapshot (tray, settings, CLI)
 //! - [`commands`] — the daemon's command channel vocabulary
@@ -30,6 +32,7 @@ pub mod logrotate;
 pub mod model;
 pub mod p2p;
 pub mod paths;
+pub mod processor;
 pub mod query;
 pub mod settings;
 pub mod status;

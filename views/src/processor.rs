@@ -15,6 +15,7 @@ use std::sync::Arc;
 
 use tokio::sync::mpsc;
 
+use ph_reactor::processor::ActionFilter;
 use ph_reactor::store::Store;
 
 use crate::read_model::DocSnapshot;
@@ -27,6 +28,13 @@ pub trait Processor: Send + Sync {
     fn models(&self) -> Vec<String> {
         Vec::new()
     }
+    /// The subscription filter (which models, and optionally the action /
+    /// field / value change). Defaults to the model list only, so a
+    /// processor that only declares `models()` is unchanged.
+    fn filter(&self) -> ActionFilter {
+        ActionFilter { models: self.models(), ..Default::default() }
+    }
+
     /// React to a doc's current snapshot.
     fn on_change(&mut self, snap: &DocSnapshot) -> Result<(), String>;
 }
@@ -115,15 +123,13 @@ impl ProcessorManager {
         // per matching processor.
         let mut change_rx = store.subscribe_changes();
         while let Some(change) = change_rx.recv().await {
-            let snap = DocSnapshot::from_change(&change);
             for (i, p) in procs.iter().enumerate() {
-                let models = p.lock().models();
-                if !models.is_empty() && !models.contains(&snap.model.name) {
+                if !p.lock().filter().matches(&change) {
                     continue;
                 }
                 let job = Job {
                     proc: i,
-                    snap: snap.clone(),
+                    snap: DocSnapshot::from_change(&change),
                     attempts: 0,
                 };
                 if loop_tx.send(job).await.is_err() {
