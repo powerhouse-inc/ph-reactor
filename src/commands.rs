@@ -48,6 +48,25 @@ pub enum Command {
         payload: Value,
         reply: tokio::sync::oneshot::Sender<std::result::Result<crate::action::Action, String>>,
     },
+    /// Build and sign a quorum-gated action without applying it, returning a
+    /// shareable proposal token for other members to co-sign.
+    Propose {
+        name: String,
+        model: String,
+        kind: String,
+        payload: Value,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
+    /// Add this node's co-signature to a proposal token.
+    CoSign {
+        token: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
+    /// Apply a proposal that has gathered enough co-signatures.
+    Submit {
+        token: String,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<String, String>>,
+    },
     /// Create a document under a specific model's `init` reducer (the
     /// model-aware counterpart to `CreateDoc`, which is always `open@1`).
     /// Synchronous, like `CreateDoc`: the sender awaits the outcome.

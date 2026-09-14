@@ -373,6 +373,15 @@ impl Store {
         }
     }
 
+    /// The pinned public key for `origin`, if this node has seen one.
+    ///
+    /// Exposed so a proposal's signatures can be verified before it is
+    /// applied — an unknown signer must be an error, never a silently
+    /// ignored one that still appears to count toward a quorum.
+    pub fn peer_key(&self, origin: &str) -> Option<[u8; 32]> {
+        self.inner.lock().known_keys.get(origin).copied()
+    }
+
     pub fn create_doc(
         &self,
         name: &str,
@@ -759,6 +768,42 @@ impl Store {
         let action = g.build_action(id, model, kind, payload)?;
         g.apply_action(&action)?;
         Ok(action)
+    }
+
+    /// Builds and origin-signs a local action **without applying it**.
+    ///
+    /// The half of [`Self::apply_local_action`] that a quorum-gated reducer
+    /// needs: the action has to travel to other members for co-signing before
+    /// it can be applied, because the store rejects it until the quorum is
+    /// met.
+    ///
+    /// The result is pinned to the document's current log position through
+    /// `prev_hash`, so it must be applied before the document changes.
+    pub fn build_local_action(
+        &self,
+        name: &str,
+        model: &ModelRef,
+        kind: &str,
+        payload: &serde_json::Value,
+    ) -> Result<Action, String> {
+        let mut g = self.inner.lock();
+        let id = *g
+            .names
+            .get(name)
+            .ok_or_else(|| format!("no doc named '{name}'"))?;
+        g.build_action(id, model, kind, payload)
+    }
+
+    /// Applies an already-signed action that this node originated.
+    ///
+    /// Used to submit a proposal once enough members have co-signed it. All
+    /// the usual checks still run — signature, hash chain, preconditions and
+    /// quorum — so a proposal that has not reached its quorum is refused here
+    /// exactly as it would be on any other node.
+    pub fn apply_signed_action(&self, action: &Action) -> Result<(), String> {
+        let mut g = self.inner.lock();
+        g.apply_action(action)?;
+        Ok(())
     }
 
     pub fn wal_path(&self, id: &DocId) -> PathBuf {
@@ -1211,18 +1256,33 @@ impl Inner {
                     .collect()
             })
             .unwrap_or_default();
+        // Distinct members who endorsed this action. The ORIGIN counts: it is
+        // a verified signature by a member, and `min` names how many people
+        // must agree, not how many must agree *with* the proposer. Excluding
+        // it would make `min: 2` a three-person rule, which is neither what
+        // "the two-person rule" means nor what a two-member group can ever
+        // satisfy.
+        //
+        // Distinctness is what carries the weight: one node cannot reach a
+        // quorum of 2 by co-signing its own action, because its origin and
+        // its co-signature share an origin id.
         let mut seen: HashSet<&str> = HashSet::new();
-        let mut in_group = 0usize;
+        if members.contains(&action.origin) {
+            seen.insert(action.origin.as_str());
+        }
         for cs in &action.cosig {
-            if seen.insert(cs.origin.as_str()) && members.contains(&cs.origin) {
-                in_group += 1;
+            if members.contains(&cs.origin) {
+                seen.insert(cs.origin.as_str());
             }
         }
-        if in_group < spec.min {
+        let endorsers = seen.len();
+        if endorsers < spec.min {
             Some(format!(
-                "quorum not met: {in_group} of {} co-signers are members of '{group_name}' (need {}). The two-person rule: {} distinct members *other than the proposer* must co-sign this action — a single node cannot satisfy it by itself.",
-                action.cosig.len(),
+                "quorum not met: {endorsers} distinct member(s) of '{group_name}' have signed this action (need {}). \
+                 The proposer counts as one; {} more distinct member(s) must co-sign it. \
+                 A single node cannot reach a quorum of {} by itself.",
                 spec.min,
+                spec.min.saturating_sub(endorsers),
                 spec.min
             ))
         } else {
@@ -1737,7 +1797,9 @@ mod tests {
             .unwrap();
         assert!(managers.iter().any(|v| v == &serde_json::json!("dave")));
 
-        // One co-signer is below quorum.
+        // The proposer counts toward the quorum, so one co-signer is enough:
+        // alice proposed and bob co-signed -- two distinct people agreed,
+        // which is what "the two-person rule" names.
         let one = make_group_action(
             id,
             "add-manager",
@@ -1749,11 +1811,48 @@ mod tests {
             3000,
         );
         assert!(
-            s.apply_remote_action(&one).is_err(),
-            "one co-signer < quorum"
+            s.apply_remote_action(&one).is_ok(),
+            "proposer + one co-signer = two distinct members"
         );
 
-        // Two co-signers but the same origin are not distinct.
+        // A proposer alone cannot reach a quorum of 2.
+        let alone = make_group_action(
+            id,
+            "add-manager",
+            serde_json::json!({ "member": "frank" }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 4),
+            4000,
+        );
+        assert!(
+            s.apply_remote_action(&alone).is_err(),
+            "a lone proposer must not satisfy a quorum of 2"
+        );
+
+        // Nor by co-signing their own action: origin and co-signer share an
+        // id, so they collapse to one distinct endorser. This is the property
+        // that keeps a single node from promoting itself.
+        let selfsign = make_group_action(
+            id,
+            "add-manager",
+            serde_json::json!({ "member": "frank" }),
+            "alice",
+            &k_alice,
+            &[("alice".into(), &k_alice)],
+            clock1("alice", 5),
+            5000,
+        );
+        assert!(
+            s.apply_remote_action(&selfsign).is_err(),
+            "a node must not reach a quorum by co-signing itself"
+        );
+
+        // Duplicate co-signers collapse: bob twice is still one person, so
+        // with alice that is 2 -- which now MEETS the quorum. Distinctness is
+        // enforced, and alice+bob is a legitimate pair regardless of how many
+        // times bob signs.
         let dup = make_group_action(
             id,
             "add-manager",
@@ -1761,31 +1860,33 @@ mod tests {
             "alice",
             &k_alice,
             &[("bob".into(), &k_bob), ("bob".into(), &k_bob)],
-            clock1("alice", 4),
-            4000,
+            clock1("alice", 6),
+            6000,
         );
         assert!(
-            s.apply_remote_action(&dup).is_err(),
-            "duplicate co-signers are not distinct"
+            s.apply_remote_action(&dup).is_ok(),
+            "alice + bob (however many times bob signs) is still two people"
         );
 
-        // One member + one outsider: only one counts.
+        // An outsider does not count: alice + mallory is one member, not two.
         let outsider = make_group_action(
             id,
             "add-manager",
             serde_json::json!({ "member": "eve" }),
             "alice",
             &k_alice,
-            &[("bob".into(), &k_bob), ("mallory".into(), &k_mallory)],
-            clock1("alice", 5),
-            5000,
+            &[("mallory".into(), &k_mallory)],
+            clock1("alice", 7),
+            7000,
         );
         assert!(
             s.apply_remote_action(&outsider).is_err(),
-            "an outsider co-signer does not count"
+            "a non-member co-signer must not count toward the quorum"
         );
 
-        // The rejected actions never added eve.
+        // "frank" was only ever attempted by actions that must be rejected
+        // (a lone proposer, and a proposer co-signing itself), so its absence
+        // proves those rejections did not mutate the group.
         let members = s
             .get("core")
             .unwrap()
@@ -1797,7 +1898,7 @@ mod tests {
             .cloned()
             .unwrap();
         assert!(
-            !members.iter().any(|v| v == &serde_json::json!("eve")),
+            !members.iter().any(|v| v == &serde_json::json!("frank")),
             "rejected actions must not mutate the group"
         );
 
@@ -1809,8 +1910,8 @@ mod tests {
             "alice",
             &k_alice,
             &[("bob".into(), &k_bob), ("carol".into(), &k_carol)],
-            clock1("alice", 6),
-            6000,
+            clock1("alice", 8),
+            8000,
         );
         tampered.sig = k_bob.sign(&tampered.message_bytes()).to_bytes();
         assert!(

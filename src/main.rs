@@ -60,6 +60,13 @@ async fn dispatch(
         }
         ph::cli::Command::Invite { groups } => ph::daemon::invite_command(state_dir, groups).await,
         ph::cli::Command::Join { invite } => ph::daemon::join_command(state_dir, invite).await,
+        ph::cli::Command::Propose {
+            group,
+            kind,
+            payload,
+        } => ph::daemon::propose_command(state_dir, group, kind, payload).await,
+        ph::cli::Command::Cosign { token } => ph::daemon::cosign_command(state_dir, token).await,
+        ph::cli::Command::Submit { token } => ph::daemon::submit_command(state_dir, token).await,
         ph::cli::Command::Ban { peer } => ph::daemon::ban_command(state_dir, peer, false).await,
         ph::cli::Command::Unban { peer } => ph::daemon::ban_command(state_dir, peer, true).await,
         ph::cli::Command::Doctor => ph::daemon::doctor(state_dir).await,

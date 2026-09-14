@@ -18,6 +18,7 @@
 //! commands ([`EngineCommand`]) and events ([`EngineEvent`]).
 
 pub mod codec;
+pub mod cosign;
 pub mod invite;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;

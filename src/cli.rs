@@ -64,6 +64,30 @@ pub enum Command {
         #[arg(long = "group")]
         groups: Vec<String>,
     },
+    /// Propose a quorum-gated group action (e.g. promoting a manager).
+    ///
+    /// Prints a proposal token. Other members co-sign it with `cosign`; once
+    /// enough have, `submit` applies it. The proposal is bound to the
+    /// document's current state, so submit it before the group changes.
+    Propose {
+        /// The group the action applies to.
+        group: String,
+        /// The reducer to run, e.g. `add-manager`.
+        kind: String,
+        /// The reducer payload as JSON, e.g. '{"member":"12D3Koo..."}'.
+        #[arg(long, default_value = "{}")]
+        payload: String,
+    },
+    /// Add this node's co-signature to a proposal token.
+    Cosign {
+        /// The token from `ph-reactor propose` (or a previous `cosign`).
+        token: String,
+    },
+    /// Apply a proposal that has gathered enough co-signatures.
+    Submit {
+        /// The fully co-signed token.
+        token: String,
+    },
     /// Consume an invite string: pin the inviter (TOFU) and add a drive that
     /// syncs with it. Requires a running daemon.
     Join {

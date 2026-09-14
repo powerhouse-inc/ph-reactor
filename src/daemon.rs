@@ -741,6 +741,61 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
                 let _ = reply.send(Err(e));
             }
         },
+        Command::Propose {
+            name,
+            model,
+            kind,
+            payload,
+            reply,
+        } => {
+            let out = crate::doc::ModelRef::parse(&model)
+                .and_then(|mr| ctx.store.build_local_action(&name, &mr, &kind, &payload))
+                .and_then(|action| crate::p2p::cosign::encode(&action));
+            match &out {
+                Ok(_) => tracing::info!("proposed {kind} on '{name}' (awaiting co-signatures)"),
+                Err(e) => tracing::warn!("propose {kind} on '{name}' failed: {e}"),
+            }
+            let _ = reply.send(out);
+        }
+        Command::CoSign { token, reply } => {
+            let store = ctx.store.clone();
+            let key_of = |o: &str| {
+                store
+                    .peer_key(o)
+                    .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
+            };
+            let out = crate::p2p::cosign::decode(&token, key_of).and_then(|mut action| {
+                let me = ctx.peer_id.to_base58();
+                crate::p2p::cosign::add_cosig(&mut action, &me, &ctx.store.key())?;
+                crate::p2p::cosign::encode(&action)
+            });
+            match &out {
+                Ok(_) => tracing::info!("co-signed a proposal"),
+                Err(e) => tracing::warn!("co-sign failed: {e}"),
+            }
+            let _ = reply.send(out);
+        }
+        Command::Submit { token, reply } => {
+            let store = ctx.store.clone();
+            let key_of = |o: &str| {
+                store
+                    .peer_key(o)
+                    .and_then(|b| ed25519_dalek::VerifyingKey::from_bytes(&b).ok())
+            };
+            let out = crate::p2p::cosign::decode(&token, key_of).and_then(|action| {
+                let kind = action.kind.clone();
+                ctx.store.apply_signed_action(&action)?;
+                Ok(kind)
+            });
+            match &out {
+                Ok(kind) => {
+                    tracing::info!("submitted co-signed {kind} action");
+                    ctx.last_event = Some(format!("applied co-signed {kind}"));
+                }
+                Err(e) => tracing::warn!("submit failed: {e}"),
+            }
+            let _ = reply.send(out.map(|k| format!("applied co-signed {k}")));
+        }
         Command::CreateDocModel {
             name,
             model,
@@ -1680,6 +1735,80 @@ pub async fn invite_command(state_dir: Option<&Path>, groups: Vec<String>) -> Re
 
 /// The `join` CLI: consumes an invite string through the running daemon —
 /// it pins the inviter (TOFU) and adds a drive with a signed join-proof.
+/// Posts to one of the co-signing endpoints and prints the returned token.
+async fn cosign_endpoint(
+    state_dir: Option<&Path>,
+    path: &str,
+    body: serde_json::Value,
+    what: &str,
+) -> Result<()> {
+    let paths = StatePaths::resolve(state_dir);
+    paths.ensure_dirs()?;
+    if !daemon_is_running(&paths.daemon_pidfile()) {
+        bail!("the daemon is not running — start it (ph-reactor) and retry: {what} needs the daemon's live identity and store");
+    }
+    let config = config::load(&paths)?;
+    let url = format!(
+        "http://{}:{}{path}",
+        config.settings.host, config.settings.port
+    );
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(20))
+        .build()?;
+    let r = client.post(&url).json(&body).send().await?;
+    let status = r.status();
+    if !status.is_success() {
+        let text = r.text().await.unwrap_or_default();
+        bail!("{what} failed: {text}");
+    }
+    let v: serde_json::Value = r.json().await?;
+    println!(
+        "{}",
+        v.get("token").and_then(|s| s.as_str()).unwrap_or_default()
+    );
+    Ok(())
+}
+
+/// `ph-reactor propose <group> <kind> --payload <json>`
+pub async fn propose_command(
+    state_dir: Option<&Path>,
+    group: String,
+    kind: String,
+    payload: String,
+) -> Result<()> {
+    let payload: serde_json::Value = serde_json::from_str(&payload)
+        .map_err(|e| anyhow::anyhow!("--payload is not valid JSON: {e}"))?;
+    cosign_endpoint(
+        state_dir,
+        "/api/propose",
+        serde_json::json!({ "group": group, "kind": kind, "payload": payload }),
+        "propose",
+    )
+    .await
+}
+
+/// `ph-reactor cosign <token>`
+pub async fn cosign_command(state_dir: Option<&Path>, token: String) -> Result<()> {
+    cosign_endpoint(
+        state_dir,
+        "/api/cosign",
+        serde_json::json!({ "token": token }),
+        "cosign",
+    )
+    .await
+}
+
+/// `ph-reactor submit <token>`
+pub async fn submit_command(state_dir: Option<&Path>, token: String) -> Result<()> {
+    cosign_endpoint(
+        state_dir,
+        "/api/submit",
+        serde_json::json!({ "token": token }),
+        "submit",
+    )
+    .await
+}
+
 pub async fn join_command(state_dir: Option<&Path>, invite: String) -> Result<()> {
     let paths = StatePaths::resolve(state_dir);
     paths.ensure_dirs()?;

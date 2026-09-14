@@ -88,6 +88,9 @@ impl Settings {
             .route("/api/docs/action", post(action_doc))
             .route("/api/query", get(query_api))
             .route("/api/invite", post(make_invite))
+            .route("/api/propose", post(propose_api))
+            .route("/api/cosign", post(cosign_api))
+            .route("/api/submit", post(submit_api))
             .route("/api/join", post(join_invite))
             .route("/api/ban", post(ban_peer))
             .route("/api/unban", post(unban_peer))
@@ -899,6 +902,80 @@ async fn group_action(
     axum::extract::Json(body): axum::extract::Json<GroupActionBody>,
 ) -> Response {
     run_create_action(&state, &name, "group@1", &body.kind, body.payload).await
+}
+
+#[derive(serde::Deserialize)]
+struct ProposeBody {
+    group: String,
+    kind: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+#[derive(serde::Deserialize)]
+struct TokenBody {
+    token: String,
+}
+
+/// Runs a command that answers with a single string, shared by the three
+/// co-signing endpoints.
+async fn string_command<F>(state: &Arc<Settings>, make: F) -> Response
+where
+    F: FnOnce(oneshot::Sender<Result<String, String>>) -> Command,
+{
+    let (reply, wait) = oneshot::channel();
+    if state.cmd_tx.send(make(reply)).is_err() {
+        return (
+            StatusCode::SERVICE_UNAVAILABLE,
+            "daemon command channel closed",
+        )
+            .into_response();
+    }
+    match tokio::time::timeout(Duration::from_secs(15), wait).await {
+        Ok(Ok(Ok(s))) => (StatusCode::OK, axum::Json(json!({ "token": s }))).into_response(),
+        Ok(Ok(Err(e))) => (StatusCode::BAD_REQUEST, e).into_response(),
+        _ => (StatusCode::SERVICE_UNAVAILABLE, "timed out").into_response(),
+    }
+}
+
+/// `POST /api/propose` — build a quorum-gated action and return a token for
+/// other members to co-sign.
+async fn propose_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<ProposeBody>,
+) -> Response {
+    string_command(&state, |reply| Command::Propose {
+        name: body.group,
+        model: "group@1".into(),
+        kind: body.kind,
+        payload: body.payload,
+        reply,
+    })
+    .await
+}
+
+/// `POST /api/cosign` — add this node's co-signature to a proposal.
+async fn cosign_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<TokenBody>,
+) -> Response {
+    string_command(&state, |reply| Command::CoSign {
+        token: body.token,
+        reply,
+    })
+    .await
+}
+
+/// `POST /api/submit` — apply a proposal that has reached its quorum.
+async fn submit_api(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Json(body): axum::extract::Json<TokenBody>,
+) -> Response {
+    string_command(&state, |reply| Command::Submit {
+        token: body.token,
+        reply,
+    })
+    .await
 }
 
 /// `GET /api/groups/:name/activity` — the group's recent signed actions.
