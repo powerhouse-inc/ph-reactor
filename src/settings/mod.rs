@@ -107,6 +107,13 @@ impl Settings {
             .route("/api/groups/:name/drive/:doc", delete(drive_remove))
             .route("/api/groups/:name/action", post(group_action))
             .route("/api/groups/:name/activity", get(group_activity))
+            .route("/api/groups/:name/channels", post(channel_add))
+            .route(
+                "/api/groups/:name/channels/:chan",
+                delete(channel_remove),
+            )
+            .route("/api/groups/:name/drive/folder", post(drive_folder))
+            .route("/api/groups/:name/drive/doc", post(drive_doc))
             .route("/api/folders", get(folders_api).post(create_folder))
             .route("/api/folders/:name/action", post(folder_action))
             .route("/api/docs/:name", get(doc_detail))
@@ -590,7 +597,20 @@ async fn overview_api(state: axum::extract::State<Arc<Settings>>) -> Response {
     let cfg = config::load(&state.paths).unwrap_or_default();
     let log_path = state.paths.reactor_log();
     let log_size = std::fs::metadata(&log_path).map(|m| m.len()).unwrap_or(0);
+    // Every node counts as a peer (itself), so this number is never zero even
+    // when it is the only node on the mesh; the rest is the set of remote
+    // peers this store has authenticated. Computed here (backend) so the
+    // console, settings, and profile views all see the same value.
+    let known_peers = state.store.known_peers();
+    let peer_count = known_peers.len() + 1;
     let body = json!({
+        "peerId": snap.reactor.peer_id,
+        "instanceName": cfg.instance.name,
+        "listen": snap.reactor.listen,
+        "peerCount": peer_count,
+        "knownPeers": known_peers,
+        "liveDocCount": snap.reactor.docs,
+        "docsDir": state.paths.docs_dir.to_string_lossy(),
         "syncEngine": {
             "running": snap.reactor.running,
             "healthy": snap.reactor.healthy,
@@ -912,9 +932,9 @@ async fn group_activity(
     axum::Json(out).into_response()
 }
 
-/// `GET /api/groups/:name` — the group's full state: membership plus its
-/// channel (the `msg_*` arrays) and its drive (the `drive` doc names). This is
-/// what the console renders as the shared space.
+/// `GET /api/groups/:name` — the group's full state: membership, its
+/// channels (the `channels` array), its messages (the `msg_*` arrays), and
+/// its drive. This is what the console renders as the shared space.
 async fn group_detail(
     state: axum::extract::State<Arc<Settings>>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -943,18 +963,22 @@ async fn group_detail(
         "msgText": arr("msg_text"),
         "msgTs": arr("msg_ts"),
         "msgChannel": arr("msg_channel"),
+        "channels": arr("channels"),
         "drive": arr("drive"),
     }))
     .into_response()
 }
 
-/// `GET /api/groups/:name/drive` — the docs in the group's drive (each doc's
-/// name/model/fields, or `missing` when the referenced doc is gone).
+/// `GET /api/groups/:name/drive` — the group's drive as a flat list of items
+/// (folders + docs), each with `kind`, `model`, and `parent` (null = root).
+/// The console turns this into a folder tree with a breadcrumb. A legacy
+/// `string` entry (pre-folder drive) is treated as a root `note` doc. Docs
+/// carry their current `fields`; a gone doc is flagged `missing`.
 async fn drive_list(
     state: axum::extract::State<Arc<Settings>>,
     axum::extract::Path(name): axum::extract::Path<String>,
 ) -> Response {
-    let store = &state.store;
+    let store = state.store.as_ref();
     let gdoc = match store.get(&name) {
         Some(d) => d,
         None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
@@ -971,36 +995,215 @@ async fn drive_list(
         .unwrap_or_else(|| json!([]));
     let mut out = Vec::new();
     for entry in drive.as_array().cloned().unwrap_or_default() {
-        let docname = entry.as_str().unwrap_or("").to_string();
-        let ddoc = match store.get(&docname) {
-            Some(d) => d,
-            None => {
-                out.push(json!({ "name": docname, "missing": true }));
-                continue;
-            }
+        // Normalize a legacy string entry into a root note item.
+        let item = match entry.as_str() {
+            Some(s) => json!({ "name": s, "kind": "doc", "model": "note", "parent": null }),
+            None => entry.clone(),
         };
-        let dstate = match store.full_state(ddoc.id) {
-            Some(s) => s,
-            None => {
-                out.push(json!({ "name": docname, "missing": true }));
-                continue;
+        let item_name = drive_item_name(&item).to_string();
+        let kind = item.get("kind").and_then(Value::as_str).unwrap_or("doc");
+        let mut o = json!({
+            "name": item_name,
+            "kind": kind,
+            "model": item.get("model").cloned().unwrap_or(Value::Null),
+            "parent": item.get("parent").cloned(),
+        });
+        if kind == "doc" && !item_name.is_empty() {
+            match store.get(&item_name).and_then(|d| store.full_state(d.id)) {
+                Some(ds) => {
+                    let fields: BTreeMap<String, Value> = ds
+                        .doc
+                        .fields
+                        .iter()
+                        .map(|(k, v)| (k.clone(), v.value.clone()))
+                        .collect();
+                    o["model"] = Value::String(ds.model.name.clone());
+                    let title = fields
+                        .get("title")
+                        .cloned()
+                        .unwrap_or_else(|| Value::String(item_name.clone()));
+                    o["fields"] = Value::Object(fields.into_iter().collect());
+                    o["title"] = title;
+                }
+                None => {
+                    o["missing"] = json!(true);
+                }
             }
-        };
-        let fields: BTreeMap<String, Value> = dstate
-            .doc
-            .fields
-            .iter()
-            .map(|(k, v)| (k.clone(), v.value.clone()))
-            .collect();
-        out.push(json!({
-            "name": docname,
-            "model": dstate.model.name,
-            "fields": fields
-        }));
+        }
+        out.push(o);
     }
     axum::Json(out).into_response()
 }
 
+/// `POST /api/groups/:name/channels` — add a channel (a **member** may).
+/// `visibility` is `public` (any member posts) or `private` (only `members`).
+#[derive(Deserialize)]
+struct ChannelBody {
+    name: String,
+    #[serde(default)]
+    visibility: String,
+    #[serde(default)]
+    members: Vec<String>,
+}
+async fn channel_add(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<ChannelBody>,
+) -> Response {
+    if !valid_name(&body.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a channel name is required (no '/', max 64)",
+        )
+            .into_response();
+    }
+    let vis = if body.visibility == "private" {
+        "private"
+    } else {
+        "public"
+    };
+    let item = json!({ "name": body.name, "visibility": vis, "members": body.members });
+    run_create_action(
+        &state,
+        &name,
+        "group@1",
+        "add-channel",
+        json!({ "item": item }),
+    )
+    .await
+}
+
+/// `DELETE /api/groups/:name/channels/:chan` — remove a channel (a **manager**
+/// may). Recomputes the `channels` array and `set`s it (per-field LWW).
+async fn channel_remove(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path((name, chan)): axum::extract::Path<(String, String)>,
+) -> Response {
+    let store = state.store.as_ref();
+    let gdoc = match store.get(&name) {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let gst = match store.full_state(gdoc.id) {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let channels = gst
+        .doc
+        .fields
+        .get("channels")
+        .map(|f| f.value.clone())
+        .unwrap_or_else(|| Value::Array(vec![]));
+    let next: Vec<Value> = channels
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|c| c.get("name").and_then(Value::as_str) != Some(chan.as_str()))
+        .collect();
+    set_group_field(&state, &name, "channels", "remove-channel", Value::Array(next)).await
+}
+
+/// `POST /api/groups/:name/drive/folder` — add a folder to the drive (a
+/// **member** may). `parent` (null = root) names the enclosing folder.
+#[derive(Deserialize)]
+struct DriveFolderBody {
+    name: String,
+    #[serde(default)]
+    parent: Option<String>,
+}
+async fn drive_folder(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<DriveFolderBody>,
+) -> Response {
+    if !valid_name(&body.name) {
+        return (
+            StatusCode::BAD_REQUEST,
+            "a folder name is required (no '/', max 64)",
+        )
+            .into_response();
+    }
+    let item = json!({
+        "name": body.name,
+        "kind": "folder",
+        "model": Value::Null,
+        "parent": body.parent,
+    });
+    run_create_action(
+        &state,
+        &name,
+        "group@1",
+        "add-folder",
+        json!({ "item": item }),
+    )
+    .await
+}
+
+/// `POST /api/groups/:name/drive/doc` — create a doc of the chosen model type
+/// in the group's drive (a **member** may). `model` is a type name (or
+/// `name@version`) from the model catalog; `parent` (null = root) places it;
+/// `fields` are the initial values (missing ones default by type).
+#[derive(Deserialize)]
+struct DriveDocBody {
+    #[serde(default)]
+    name: Option<String>,
+    model: String,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    fields: Value,
+}
+async fn drive_doc(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<DriveDocBody>,
+) -> Response {
+    if body.model.trim().is_empty() {
+        return (StatusCode::BAD_REQUEST, "a model type is required").into_response();
+    }
+    let model = match state.store.model_refs().into_iter().find(|r| r.name == body.model) {
+        Some(r) => format!("{}@{}", r.name, r.version),
+        None => body.model.clone(),
+    };
+    let type_name = model.split('@').next().unwrap_or(&body.model).to_string();
+    let doc_name = match &body.name {
+        Some(n) if !n.trim().is_empty() => n.trim().to_string(),
+        _ => {
+            let ms = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_millis())
+                .unwrap_or(0);
+            format!("{type_name}-{ms}")
+        }
+    };
+    let def = crate::doc::ModelRef::parse(&model)
+        .ok()
+        .and_then(|r| state.store.model_definition(&r));
+    let payload = init_payload_with_defaults(def.as_ref(), &doc_name, &body.fields);
+    let created = run_create_doc_model(&state, &doc_name, &model, payload).await;
+    if created.status() != StatusCode::OK {
+        return created;
+    }
+    let item = json!({
+        "name": doc_name,
+        "kind": "doc",
+        "model": type_name,
+        "parent": body.parent,
+    });
+    run_create_action(
+        &state,
+        &name,
+        "group@1",
+        "add-doc",
+        json!({ "item": item }),
+    )
+    .await
+}
+
+/// `POST /api/groups/:name/drive` — compatibility "new file": create a `note`
+/// doc at the drive root. (The folder-aware equivalents are
+/// `.../drive/folder` and `.../drive/doc`.)
 #[derive(Deserialize)]
 struct DriveAddBody {
     #[serde(default)]
@@ -1010,9 +1213,6 @@ struct DriveAddBody {
     #[serde(default)]
     body: String,
 }
-
-/// `POST /api/groups/:name/drive` — create a `note` doc and add it to the
-/// group's drive in one call (the "new file" action).
 async fn drive_add(
     state: axum::extract::State<Arc<Settings>>,
     axum::extract::Path(name): axum::extract::Path<String>,
@@ -1038,29 +1238,109 @@ async fn drive_add(
     if created.status() != StatusCode::OK {
         return created;
     }
+    let item = json!({
+        "name": note_name,
+        "kind": "doc",
+        "model": "note",
+        "parent": Value::Null,
+    });
     run_create_action(
         &state,
         &name,
         "group@1",
         "add-doc",
-        json!({ "name": note_name }),
+        json!({ "item": item }),
     )
     .await
 }
 
-/// `DELETE /api/groups/:name/drive/:doc` — remove a doc from the group's drive.
+/// `DELETE /api/groups/:name/drive/:item` — remove a drive item (a folder or
+/// a doc) from the group's drive (a **manager** may). Recomputes the `drive`
+/// array and `set`s it (per-field LWW).
 async fn drive_remove(
     state: axum::extract::State<Arc<Settings>>,
-    axum::extract::Path((name, doc)): axum::extract::Path<(String, String)>,
+    axum::extract::Path((name, item)): axum::extract::Path<(String, String)>,
 ) -> Response {
-    run_create_action(
-        &state,
-        &name,
-        "group@1",
-        "remove-doc",
-        json!({ "name": doc }),
-    )
-    .await
+    let store = state.store.as_ref();
+    let gdoc = match store.get(&name) {
+        Some(d) => d,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let gst = match store.full_state(gdoc.id) {
+        Some(s) => s,
+        None => return (StatusCode::NOT_FOUND, "no such group").into_response(),
+    };
+    let drive = gst
+        .doc
+        .fields
+        .get("drive")
+        .map(|f| f.value.clone())
+        .unwrap_or_else(|| Value::Array(vec![]));
+    let next: Vec<Value> = drive
+        .as_array()
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|i| drive_item_name(i) != item.as_str())
+        .collect();
+    set_group_field(&state, &name, "drive", "remove-item", Value::Array(next)).await
+}
+
+/// `set` one of a group's array fields through a (manager-gated) reducer —
+/// the "recompute the whole array" pattern, which converges under per-field
+/// last-writer-wins like any other field write.
+async fn set_group_field(
+    state: &axum::extract::State<Arc<Settings>>,
+    group: &str,
+    field: &str,
+    reducer: &str,
+    next: Value,
+) -> Response {
+    let mut payload = serde_json::Map::new();
+    payload.insert(field.to_string(), next);
+    run_create_action(state, group, "group@1", reducer, Value::Object(payload)).await
+}
+
+/// The name of a drive item, whether it is a legacy string or an object.
+fn drive_item_name(item: &Value) -> &str {
+    item.as_str()
+        .unwrap_or_else(|| item.get("name").and_then(Value::as_str).unwrap_or(""))
+}
+
+/// A type-appropriate default for a model field type.
+fn default_value(t: &str) -> Value {
+    match t {
+        "string" => Value::String(String::new()),
+        "number" => Value::from(0),
+        "boolean" => Value::Bool(false),
+        "object" => Value::Object(serde_json::Map::new()),
+        "string[]" | "number[]" | "boolean[]" | "array" => Value::Array(vec![]),
+        _ => Value::Null,
+    }
+}
+
+/// Build an `init` payload: for each field in the model's init schema, use
+/// the caller's value if present, else a type default. The doc `name` always
+/// wins. Extra caller fields pass through (the reducer ignores them).
+fn init_payload_with_defaults(def: Option<&Value>, name: &str, fields: &Value) -> Value {
+    let mut out = serde_json::Map::new();
+    let schema = def
+        .and_then(|d| d.get("reducers"))
+        .and_then(|r| r.get("init"))
+        .and_then(|r| r.get("payload"));
+    if let Some(obj) = schema.and_then(Value::as_object) {
+        for (f, t) in obj {
+            let v = fields.get(f).cloned().unwrap_or_else(|| default_value(t.as_str().unwrap_or("")));
+            out.insert(f.clone(), v);
+        }
+    }
+    if let Some(obj) = fields.as_object() {
+        for (k, v) in obj {
+            out.entry(k.clone()).or_insert_with(|| v.clone());
+        }
+    }
+    out.insert("name".into(), Value::String(name.to_string()));
+    Value::Object(out)
 }
 
 /// `GET /api/folders` — the registered folder documents.
@@ -1279,7 +1559,8 @@ fn pick(override_: &str, default: &str) -> String {
 // ---------------------------------------------------------------------------
 
 /// `GET /api/models` — the registered document-model types (for the
-/// create-document picker).
+/// create-document picker and the rich editor). `enums` maps a field name to
+/// its allowed values, so the editor can render a dropdown for that field.
 async fn models_api(state: axum::extract::State<Arc<Settings>>) -> Response {
     let mut out = Vec::new();
     for r in state.store.model_refs() {
@@ -1289,6 +1570,7 @@ async fn models_api(state: axum::extract::State<Arc<Settings>>) -> Response {
             "version": r.version,
             "fields": def.get("fields").cloned().unwrap_or(json!({})),
             "reducers": def.get("reducers").cloned().unwrap_or(json!({})),
+            "enums": def.get("enums").cloned().unwrap_or(json!({})),
         }));
     }
     axum::Json(out).into_response()
