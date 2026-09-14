@@ -279,6 +279,12 @@ pub struct SyncEngine {
     running: bool,
     /// Whether the idle notice has already been emitted.
     idle_notified: bool,
+    /// Documents this node declined to serve because the asking peer could
+    /// not read them. Counted separately from "we had nothing to send" so a
+    /// broken access check and a broken sync are distinguishable; without
+    /// that they present identically and every bug reads as "sometimes my
+    /// data doesn't appear".
+    withheld: u64,
     /// Whether the resolved listen address has been announced yet.
     identity_sent: bool,
 
@@ -432,6 +438,7 @@ impl SyncEngine {
             evt_tx,
             running: true,
             idle_notified: false,
+            withheld: 0,
             identity_sent: false,
             pending_actions: Vec::new(),
             requested_models: HashSet::new(),
@@ -507,7 +514,23 @@ impl SyncEngine {
     /// Publishes one of our own actions to the mesh topic exactly once.
     /// The dedupe set covers the overlap between the immediate outbound
     /// feed and the periodic drain.
+    ///
+    /// **Only public spaces are gossiped.** Gossipsub subscription is
+    /// unauthenticated -- any peer may subscribe to any topic -- so a
+    /// per-space topic would enforce nothing at all. Anything narrower than
+    /// public reaches member peers through the direct, authenticated sync
+    /// protocol instead, where `may_peer_read` gates it. That also keeps every
+    /// access decision on one path rather than split across two transports.
     fn publish_action(&mut self, action: &Action) {
+        if let Some(visibility) = self.store.space_visibility(action.doc_id) {
+            if !crate::model::space::may_gossip(&visibility) {
+                tracing::debug!(
+                    "not gossiping {}: its space is {visibility}, not public",
+                    action.doc_id
+                );
+                return;
+            }
+        }
         let h = action.hash();
         if !self.published.insert(h) {
             return;
@@ -1177,9 +1200,12 @@ impl SyncEngine {
                         }
                     }
                 }
-                // Ack with our full doc summary: the dialer plans
-                // catch-up from this.
-                let own = self.store.summary();
+                // Ack with our doc summary: the dialer plans catch-up from
+                // this. Filtered to what this peer may read -- an unfiltered
+                // summary hands over the *existence* and name of every
+                // document on the node, which is exactly the metadata a
+                // protected space must not give up.
+                let own = self.store.summary_for(&peer.to_base58());
                 let docs: Vec<DocSummary> = own
                     .iter()
                     .map(|(id, clock)| DocSummary {
@@ -1201,6 +1227,34 @@ impl SyncEngine {
                     .send_response(channel, SyncMsg::HelloAck(ack));
             }
             SyncMsg::CatchUp(c) => {
+                // The read gate. Sound because the peer on the other end of
+                // this session was authenticated by Noise, and `signing_key()`
+                // derives the document key from the same libp2p identity
+                // keypair -- so this peer id is the principal a space's member
+                // list names.
+                if !self.store.may_peer_read(&peer.to_base58(), c.doc_id) {
+                    // Counted and logged apart from "we have nothing", because
+                    // otherwise a bug in this check and a genuine sync failure
+                    // are the same observable -- nothing arrives -- and every
+                    // report becomes "sometimes my data doesn't show up".
+                    self.withheld += 1;
+                    tracing::debug!(
+                        "withheld {} from {peer}: not readable in its space",
+                        c.doc_id
+                    );
+                    let ack = CatchUpAck {
+                        doc_id: c.doc_id,
+                        state: None,
+                        actions: Vec::new(),
+                        more: false,
+                    };
+                    let _ = self
+                        .swarm
+                        .behaviour_mut()
+                        .sync
+                        .send_response(channel, SyncMsg::CatchUpAck(ack));
+                    return;
+                }
                 let (state, mut actions) = self.store.catch_up(c.doc_id, &c.have);
                 let more = actions.len() > CATCH_UP_MAX_ACTIONS;
                 actions.truncate(CATCH_UP_MAX_ACTIONS);
@@ -1225,7 +1279,11 @@ impl SyncEngine {
                     }
                     rt.last_seen = tokio::time::Instant::now();
                 }
-                let own: Vec<(DocId, VecClock)> = self.store.summary().into_iter().collect();
+                let own: Vec<(DocId, VecClock)> = self
+                    .store
+                    .summary_for(&peer.to_base58())
+                    .into_iter()
+                    .collect();
                 let _ = self
                     .swarm
                     .behaviour_mut()

@@ -16,6 +16,8 @@
 //!   preconditions) interpreted by one fixed, auditable engine.
 //! - `group` — the built-in `group` model (membership + quorum), which is
 //!   itself an `l1` definition.
+//! - `space` — the built-in `space` model: the unit of access. Everything a
+//!   space contains is an app, not a field of the space.
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
@@ -33,6 +35,7 @@ pub mod package;
 pub mod release;
 pub mod persist;
 pub mod realistic;
+pub mod space;
 
 /// Why a model rejected an action or a state.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -165,6 +168,7 @@ impl ModelRegistry {
         r.insert(Arc::new(group::group()));
         r.insert(Arc::new(package::package()));
         r.insert(Arc::new(release::release()));
+    r.insert(Arc::new(space::space()));
         r
     }
 

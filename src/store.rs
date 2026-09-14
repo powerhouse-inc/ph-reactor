@@ -339,6 +339,78 @@ impl Store {
         self.inner.lock().key.clone()
     }
 
+    /// May `peer` read this document?
+    ///
+    /// The one predicate behind all three enforcement points, so there is a
+    /// single place to be wrong rather than three. `peer` is the origin of the
+    /// node asking — the same key material the Noise handshake authenticated,
+    /// because `signing_key()` derives the document key from the libp2p
+    /// identity keypair. That identity is why any of this is enforceable: the
+    /// peer on the far end of the session is the same principal a member list
+    /// names.
+    ///
+    /// Defaults are chosen so that a mistake withholds rather than discloses:
+    /// a document whose space document has not arrived yet is not served.
+    pub fn may_peer_read(&self, peer: &str, id: DocId) -> bool {
+        let inner = self.inner.lock();
+        let Some(entry) = inner.entries.get(&id) else {
+            return false;
+        };
+        let Some(space_id) = entry.space else {
+            // Written before spaces existed. Replicates as it always did;
+            // giving it a home is a migration, not something to do silently
+            // here (and no default is safe -- see the design doc).
+            return true;
+        };
+
+        // A space document is served to anyone its own copy names. Without
+        // this the ACL is circular: to be told you are a member you must
+        // already be able to read the document that says so. The tail is that
+        // a removed member can never learn they were removed -- revocation is
+        // forward-only and best-effort, and is documented as such.
+        let gate = if space_id == id {
+            entry
+        } else {
+            match inner.entries.get(&space_id) {
+                Some(e) => e,
+                None => return false,
+            }
+        };
+
+        let visibility = crate::model::space::visibility_of(&gate.doc);
+        match visibility.as_str() {
+            crate::model::space::PUBLIC => true,
+            crate::model::space::PRIVATE => false,
+            _ => crate::model::space::members_of(&gate.doc)
+                .iter()
+                .any(|m| m == peer),
+        }
+    }
+
+    /// The visibility of the space a document belongs to, if it has one.
+    pub fn space_visibility(&self, id: DocId) -> Option<String> {
+        let inner = self.inner.lock();
+        let space_id = inner.entries.get(&id)?.space?;
+        let gate = if space_id == id {
+            inner.entries.get(&id)?
+        } else {
+            inner.entries.get(&space_id)?
+        };
+        Some(crate::model::space::visibility_of(&gate.doc))
+    }
+
+    /// Per-doc vector clocks, filtered to what `peer` may read.
+    ///
+    /// The unfiltered [`Store::summary`] leaks the *existence* of every
+    /// document to every peer, which is metadata a protected space should not
+    /// give up. Sync uses this; local callers use `summary`.
+    pub fn summary_for(&self, peer: &str) -> BTreeMap<DocId, VecClock> {
+        self.summary()
+            .into_iter()
+            .filter(|(id, _)| self.may_peer_read(peer, *id))
+            .collect()
+    }
+
     /// Per-doc vector clocks (for catch-up and reconciliation).
     pub fn summary(&self) -> BTreeMap<DocId, VecClock> {
         self.inner
@@ -2560,5 +2632,200 @@ mod tests {
             err.contains("space"),
             "the rejection names the reason: {err}"
         );
+    }
+
+    // ---- spaces: the read gate -------------------------------------------
+
+    /// Create a space document of the given visibility, plus one ordinary
+    /// document that lives in it. Returns (space id, doc id).
+    fn seed_space(
+        s: &Arc<Store>,
+        visibility: &str,
+        members: &[&str],
+        owner: &str,
+        key: &SigningKey,
+    ) -> (DocId, DocId) {
+        let space_id = DocId::new();
+        let mut init = Action {
+            doc_id: space_id,
+            model: ModelRef::new("space", "1"),
+            kind: "init".into(),
+            payload: serde_json::json!({
+                "name": format!("space-{visibility}"),
+                "visibility": visibility,
+                "members": members,
+                "managers": [owner],
+            }),
+            ts: 1000,
+            clock: clock1(owner, 1),
+            origin: owner.into(),
+            cosig: Vec::new(),
+            sig: [0; 64],
+            prev_hash: None,
+            // A space document lives in itself: that is what lets a member be
+            // told they are a member without already being able to read it.
+            space: Some(space_id),
+        };
+        let mb = init.message_bytes();
+        init.sig = key.sign(&mb).to_bytes();
+        s.apply_remote_action(&init).unwrap();
+
+        let doc_id = DocId::new();
+        let mut doc = Action {
+            doc_id,
+            model: ModelRef::new("group", "1"),
+            kind: "init".into(),
+            payload: serde_json::json!({
+                "name": format!("doc-in-{visibility}"),
+                "members": members,
+                "managers": [owner],
+            }),
+            ts: 1001,
+            clock: clock1(owner, 2),
+            origin: owner.into(),
+            cosig: Vec::new(),
+            sig: [0; 64],
+            prev_hash: None,
+            space: Some(space_id),
+        };
+        let mb = doc.message_bytes();
+        doc.sig = key.sign(&mb).to_bytes();
+        s.apply_remote_action(&doc).unwrap();
+        (space_id, doc_id)
+    }
+
+    fn space_store(dir: &Path) -> (Arc<Store>, SigningKey) {
+        let s = open_store(dir);
+        let k = identity(1);
+        for who in ["alice", "bob", "mallory"] {
+            s.register_peer_key(who, k.verifying_key().to_bytes()).ok();
+        }
+        // Distinct keys would be more faithful, but the read gate is about
+        // membership, not signatures, and every action here is alice's.
+        (s, k)
+    }
+
+    #[test]
+    fn a_public_space_is_readable_by_anyone() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let (_, doc) = seed_space(&s, "public", &["alice"], "alice", &k);
+        assert!(s.may_peer_read("mallory", doc), "public means public");
+    }
+
+    #[test]
+    fn a_protected_space_is_withheld_from_a_non_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let (_, doc) = seed_space(&s, "protected", &["alice", "bob"], "alice", &k);
+        assert!(s.may_peer_read("bob", doc), "a member reads it");
+        assert!(
+            !s.may_peer_read("mallory", doc),
+            "a non-member must not be served a protected document"
+        );
+    }
+
+    #[test]
+    fn a_private_space_is_served_to_nobody() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let (_, doc) = seed_space(&s, "private", &["alice"], "alice", &k);
+        assert!(
+            !s.may_peer_read("alice", doc),
+            "private means it never leaves this node -- not even to its owner's peers"
+        );
+    }
+
+    /// The ACL is circular without this: to be told you are a member you must
+    /// already be able to read the document that says so.
+    #[test]
+    fn a_space_document_is_served_to_anyone_it_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let (space, _) = seed_space(&s, "protected", &["alice", "bob"], "alice", &k);
+        assert!(
+            s.may_peer_read("bob", space),
+            "a member must be able to fetch the document that names them"
+        );
+        assert!(
+            !s.may_peer_read("mallory", space),
+            "and a stranger must not"
+        );
+    }
+
+    /// Defaults must withhold, not disclose.
+    #[test]
+    fn a_document_whose_space_is_unknown_is_withheld() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let orphan = DocId::new();
+        let missing_space = DocId::new();
+        let mut a = Action {
+            doc_id: orphan,
+            model: ModelRef::new("group", "1"),
+            kind: "init".into(),
+            payload: serde_json::json!({
+                "name": "orphan", "members": ["alice"], "managers": ["alice"],
+            }),
+            ts: 1000,
+            clock: clock1("alice", 1),
+            origin: "alice".into(),
+            cosig: Vec::new(),
+            sig: [0; 64],
+            prev_hash: None,
+            space: Some(missing_space),
+        };
+        let mb = a.message_bytes();
+        a.sig = k.sign(&mb).to_bytes();
+        s.apply_remote_action(&a).unwrap();
+        assert!(
+            !s.may_peer_read("alice", orphan),
+            "a space document that has not arrived means withhold, not serve"
+        );
+    }
+
+    /// A document written before spaces existed replicates as it always did.
+    #[test]
+    fn a_document_with_no_space_still_replicates() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let id = DocId::new();
+        let init = make_group_action(
+            id,
+            "init",
+            serde_json::json!({ "name": "legacy", "members": ["alice"], "managers": ["alice"] }),
+            "alice",
+            &k,
+            &[],
+            clock1("alice", 1),
+            1000,
+        );
+        s.apply_remote_action(&init).unwrap();
+        assert!(s.may_peer_read("mallory", id));
+    }
+
+    /// An unfiltered summary hands over the existence and name of every
+    /// document on the node -- metadata a protected space must not give up.
+    #[test]
+    fn a_summary_hides_documents_the_peer_cannot_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let (prot_space, prot_doc) = seed_space(&s, "protected", &["alice"], "alice", &k);
+
+        let full = s.summary();
+        assert!(full.contains_key(&prot_doc), "we hold it ourselves");
+
+        let theirs = s.summary_for("mallory");
+        assert!(
+            !theirs.contains_key(&prot_doc),
+            "a stranger must not learn the document exists"
+        );
+        assert!(
+            !theirs.contains_key(&prot_space),
+            "nor that the space exists"
+        );
+
+        let members = s.summary_for("alice");
+        assert!(members.contains_key(&prot_doc), "a member still syncs it");
     }
 }
