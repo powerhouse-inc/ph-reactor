@@ -1461,6 +1461,35 @@ struct LlmTestBody {
     model: String,
 }
 
+/// Refuse an LLM base URL whose host is a link-local address (the cloud
+/// metadata range `169.254.0.0/16`): a per-request `baseUrl` on
+/// `POST /api/llm/test` could otherwise point the daemon at that address to
+/// read cloud credentials, or at an attacker URL to exfiltrate the API key.
+/// The settings API is loopback-only, so this blocks the SSRF/exfil path
+/// without a token.
+fn llm_base_url_ok(base: &str) -> Result<(), String> {
+    let after_scheme = base
+        .split_once("://")
+        .map(|(_, r)| r)
+        .unwrap_or(base);
+    let hostport = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
+    let host = if let Some(s) = hostport.strip_prefix('[') {
+        s.split(']').next().unwrap_or("")
+    } else {
+        hostport.split(':').next().unwrap_or(hostport)
+    };
+    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
+        if let std::net::IpAddr::V4(v4) = ip {
+            if v4.to_bits() >> 16 == 169 * 256 + 254 {
+                return Err(
+                    "refusing LLM request to a link-local (cloud metadata) address".into(),
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
 /// `POST /api/llm/test` — round-trip the configured OpenAI-compatible endpoint.
 /// Optional body fields override the config (to test unsaved form values); the
 /// API key is always read from the environment (never stored).
@@ -1469,7 +1498,21 @@ async fn llm_test(
     axum::extract::Json(body): axum::extract::Json<LlmTestBody>,
 ) -> Response {
     let cfg = config::load(&state.paths).unwrap_or_default();
-    let base = pick(&body.base_url, &cfg.llm.base_url);
+    let base = match llm_base_url_ok(&body.base_url) {
+        Err(msg) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                axum::Json(json!({
+                    "ok": false,
+                    "model": "",
+                    "baseUrl": body.base_url,
+                    "error": msg
+                })),
+            )
+                .into_response();
+        }
+        Ok(()) => pick(&body.base_url, &cfg.llm.base_url),
+    };
     let model = pick(&body.model, &cfg.llm.model);
     let key_env = pick(&body.api_key_env, &cfg.llm.api_key_env);
 
@@ -1994,3 +2037,19 @@ async fn page_v2() -> Html<&'static str> {
 
 const PAGE: &str = include_str!("console.html");
 const PAGE_V2: &str = include_str!("../../console/v2.html");
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn llm_base_url_rejects_link_local_metadata_allows_real_llm() {
+        // The cloud metadata IP (AWS/Azure) is in the 169.254.0.0/16 range.
+        assert!(llm_base_url_ok("http://169.254.169.254/latest/meta-data/").is_err());
+        assert!(llm_base_url_ok("http://169.254.0.1:8080").is_err());
+        // A normal LLM endpoint is allowed (an https host, and a local http
+        // LLM server like Ollama on loopback).
+        assert!(llm_base_url_ok("https://api.openai.com").is_ok());
+        assert!(llm_base_url_ok("http://127.0.0.1:11434").is_ok());
+        // A non-IP host is allowed (no range to check).
+        assert!(llm_base_url_ok("https://llm.example.com/v1").is_ok());
+    }
+}
