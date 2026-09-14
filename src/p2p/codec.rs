@@ -13,7 +13,7 @@ use libp2p::swarm::StreamProtocol;
 use serde::{Deserialize, Serialize};
 
 use crate::action::Action;
-use crate::doc::{DocId, ModelRef, VecClock};
+use crate::doc::{DocId, Hash32, ModelRef, VecClock};
 use crate::store::DocState;
 
 use serde_json::Value;
@@ -149,6 +149,29 @@ pub struct ModelRequest {
     pub ref_: ModelRef,
 }
 
+/// Ask a peer for one content-addressed chunk.
+///
+/// One chunk per message, deliberately: a request naming many chunks would let
+/// a peer make us buffer an unbounded reply, which is the property
+/// [`MAX_MSG_BYTES`] exists to prevent. [`crate::blob::CHUNK_BYTES`] is sized
+/// so a single chunk always fits.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkRequest {
+    pub hash: Hash32,
+}
+
+/// A chunk, or `None` when the peer does not have it.
+///
+/// `hash` is echoed so a reply can be matched to its request, and so the
+/// receiver can verify the bytes against the name it asked for. Nothing here
+/// is trusted: [`crate::blob::BlobStore::put_chunk`] re-hashes before storing.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChunkData {
+    pub hash: Hash32,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bytes: Option<Vec<u8>>,
+}
+
 /// Model-definition reply. `def` is `None` when the responder does not
 /// have (a verifiable) definition for the requested model; the requester
 /// then keeps the action pending until some peer can provide it.
@@ -171,6 +194,8 @@ pub enum SyncMsg {
     SummaryAck(SummaryAck),
     ModelRequest(ModelRequest),
     ModelDef(ModelDef),
+    ChunkRequest(ChunkRequest),
+    ChunkData(ChunkData),
 }
 
 /// Length-prefixed JSON codec for the request-response behaviour.

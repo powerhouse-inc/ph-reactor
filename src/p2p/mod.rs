@@ -42,9 +42,9 @@ use crate::doc::{DocId, Hash32, ModelRef, VecClock};
 use crate::drives::{Drive, DriveStatus};
 use crate::model::{l1::L1, model_def_hash};
 use crate::p2p::codec::{
-    ActionMsg, CatchUp, CatchUpAck, DocSummary, Hello, HelloAck, HelloError, ModelDef,
-    ModelRequest, Summary, SummaryAck, SyncCodec, SyncMsg, CATCH_UP_MAX_ACTIONS, GOSSIPSUB_TOPIC,
-    PROTOCOL_VERSION, SYNC_PROTOCOL,
+    ActionMsg, CatchUp, CatchUpAck, ChunkData, ChunkRequest, DocSummary, Hello, HelloAck,
+    HelloError, ModelDef, ModelRequest, Summary, SummaryAck, SyncCodec, SyncMsg,
+    CATCH_UP_MAX_ACTIONS, GOSSIPSUB_TOPIC, PROTOCOL_VERSION, SYNC_PROTOCOL,
 };
 use crate::store::Store;
 
@@ -163,6 +163,12 @@ pub enum EngineCommand {
     Resync { name: String },
     /// Bootstrap the DHT: seed the routing table from these peers.
     DhtBootstrap { peers: Vec<(PeerId, Multiaddr)> },
+    /// Ask connected peers for the chunks of `blob` this node lacks.
+    ///
+    /// One request per missing chunk, broadcast to every authenticated drive:
+    /// chunks are content-addressed, so whichever peer answers first wins and
+    /// a wrong answer cannot be stored.
+    FetchBlob { blob: crate::blob::BlobRef },
     /// Publish a provider record: this node provides the doc.
     PublishProvider { name: String, doc: DocId },
     /// Query the DHT for providers of a key (doc id bytes).
@@ -199,6 +205,9 @@ pub enum EngineEvent {
     DhtBootstrap(bool),
     /// The DHT reported a provider for a key (doc id bytes).
     DhtProvider { key: Vec<u8>, peer: PeerId },
+    /// A content-addressed chunk was verified and stored. Lets a waiting
+    /// install know a blob may now be complete.
+    ChunkStored { hash: crate::doc::Hash32 },
     /// A connection to a peer was established (direct or relayed).
     PeerConnected { peer: PeerId },
     /// A joiner was accepted on a valid join-proof; the daemon should persist
@@ -244,6 +253,9 @@ pub struct SyncEngine {
     peer_id: PeerId,
     pub_name: String,
     listen: Multiaddr,
+    /// Content-addressed chunk store, shared with the daemon so an installed
+    /// package's bundle can be served to peers that lack it.
+    blobs: Arc<crate::blob::BlobStore>,
     /// Optional second listener for the WebSocket transport.
     listen_ws: Option<Multiaddr>,
     /// Addresses announced to peers via `add_external_address`.
@@ -310,6 +322,7 @@ impl SyncEngine {
         listen: Multiaddr,
         listen_ws: Option<Multiaddr>,
         external: Vec<Multiaddr>,
+        blobs: Arc<crate::blob::BlobStore>,
         mdns_enabled: bool,
         dht_enabled: bool,
         relay_enabled: bool,
@@ -407,6 +420,7 @@ impl SyncEngine {
             peer_id,
             pub_name: pub_name.to_string(),
             listen,
+            blobs,
             listen_ws,
             external,
             token,
@@ -585,6 +599,40 @@ impl SyncEngine {
                             DriveStatus::Connecting,
                             Some("re-sync requested (handshaking)".into()),
                         );
+                    }
+                }
+            }
+            EngineCommand::FetchBlob { blob } => {
+                let missing = self.blobs.missing(&blob);
+                if missing.is_empty() {
+                    tracing::debug!("blob {} already complete", blob.hash);
+                    return;
+                }
+                // Ask every connected drive peer for each missing chunk.
+                // Duplicated answers are free -- put_chunk is idempotent for
+                // content-addressed data -- and asking everyone means one
+                // offline peer does not stall an install.
+                let peers: Vec<PeerId> = self.drives.values().map(|rt| rt.peer).collect();
+                if peers.is_empty() {
+                    tracing::warn!(
+                        "cannot fetch blob {}: no connected peers ({} chunks missing)",
+                        blob.hash,
+                        missing.len()
+                    );
+                    return;
+                }
+                tracing::info!(
+                    "fetching {} missing chunk(s) of blob {} from {} peer(s)",
+                    missing.len(),
+                    blob.hash,
+                    peers.len()
+                );
+                for hash in missing {
+                    for peer in &peers {
+                        self.swarm
+                            .behaviour_mut()
+                            .sync
+                            .send_request(peer, SyncMsg::ChunkRequest(ChunkRequest { hash }));
                     }
                 }
             }
@@ -1195,11 +1243,25 @@ impl SyncEngine {
                     .sync
                     .send_response(channel, SyncMsg::ModelDef(ModelDef { ref_: r.ref_, def }));
             }
+            SyncMsg::ChunkRequest(r) => {
+                // Serve a chunk if we hold it. Content-addressed, so there is
+                // nothing to authorise: the requester already knows the hash,
+                // and can only learn bytes that hash to it.
+                let bytes = self.blobs.get_chunk(&r.hash);
+                let _ = self.swarm.behaviour_mut().sync.send_response(
+                    channel,
+                    SyncMsg::ChunkData(ChunkData {
+                        hash: r.hash,
+                        bytes,
+                    }),
+                );
+            }
             // Rejections/acks we initiated on the outbound side.
             SyncMsg::HelloAck(_)
             | SyncMsg::CatchUpAck(_)
             | SyncMsg::SummaryAck(_)
             | SyncMsg::HelloErr(_)
+            | SyncMsg::ChunkData(_)
             | SyncMsg::ModelDef(_) => {}
         }
     }
@@ -1396,10 +1458,26 @@ impl SyncEngine {
                     self.apply_remote_action(Some(peer), &a);
                 }
             }
+            SyncMsg::ChunkData(d) => {
+                let Some(bytes) = d.bytes else {
+                    tracing::debug!("peer does not have chunk {}", d.hash);
+                    return;
+                };
+                // put_chunk re-hashes before writing, so a peer cannot poison
+                // the store by answering with bytes that are not what we asked
+                // for. A mismatch is worth logging: it is either corruption or
+                // a hostile peer.
+                match self.blobs.put_chunk(&d.hash, &bytes) {
+                    Ok(()) => tracing::debug!("stored chunk {}", d.hash),
+                    Err(e) => tracing::warn!("rejected chunk from {peer}: {e}"),
+                }
+                let _ = self.evt_tx.send(EngineEvent::ChunkStored { hash: d.hash });
+            }
             // We do not initiate these.
             SyncMsg::Hello(_)
             | SyncMsg::CatchUp(_)
             | SyncMsg::Summary(_)
+            | SyncMsg::ChunkRequest(_)
             | SyncMsg::ModelRequest(_) => {}
         }
     }
@@ -1546,9 +1624,10 @@ mod tests {
             listen,
             None,       // no websocket listener
             Vec::new(), // no announced addresses
-            false,      // no mDNS
-            false,      // no DHT
-            false,      // no relay
+            Arc::new(crate::blob::BlobStore::open(&dir.path().join("blobs")).expect("blob store")),
+            false, // no mDNS
+            false, // no DHT
+            false, // no relay
             token.map(str::to_string),
             HashSet::new(),
             cmd_rx,

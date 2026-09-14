@@ -61,6 +61,9 @@ async fn spawn_node(tag: &str, listen_ws: Option<Multiaddr>, external: Vec<Multi
         listen,
         listen_ws,
         external,
+        std::sync::Arc::new(
+            ph_reactor::blob::BlobStore::open(&dir.path().join("blobs")).expect("blob store"),
+        ),
         false,          // no mDNS in the test
         false,          // no DHT in the test
         false,          // no relay in the test

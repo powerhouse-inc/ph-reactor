@@ -268,6 +268,10 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         })
         .collect();
 
+    // Chunk store for package bundles, shared with the engine so this node can
+    // serve blobs it holds to peers that lack them.
+    let blobs =
+        Arc::new(crate::blob::BlobStore::open(&paths.blobs_dir()).map_err(anyhow::Error::msg)?);
     let engine = SyncEngine::new(
         &kp,
         store.clone(),
@@ -275,6 +279,7 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         listen,
         listen_ws,
         external,
+        blobs.clone(),
         config.p2p.mdns,
         config.p2p.dht,
         config.p2p.relay,
@@ -492,6 +497,9 @@ struct Ctx {
 /// Folds one engine event into the daemon's view of the world.
 fn on_engine_event(ctx: &mut Ctx, ev: EngineEvent) {
     match ev {
+        EngineEvent::ChunkStored { hash } => {
+            tracing::debug!("chunk {hash} stored");
+        }
         EngineEvent::Identity { peer_id, listen } => {
             ctx.reactor_healthy = true;
             ctx.listen = Some(listen.clone());

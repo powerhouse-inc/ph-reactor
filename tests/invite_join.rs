@@ -56,8 +56,11 @@ async fn spawn_node(tag: &str) -> Node {
         store.clone(),
         tag,
         listen,
-        None,           // no websocket listener in the test
-        Vec::new(),     // no announced addresses in the test
+        None,       // no websocket listener in the test
+        Vec::new(), // no announced addresses in the test
+        std::sync::Arc::new(
+            ph_reactor::blob::BlobStore::open(&dir.path().join("blobs")).expect("blob store"),
+        ),
         false,          // no mDNS
         false,          // no DHT
         false,          // no relay

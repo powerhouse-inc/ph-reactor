@@ -103,6 +103,11 @@ impl StatePaths {
         self.root.join("processors.json")
     }
 
+    /// Content-addressed chunk store for package bundles.
+    pub fn blobs_dir(&self) -> PathBuf {
+        self.root.join("blobs")
+    }
+
     /// Model definitions registered at runtime.
     ///
     /// These MUST be loaded before the store replays its action logs. A
