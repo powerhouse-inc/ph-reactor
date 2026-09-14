@@ -7,6 +7,7 @@
 //! which indicator implementations scan for. In headless environments
 //! (no session bus) the daemon runs without a tray.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use parking_lot::Mutex;
@@ -14,10 +15,12 @@ use tokio::sync::{mpsc, watch};
 use zbus::connection::Connection;
 use zbus::names::WellKnownName;
 use zbus::object_server::SignalContext;
-use zbus::zvariant::ObjectPath;
+use zbus::zvariant::{ObjectPath, OwnedValue, Value};
 
 use crate::commands::Command;
 
+pub mod dbusmenu;
+pub mod icon;
 pub mod menu;
 use crate::status::StatusSnapshot;
 use menu::{Action, MenuItem};
@@ -28,6 +31,10 @@ use menu::{Action, MenuItem};
 // path, which not every host implements.
 const SNI_PATH: &str = "/StatusNotifierItem";
 const MENU_PATH: &str = "/StatusNotifierItem/Menu";
+
+/// The SNI `ToolTip` property: `(icon-name, pixmaps, title, description)`,
+/// D-Bus signature `(sa(iiay)ss)`.
+type ToolTip = (String, Vec<(i32, i32, Vec<u8>)>, String, String);
 
 /// The result of starting the tray.
 pub enum Tray {
@@ -56,6 +63,21 @@ struct TrayState {
     snapshot: StatusSnapshot,
     menu: MenuItem,
     commands: mpsc::UnboundedSender<Command>,
+    /// Bumped whenever the menu is rebuilt. Hosts cache a layout and only
+    /// re-fetch when `LayoutUpdated` carries a revision newer than theirs.
+    revision: u32,
+    /// Where the embedded icon was installed, for `IconThemePath`.
+    icon_theme_path: String,
+}
+
+impl TrayState {
+    /// Rebuilds the menu from the current snapshot, returning the new
+    /// revision.
+    fn rebuild(&mut self) -> u32 {
+        self.menu = menu::build_menu(&self.snapshot);
+        self.revision = self.revision.wrapping_add(1);
+        self.revision
+    }
 }
 
 /// SNI object.
@@ -87,31 +109,63 @@ impl Sni {
         "Communication"
     }
 
-    /// Active while the reactor is healthy; Attention otherwise.
+    /// `NeedsAttention` is the spec spelling (not "Attention"), and it makes
+    /// a shell surface the icon out of a collapsed tray -- which is what a
+    /// reactor that cannot sync should do rather than sit there looking fine.
     #[zbus(property)]
     fn status(&self) -> &str {
         let s = self.state.lock();
-        if s.snapshot.reactor.healthy {
+        if s.snapshot.reactor.running && s.snapshot.reactor.healthy {
             "Active"
         } else {
-            "Attention"
+            "NeedsAttention"
         }
     }
 
-    /// Themed icon, resolved by the desktop theme.
+    /// The Powerhouse logomark. Recoloured by the desktop, so it reads on a
+    /// light or a dark panel; see `icon::LOGOMARK_SVG`.
     #[zbus(property)]
-    fn icon_name(&self) -> &str {
+    fn icon_name(&self) -> String {
+        icon::ICON_NAME.to_string()
+    }
+
+    /// Shown instead of `IconName` while `Status` is `NeedsAttention`.
+    #[zbus(property)]
+    fn attention_icon_name(&self) -> &str {
+        "dialog-warning"
+    }
+
+    /// A small badge over the base icon. State lives here rather than in the
+    /// base icon so the brand mark stays recognisable; a host that ignores
+    /// overlays simply shows the mark.
+    #[zbus(property)]
+    fn overlay_icon_name(&self) -> &str {
         let s = self.state.lock();
-        if s.snapshot.reactor.healthy {
-            "network-server"
+        let d = &s.snapshot.drives;
+        if d.is_empty() {
+            ""
+        } else if d.iter().all(|x| x.paused) {
+            "media-playback-pause"
+        } else if d.iter().any(|x| x.status == "connecting") {
+            "emblem-synchronizing"
         } else {
-            "dialog-warning"
+            ""
         }
     }
 
+    /// Where the embedded icon was installed, so a host that does not rescan
+    /// the theme still finds it.
     #[zbus(property)]
-    fn icon_theme_path(&self) -> &str {
-        ""
+    fn icon_theme_path(&self) -> String {
+        self.state.lock().icon_theme_path.clone()
+    }
+
+    /// False: left-click invokes `Activate` rather than popping the menu.
+    /// Without this some hosts assume the icon is menu-only and never call
+    /// `Activate` at all.
+    #[zbus(property)]
+    fn item_is_menu(&self) -> bool {
+        false
     }
 
     /// The menu's object path.
@@ -129,38 +183,55 @@ impl Sni {
         ObjectPath::try_from(MENU_PATH).unwrap_or_default()
     }
 
-    #[zbus(property, name = "ItemActivationRequested")]
-    fn item_activation_requested(&self) -> u32 {
-        0
-    }
-
+    /// The hover tooltip.
+    ///
+    /// zbus derives the signature `(sa(iiay)ss)` from [`ToolTip`]; returning
+    /// a bare string here would advertise `s` and the host would fail to read
+    /// it — the same class of bug that made `Menu` unreadable.
     #[zbus(property)]
-    fn tool_tip(&self) -> String {
+    fn tool_tip(&self) -> ToolTip {
         let s = self.state.lock();
-        let r = &s.snapshot.reactor;
-        format!(
-            "<b>ph-reactor</b> — {} ({} docs)",
-            if r.healthy { "syncing" } else { "not ready" },
-            r.docs
+        let snap = &s.snapshot;
+        let mut lines = vec![format!("ph-reactor {}", snap.version)];
+        if let Some(peer) = &snap.reactor.peer_id {
+            lines.push(peer.clone());
+        }
+        lines.push(format!(
+            "{} document{}",
+            snap.reactor.docs,
+            if snap.reactor.docs == 1 { "" } else { "s" }
+        ));
+        for d in &snap.drives {
+            lines.push(format!("{} — {}", d.name, d.status));
+        }
+        for g in &snap.groups {
+            lines.push(format!("team {} — {} members", g.name, g.members));
+        }
+        (
+            icon::ICON_NAME.to_string(),
+            Vec::new(),
+            format!("ph-reactor — {}", menu::state_line_for(snap)),
+            lines.join("\n"),
         )
     }
 
-    #[zbus(property)]
-    fn attention_icon_name(&self) -> &str {
-        ""
+    /// Left-click: open the console. This was an empty stub, which is why
+    /// clicking the icon appeared to do nothing at all.
+    fn activate(&self, _x: i32, _y: i32) {
+        open_console(&self.state);
     }
 
-    fn activate(&self, _x: i32, _y: i32) {}
+    /// Middle-click does the same, as it always has.
     fn secondary_activate(&self, _x: i32, _y: i32) {
-        let url = self.state.lock().snapshot.settings.url.clone();
-        if url.is_empty() {
-            return;
-        }
-        let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
+        open_console(&self.state);
     }
+
+    /// Right-click. Hosts pop the menu from the `Menu` property themselves;
+    /// there is nothing to do here, and returning an error would make some
+    /// hosts skip the menu entirely.
     fn context_menu(&self, _x: i32, _y: i32) {}
+
     fn scroll(&self, _amount: i32, _direction: &str) {}
-    fn set_show_menu(&self, _show: bool) {}
 
     #[zbus(signal)]
     async fn updated(signal_ctxt: &SignalContext<'_>) -> zbus::Result<()>;
@@ -182,52 +253,149 @@ impl Sni {
 impl DbusMenu {
     #[zbus(property)]
     fn version(&self) -> u32 {
-        2
+        3
+    }
+
+    /// "normal" or "notice". We never demand attention through the menu.
+    #[zbus(property)]
+    fn status(&self) -> &str {
+        "normal"
     }
 
     #[zbus(property)]
-    fn layout(&self) -> String {
-        self.state.lock().menu.xml()
+    fn text_direction(&self) -> &str {
+        "ltr"
     }
 
-    /// The shell calls this before showing the menu: refresh the layout
-    /// from the latest snapshot.
-    async fn about_to_show(&self, _parent_id: u32) -> zbus::fdo::Result<()> {
+    #[zbus(property)]
+    fn icon_theme_path(&self) -> Vec<String> {
+        let p = self.state.lock().icon_theme_path.clone();
+        if p.is_empty() {
+            Vec::new()
+        } else {
+            vec![p]
+        }
+    }
+
+    /// The layout a host renders.
+    ///
+    /// Every argument is signed: the spec uses `i`, and the previous
+    /// implementation's `u` made the whole interface unreadable.
+    fn get_layout(
+        &self,
+        parent_id: i32,
+        recursion_depth: i32,
+        property_names: Vec<String>,
+    ) -> zbus::fdo::Result<(u32, dbusmenu::LayoutItem<'static>)> {
+        let st = self.state.lock();
+        match dbusmenu::layout(&st.menu, parent_id, recursion_depth, &property_names) {
+            Some(item) => Ok((st.revision, item)),
+            None => Err(zbus::fdo::Error::InvalidArgs(format!(
+                "no menu item with id {parent_id}"
+            ))),
+        }
+    }
+
+    fn get_group_properties(
+        &self,
+        ids: Vec<i32>,
+        property_names: Vec<String>,
+    ) -> Vec<(i32, HashMap<String, OwnedValue>)> {
+        let st = self.state.lock();
+        dbusmenu::group_properties(&st.menu, &ids, &property_names)
+            .into_iter()
+            .map(|(id, props)| (id, owned(props)))
+            .collect()
+    }
+
+    fn get_property(&self, id: i32, name: String) -> zbus::fdo::Result<OwnedValue> {
+        let st = self.state.lock();
+        let item = dbusmenu::find(&st.menu, id)
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("no menu item with id {id}")))?;
+        dbusmenu::props_of(item, std::slice::from_ref(&name))
+            .remove(&name)
+            .and_then(|v| OwnedValue::try_from(v).ok())
+            .ok_or_else(|| zbus::fdo::Error::InvalidArgs(format!("item {id} has no {name}")))
+    }
+
+    /// A host calls this before opening a submenu. Rebuilding here keeps the
+    /// menu honest: the snapshot may have moved since it was last drawn.
+    ///
+    /// Returns whether the layout changed, which is what tells the host to
+    /// re-fetch rather than draw its cached copy.
+    async fn about_to_show(&self, _id: i32) -> bool {
         let mut st = self.state.lock();
-        st.menu = menu::build_menu(&st.snapshot);
-        Ok(())
+        let before = format!("{:?}", st.menu);
+        st.rebuild();
+        format!("{:?}", st.menu) != before
     }
 
-    /// `event_id` 2 = itemActivated: dispatch the item's action.
+    /// `event_id` is a STRING ("clicked", "hovered", …), not the integer the
+    /// previous implementation compared against.
     async fn event(
         &self,
-        id: u32,
-        event_id: u32,
-        _data: &str,
-        _uuid: u32,
+        id: i32,
+        event_id: String,
+        _data: Value<'_>,
+        _timestamp: u32,
     ) -> zbus::fdo::Result<()> {
-        if event_id == 2 {
-            let action = {
-                let st = self.state.lock();
-                menu::action_for_id(&st.menu, id)
-            };
-            if let Some(action) = action {
-                dispatch_action(&self.state, action).await;
-            }
+        if event_id != "clicked" {
+            return Ok(());
+        }
+        let action = {
+            let st = self.state.lock();
+            menu::action_for_id(&st.menu, id as u32)
+        };
+        if let Some(action) = action {
+            dispatch_action(&self.state, action).await;
         }
         Ok(())
     }
 
-    fn event_removed(&self, _id: u32, _event_id: u32, _data: &str, _uuid: u32) {}
+    #[zbus(signal)]
+    async fn layout_updated(
+        signal_ctxt: &SignalContext<'_>,
+        revision: u32,
+        parent_id: i32,
+    ) -> zbus::Result<()>;
 
     #[zbus(signal)]
-    async fn item_activated(
+    async fn item_activation_requested(
         signal_ctxt: &SignalContext<'_>,
-        id: u32,
-        event_id: u32,
-        data: &str,
-        uuid: u32,
+        id: i32,
+        timestamp: u32,
     ) -> zbus::Result<()>;
+}
+
+/// Borrowed property values to owned ones, for the `a{sv}` returns.
+fn owned(props: HashMap<String, Value<'static>>) -> HashMap<String, OwnedValue> {
+    props
+        .into_iter()
+        .filter_map(|(k, v)| OwnedValue::try_from(v).ok().map(|v| (k, v)))
+        .collect()
+}
+
+/// `Status` for a snapshot: `NeedsAttention` is the spec spelling, and it is
+/// what surfaces the icon out of a collapsed tray.
+fn sni_status(snap: &StatusSnapshot) -> &'static str {
+    if snap.reactor.running && snap.reactor.healthy {
+        "Active"
+    } else {
+        "NeedsAttention"
+    }
+}
+
+/// Opens the console in the user's browser.
+fn open_console(state: &Arc<Mutex<TrayState>>) {
+    let url = state.lock().snapshot.settings.url.clone();
+    if url.is_empty() {
+        tracing::warn!("no console URL in the snapshot; not opening");
+        return;
+    }
+    match std::process::Command::new("xdg-open").arg(&url).spawn() {
+        Ok(_) => tracing::debug!("opened {url}"),
+        Err(err) => tracing::warn!("could not open {url}: {err}"),
+    }
 }
 
 /// Executes a menu action: sends the command and/or opens the settings.
@@ -245,62 +413,9 @@ async fn dispatch_action(state: &Arc<Mutex<TrayState>>, action: Action) {
             }
         }
         Action::RemoveDrive { name } => send(Command::RemoveDrive { name }),
-        Action::OpenSettings => {
-            let url = state.lock().snapshot.settings.url.clone();
-            if !url.is_empty() {
-                let _ = std::process::Command::new("xdg-open").arg(&url).spawn();
-            }
-        }
+        Action::OpenConsole => open_console(state),
         Action::Quit => send(Command::Quit),
     }
-}
-
-impl MenuItem {
-    /// The DBusMenu `Layout` XML for this subtree (root id 0 implied).
-    pub fn xml(&self) -> String {
-        let mut out = String::from("<dbustree version=\"1.0\"><layout>");
-        out.push_str(&format!(r#"<id version="1">{}"#, self.id));
-        write_item(&mut out, self);
-        out.push_str("</layout></layout></dbustree>");
-        out
-    }
-}
-
-fn write_item(out: &mut String, item: &menu::MenuItem) {
-    if item.kind == "separator" {
-        out.push_str(r#"</id><type>separator</type>"#);
-        return;
-    }
-    out.push_str(&format!("</id><type>{}</type>", item.kind));
-    if !item.enabled {
-        out.push_str(r#"<enable>false</enable>"#);
-    }
-    if !item.visible {
-        out.push_str(r#"<visible>false</visible>"#);
-    }
-    out.push_str(&format!("<label>{}</label>", xml_escape(&item.label)));
-    if let Some(icon) = &item.icon {
-        out.push_str(&format!(
-            r#"<attribs><icon-name>{}</icon-name></attribs>"#,
-            icon
-        ));
-    }
-    if !item.children.is_empty() {
-        out.push_str("<layout>");
-        for child in &item.children {
-            out.push_str(&format!(r#"<id version="1">{}"#, child.id));
-            write_item(out, child);
-        }
-        out.push_str("</layout>");
-    }
-    out.push_str("</layout>");
-}
-
-fn xml_escape(s: &str) -> String {
-    s.replace('&', "&amp;")
-        .replace('<', "&lt;")
-        .replace('>', "&gt;")
-        .replace('"', "&quot;")
 }
 
 async fn run(
@@ -310,10 +425,18 @@ async fn run(
     commands: mpsc::UnboundedSender<Command>,
 ) {
     let snap = snapshot.borrow_and_update().clone();
+    // Write the embedded logomark into the user's icon theme. Best-effort:
+    // without it the host falls back to a generic icon, which is a cosmetic
+    // loss, not a reason to run without a tray.
+    let icon_theme_path = icon::ensure_installed()
+        .map(|p| p.to_string_lossy().into_owned())
+        .unwrap_or_default();
     let state = Arc::new(Mutex::new(TrayState {
         snapshot: snap.clone(),
         menu: menu::build_menu(&snap),
         commands,
+        revision: 1,
+        icon_theme_path,
     }));
     let sni = Sni {
         state: state.clone(),
@@ -371,9 +494,16 @@ async fn run(
             None
         }
     };
+    let menu_ctxt = match SignalContext::new(conn.as_ref(), MENU_PATH) {
+        Ok(c) => Some(c),
+        Err(err) => {
+            tracing::warn!("cannot build menu signal context: {err:#}");
+            None
+        }
+    };
     if let Some(ctxt) = &ctxt {
-        let _ = Sni::new_status(ctxt, "Active").await;
-        let _ = Sni::new_icon_name(ctxt, "network-server").await;
+        let _ = Sni::new_status(ctxt, sni_status(&snap)).await;
+        let _ = Sni::new_icon_name(ctxt, icon::ICON_NAME).await;
         let _ = Sni::new_title(ctxt, "ph-reactor").await;
     }
 
@@ -391,22 +521,19 @@ async fn run(
                     break;
                 }
                 let snap = rx_snap.borrow_and_update().clone();
-                let healthy = snap.reactor.healthy;
-                {
+                let revision = {
                     let mut st = state.lock();
                     st.snapshot = snap.clone();
-                    st.menu = menu::build_menu(&snap);
-                }
+                    st.rebuild()
+                };
                 if let Some(ctxt) = &ctxt {
-                    let status = if healthy { "Active" } else { "Attention" };
-                    let icon = if healthy {
-                        "network-server"
-                    } else {
-                        "dialog-warning"
-                    };
-                    let _ = Sni::new_status(ctxt, status).await;
-                    let _ = Sni::new_icon_name(ctxt, icon).await;
+                    let _ = Sni::new_status(ctxt, sni_status(&snap)).await;
                     let _ = Sni::updated(ctxt).await;
+                }
+                // Tell the host the menu moved. Without this an open menu
+                // keeps showing whatever was true when it was first drawn.
+                if let Some(ctxt) = &menu_ctxt {
+                    let _ = DbusMenu::layout_updated(ctxt, revision, 0).await;
                 }
             }
         }

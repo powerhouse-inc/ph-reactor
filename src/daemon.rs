@@ -1107,8 +1107,40 @@ fn refresh_status(ctx: &Ctx, settings_url: &str) -> StatusSnapshot {
         settings: status::SettingsStatus {
             url: settings_url.into(),
         },
+        groups: group_summaries(&ctx.store),
         updated_at: status::rfc3339_now(),
     }
+}
+
+/// Summarises the group documents for the tray.
+///
+/// Reuses the same query the console's `/api/groups` runs, against the
+/// in-memory store, so the tray never has to call the settings server.
+fn group_summaries(store: &Store) -> Vec<status::GroupSummary> {
+    crate::query::query_docs(store, "group", None)
+        .into_iter()
+        .map(|d| {
+            let fields = d.get("fields");
+            let len = |key: &str| {
+                fields
+                    .and_then(|f| f.get(key))
+                    .and_then(|v| v.as_array())
+                    .map(|a| a.len())
+                    .unwrap_or(0)
+            };
+            status::GroupSummary {
+                name: d
+                    .get("name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                members: len("members"),
+                // msg_text is the append-only message column; its length is
+                // the message count.
+                messages: len("msg_text"),
+            }
+        })
+        .collect()
 }
 
 /// A snapshot built from the config file when the daemon is not
@@ -2262,6 +2294,7 @@ mod tests {
             settings: status::SettingsStatus {
                 url: "http://127.0.0.1:4002".into(),
             },
+            groups: Vec::new(),
             updated_at: "2026-09-12T00:00:00Z".into(),
         };
         let v: serde_json::Value =

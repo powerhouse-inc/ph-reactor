@@ -35,8 +35,23 @@ pub struct StatusSnapshot {
     #[serde(default)]
     pub bans: Vec<String>,
     pub settings: SettingsStatus,
+    /// Groups (teams) this reactor belongs to.
+    ///
+    /// Summarised from the store on each refresh so the tray can show them
+    /// without calling the settings server. `#[serde(default)]` keeps a
+    /// snapshot written by an older daemon readable.
+    #[serde(default)]
+    pub groups: Vec<GroupSummary>,
     /// RFC 3339 UTC of the last refresh.
     pub updated_at: String,
+}
+
+/// A group as the tray shows it: what it is called and how big it is.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GroupSummary {
+    pub name: String,
+    pub members: usize,
+    pub messages: usize,
 }
 
 /// The p2p sync core: up, its identity, its doc count.
@@ -97,6 +112,7 @@ impl StatusSnapshot {
             drives: Vec::new(),
             bans: Vec::new(),
             settings: SettingsStatus { url: settings_url },
+            groups: Vec::new(),
             updated_at: rfc3339_now(),
         }
     }
@@ -197,6 +213,7 @@ mod tests {
             settings: SettingsStatus {
                 url: "http://127.0.0.1:4002".into(),
             },
+            groups: Vec::new(),
             updated_at: "2026-09-12T00:00:00Z".into(),
         }
     }
