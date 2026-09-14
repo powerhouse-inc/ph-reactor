@@ -71,7 +71,9 @@ pub fn folder_def() -> serde_json::Value {
 
 /// The JSON definition of the `note@1` model: a plain text "file" — a title
 /// and a body. The default content created straight into a group's drive;
-/// the drive lists its name to the group's members.
+/// the drive lists its name to the group's members. `edit` updates both at
+/// once; `set-title` / `set-body` update a single field (what the rich
+/// editor dispatches per changed field).
 pub fn note_def() -> serde_json::Value {
     json!({
         "name": "note",
@@ -103,6 +105,16 @@ pub fn note_def() -> serde_json::Value {
                     "title": { "set": "$payload.title" },
                     "body": { "set": "$payload.body" }
                 },
+                "pre": []
+            },
+            "set-title": {
+                "payload": { "title": "string" },
+                "writes": { "title": { "set": "$payload.title" } },
+                "pre": []
+            },
+            "set-body": {
+                "payload": { "body": "string" },
+                "writes": { "body": { "set": "$payload.body" } },
                 "pre": []
             }
         }
@@ -157,7 +169,11 @@ pub fn project_def() -> serde_json::Value {
     })
 }
 
-/// The JSON definition of the `task@1` model.
+/// The JSON definition of the `task@1` model: a task with a title, a `status`
+/// (a dropdown — its allowed values are declared in `enums`), an assignee, a
+/// `project` relationship, a numeric `priority`, and a `tags` list. Each
+/// editable field has a `set-<field>` reducer so the console's rich editor can
+/// persist it with the model's real reducer (not a generic field-set).
 pub fn task_def() -> serde_json::Value {
     json!({
         "name": "task",
@@ -167,7 +183,11 @@ pub fn task_def() -> serde_json::Value {
             "status": "string",
             "assignee": "string",
             "project": "string",
-            "priority": "number"
+            "priority": "number",
+            "tags": "string[]"
+        },
+        "enums": {
+            "status": ["open", "in-progress", "blocked", "done"]
         },
         "reducers": {
             "init": {
@@ -189,6 +209,11 @@ pub fn task_def() -> serde_json::Value {
                 },
                 "pre": []
             },
+            "set-title": {
+                "payload": { "title": "string" },
+                "writes": { "title": { "set": "$payload.title" } },
+                "pre": []
+            },
             "set-status": {
                 "payload": { "status": "string" },
                 "writes": { "status": { "set": "$payload.status" } },
@@ -202,6 +227,16 @@ pub fn task_def() -> serde_json::Value {
             "set-project": {
                 "payload": { "project": "string" },
                 "writes": { "project": { "set": "$payload.project" } },
+                "pre": []
+            },
+            "set-priority": {
+                "payload": { "priority": "number" },
+                "writes": { "priority": { "set": "$payload.priority" } },
+                "pre": []
+            },
+            "set-tags": {
+                "payload": { "tags": "string[]" },
+                "writes": { "tags": { "set": "$payload.tags" } },
                 "pre": []
             }
         }

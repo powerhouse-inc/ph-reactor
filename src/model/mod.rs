@@ -94,6 +94,19 @@ pub trait Model: Send + Sync {
     /// Validate that a state satisfies the model's state schema.
     fn check_state(&self, state: &Doc) -> Result<(), Reject>;
 
+    /// Model-declared authorization checked by the store *after* the
+    /// signature check but *before* the reducer runs. Like [`quorum`], the
+    /// model only *declares* the rule (kept in its definition); the store
+    /// runs it because it can reach the document's full state — needed for
+    /// rules that inspect a field the pure precondition DSL cannot reach
+    /// (e.g. a group member posting to a *private* channel whose allow-list
+    /// is a nested object, not a top-level `string[]` field). Default: no
+    /// extra authorization (most models are fully described by their
+    /// preconditions).
+    fn authorize(&self, _state: &Doc, _action: &Action) -> Result<(), Reject> {
+        Ok(())
+    }
+
     /// The quorum requirement for a reducer kind, if any. Declared by the
     /// model; checked by the store (which has the group doc). Default: none.
     fn quorum(&self, _kind: &str) -> Option<QuorumSpec> {
