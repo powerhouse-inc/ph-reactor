@@ -1155,7 +1155,6 @@ async function renderProfile() {
   const peerId = ov.peerId || "";
   const short = (p) => (!p ? "?" : (p.length > 24 ? p.slice(0, 10) + "…" + p.slice(-8) : p));
   const known = ov.knownPeers || [];
-  const isKnown = peerId && known.some((k) => k.indexOf(peerId) >= 0); // the local id normally is not in its own known list
   const el = document.createElement("div");
   el.innerHTML = head("profile") + `
   <div class="grid g-2fr">
@@ -1176,7 +1175,7 @@ async function renderProfile() {
         <span class="badge b-green mono" title="you">${esc(short(peerId))} · you</span>
         ${known.map((p) => `<span class="badge b-cyan mono">${esc(short(p))}</span>`).join("") || '<span class="muted">no remote peers yet</span>'}
       </div>
-      <div class="hint" style="margin-top:12px">The sidebar's <b>peers</b> count is this list's length (≥ 1 — you). It grows as you discover remote peers via handshakes, invites, and sync. ${isKnown ? "<br><b>The local node is also in the known-peers set</b> on this machine." : ""}</div>
+      <div class="hint" style="margin-top:12px">The sidebar's <b>peers</b> count is this list's length — it is never zero (≥ 1 = you), and grows as you discover remote peers via handshakes, invites, and sync.</div>
     </div>
   </div>`;
   $("#content").replaceChildren(el);
