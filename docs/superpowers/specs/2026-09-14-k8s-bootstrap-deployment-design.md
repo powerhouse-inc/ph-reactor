@@ -114,12 +114,56 @@ LoadBalancer Service receives no DNS record. `service` is added to that list.
 
 Blast radius is small: `annotationFilter:
 "external-dns.alpha.kubernetes.io/hostname"` is already set, so only Services
-that explicitly carry the hostname annotation are managed. This yields
-`reactor.vetra.io` and is a prerequisite for phase 2.
+that explicitly carry the hostname annotation are managed. Verified against
+the live cluster: **no Service currently carries that annotation**, so nothing
+existing is newly claimed.
 
 This is the one change in this design that touches shared cluster
 infrastructure, and it is called out as such so it can be reviewed on its own
 merits.
+
+### The load balancer needs a Cilium IP pool to publish its address
+
+This is the non-obvious part of deploying a LoadBalancer Service in *this*
+cluster, and it was found by inspecting live state rather than by reading the
+manifests.
+
+The Hetzner CCM provisions the load balancer correctly, but **it does not
+populate `status.loadBalancer.ingress`**. Proof from the running cluster:
+
+- `argocd-server` is `type: LoadBalancer`. The CCM log shows
+  `EnsuredLoadBalancer` for it against `loadBalancerID=5506209` — the LB really
+  exists — yet the Service has read `<pending>` for 248 days.
+- `traefik` shows `138.199.129.93` only because a
+  **`CiliumLoadBalancerIPPool`** named `traefik-hetzner-lb` hands it that
+  address. Its Service status carries the condition
+  `cilium.io/IPAMRequestSatisfied`, which is Cilium LB-IPAM, not the CCM.
+
+Since external-dns publishes records only for objects whose
+`status.loadBalancer.ingress[]` is populated — the same reason ARCHITECTURE.md
+gives for the Traefik pool existing — `reactor.vetra.io` will never appear
+without a pool of our own.
+
+Therefore the deploy is **two-phase**, and the ordering is forced:
+
+1. Sync the Service; the CCM creates the Hetzner LB and assigns it a public
+   IPv4/IPv6.
+2. Read those addresses from the Hetzner API, commit a
+   `CiliumLoadBalancerIPPool` whose `blocks` are the assigned IPs and whose
+   `serviceSelector` matches `ph-reactor-p2p`, and sync again.
+
+The chicken-and-egg is unavoidable: the pool must contain an address that does
+not exist until the LB is created.
+
+A note on the existing pool: `traefik-hetzner-lb` was applied by hand and is
+**not in the repo** — the `infrastructure/cilium-lb-pool/` directory the
+README documents no longer exists. Ours goes into git properly rather than
+inheriting that drift.
+
+Phase 1 does not strictly *require* DNS: the bootstrap multiaddr can be
+`/ip4/<lb-ip>/…`, and libp2p dials an IP perfectly well. The pool is still
+worth doing, because it makes the Service status truthful and is a
+prerequisite for phase 2's `/dns4/` multiaddr.
 
 ### Identity from OpenBao, not from the PVC
 
@@ -199,6 +243,7 @@ after the signature check.
 | `04-service-p2p.yaml` | `type: LoadBalancer`, TCP 25422 |
 | `05-service-console.yaml` | ClusterIP :4002 |
 | `06-networkpolicy.yaml` | console restricted to the namespace |
+| `07-cilium-lb-pool.yaml` | `CiliumLoadBalancerIPPool` — added in phase 2 of the deploy, once the LB's address is known |
 
 Plus `argocd-apps/infrastructure/ph-reactor.yaml` (the ArgoCD Application) and
 the one-line `sources` addition to
@@ -304,7 +349,8 @@ Requires actual Rust changes, which is why it is not phase 1:
 | Risk | Mitigation |
 |---|---|
 | PROXY protocol accidentally inherited from the Traefik LB pattern | Explicitly assert its absence in the manifest and in the reachability test |
-| external-dns `sources` change affects other Services | `annotationFilter` already scopes it; only annotated Services are managed |
+| external-dns `sources` change affects other Services | `annotationFilter` already scopes it; verified no existing Service carries the annotation |
+| Service status stays `<pending>` like argocd-server's, so DNS never publishes | Two-phase deploy with a `CiliumLoadBalancerIPPool`; the reachability test uses the LB address from the Hetzner API, so it does not depend on the status being populated |
 | Console accidentally exposed later | No Ingress in the directory at all; NetworkPolicy as defence in depth |
 | Second Hetzner LB cost drifts unnoticed | Documented in ARCHITECTURE.md alongside the existing lb11 |
 | Operator confusion over reverted console changes | Documented explicitly in both repos |
