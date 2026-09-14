@@ -313,6 +313,57 @@ pub async fn revoke_publisher(state: State<Arc<Settings>>, Path(key): Path<Strin
     }
 }
 
+#[derive(Deserialize)]
+pub struct TrustBody {
+    /// The ed25519 public key, hex. The identity — never the name.
+    pub key: String,
+    #[serde(default)]
+    pub name: String,
+}
+
+/// `POST /api/publishers` — accept a publisher key.
+///
+/// A package's install prompt can pin a key as a side effect of installing,
+/// because the operator is reading its capabilities at the time. A release has
+/// no capabilities to read, so trusting a key that will be allowed to replace
+/// the daemon binary has to be its own deliberate act — this is it.
+pub async fn trust_publisher(
+    state: State<Arc<Settings>>,
+    body: axum::Json<TrustBody>,
+) -> Response {
+    let b = body.0;
+    let key = b.key.trim().to_lowercase();
+    // Validate it is actually a key before recording it. A malformed entry in
+    // the trust store is a line nothing will ever match, which reads to an
+    // operator as "I trusted this" while granting nothing -- or worse, looks
+    // like the right key at a glance.
+    match hex::decode(&key) {
+        Ok(bytes) if bytes.len() == 32 => {}
+        Ok(bytes) => {
+            return (
+                StatusCode::BAD_REQUEST,
+                format!("a publisher key is 32 bytes, this is {}", bytes.len()),
+            )
+                .into_response()
+        }
+        Err(e) => return (StatusCode::BAD_REQUEST, format!("not hex: {e}")).into_response(),
+    }
+
+    let file = state.paths.publishers_file();
+    let mut trust = TrustStore::load(&file);
+    let already = trust.is_trusted(&key);
+    trust.trust(&key, &b.name);
+    if let Err(e) = trust.save(&file) {
+        return (StatusCode::INTERNAL_SERVER_ERROR, e).into_response();
+    }
+    tracing::info!("operator trusted publisher {} ({key})", b.name);
+    (
+        StatusCode::OK,
+        axum::Json(json!({ "key": key, "name": b.name, "alreadyTrusted": already })),
+    )
+        .into_response()
+}
+
 /// `GET /api/publishers` — the keys this operator has accepted.
 pub async fn publishers(state: State<Arc<Settings>>) -> Response {
     let trust = TrustStore::load(&state.paths.publishers_file());

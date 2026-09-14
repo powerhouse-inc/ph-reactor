@@ -30,6 +30,7 @@ pub mod group;
 pub mod l1;
 pub mod open;
 pub mod package;
+pub mod release;
 pub mod persist;
 pub mod realistic;
 
@@ -154,7 +155,7 @@ impl ModelRegistry {
     }
 
     /// A registry seeded with all built-in models (`open@1`, `group@1`,
-    /// `package@1`).
+    /// `package@1`, `release@1`).
     ///
     /// `package@1` is built in rather than shipped as a definition because of
     /// the obvious circularity: packages are how definitions are distributed,
@@ -163,6 +164,7 @@ impl ModelRegistry {
         let mut r = Self::seeded_with_open();
         r.insert(Arc::new(group::group()));
         r.insert(Arc::new(package::package()));
+        r.insert(Arc::new(release::release()));
         r
     }
 

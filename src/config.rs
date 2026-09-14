@@ -200,6 +200,35 @@ impl Default for LlmConfig {
     }
 }
 
+/// Self-update behaviour.
+///
+/// `check` is on by default and `auto` is off, which is the asymmetry the
+/// plugin system already establishes: knowing an update exists costs nothing,
+/// and applying one is a decision. A binary has no sandbox and no capability
+/// list, so it would be incoherent to demand consent for a plugin and not for
+/// the daemon itself.
+///
+/// `auto` exists for nodes nobody is watching — a cluster reactor with no tray
+/// and no operator at the console. Turning it on says: this key is trusted
+/// enough that a build signed by it may replace the running binary unattended.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+#[serde(default)]
+pub struct UpdateConfig {
+    /// Look for newer releases on start and while running.
+    pub check: bool,
+    /// Apply a verified newer release from a trusted publisher without asking.
+    pub auto: bool,
+}
+
+impl Default for UpdateConfig {
+    fn default() -> Self {
+        Self {
+            check: true,
+            auto: false,
+        }
+    }
+}
+
 /// The top-level configuration document.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
@@ -211,6 +240,8 @@ pub struct ReactorConfig {
     pub drives: Vec<DriveConfig>,
     pub settings: SettingsConfig,
     pub llm: LlmConfig,
+    #[serde(default)]
+    pub update: UpdateConfig,
     #[serde(rename = "logLevel")]
     pub log_level: String,
     /// Unknown fields, preserved verbatim (forward compatibility).
@@ -227,6 +258,7 @@ impl Default for ReactorConfig {
             drives: Vec::new(),
             settings: SettingsConfig::default(),
             llm: LlmConfig::default(),
+            update: UpdateConfig::default(),
             log_level: "info".into(),
             extra: BTreeMap::new(),
         }
@@ -431,6 +463,14 @@ pub fn set(config: &mut ReactorConfig, key: &str, value: &Value) -> Result<(), C
         "settings.port" => {
             set_port("settings.port", &mut config.settings.port, value)?;
         }
+        "update.check" => match value {
+            Value::Bool(b) => config.update.check = *b,
+            _ => return Err(invalid("update.check", "expected a boolean")),
+        },
+        "update.auto" => match value {
+            Value::Bool(b) => config.update.auto = *b,
+            _ => return Err(invalid("update.auto", "expected a boolean")),
+        },
         "logLevel" => {
             let s = match value {
                 Value::String(s) => s.clone(),
@@ -460,7 +500,7 @@ pub fn set(config: &mut ReactorConfig, key: &str, value: &Value) -> Result<(), C
         _ => {
             return Err(invalid(
                 key,
-                "unknown key (allowed: instance.name, instance.listen, p2p.mdns, p2p.tokenEnv, llm.baseUrl, llm.apiKeyEnv, llm.model, settings.host, settings.port, logLevel)",
+                "unknown key (allowed: instance.name, instance.listen, p2p.mdns, p2p.tokenEnv, llm.baseUrl, llm.apiKeyEnv, llm.model, settings.host, settings.port, update.check, update.auto, logLevel)",
             ))
         }
     }

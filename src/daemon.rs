@@ -329,6 +329,7 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         paths.clone(),
         processor_handle,
         blobs.clone(),
+        config.update.auto,
     )
     .start(&config.settings.host, config.settings.port)
     .await
@@ -359,6 +360,10 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
     }
 
     // The status-bar tray (headless environments continue without it).
+    // Cloned before cmd_tx and store move into the tray and the context: the
+    // update task outlives both and needs its own handles.
+    let update_cmd_tx = cmd_tx.clone();
+    let update_store = store.clone();
     let tray = tray::start(snap_rx, cmd_tx).await;
     match &tray {
         tray::Tray::Headless(reason) => tracing::warn!("no tray: {reason}"),
@@ -393,6 +398,38 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         url = settings_url,
         peer = peer_id,
     );
+
+    // Self-update.
+    //
+    // Deliberately NOT before the daemon reports ready. An update that runs on
+    // the way up turns a bad release into a node that never starts and cannot
+    // say why -- no console, no tray, no log line anyone will look for. Coming
+    // up first means a failed upgrade leaves a working daemon to be told about.
+    //
+    // The first check is delayed because a node that has just started has not
+    // synced yet: asking immediately would reliably find nothing and report
+    // "up to date" on the strength of having looked too early.
+    if ctx.config.update.check {
+        let cmd_tx = update_cmd_tx;
+        let store = update_store;
+        let blobs = blobs.clone();
+        let paths_for_update = paths.clone();
+        let auto = ctx.config.update.auto;
+        tokio::spawn(async move {
+            let mut first = true;
+            loop {
+                tokio::time::sleep(if first {
+                    std::time::Duration::from_secs(60)
+                } else {
+                    std::time::Duration::from_secs(6 * 60 * 60)
+                })
+                .await;
+                first = false;
+                crate::daemon::check_for_update(&store, &blobs, &paths_for_update, auto, &cmd_tx)
+                    .await;
+            }
+        });
+    }
 
     // Seed the engine with the drives already in the config (a restart
     // must not lose the user's drive list).
@@ -2379,6 +2416,113 @@ fn init_logging(paths: &StatePaths, config: &ReactorConfig, to_stdout: bool) -> 
 // ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
+
+/// Looks for a newer release and either says so or applies it.
+///
+/// The conditions are all checks that applying would make anyway, evaluated
+/// here so that "an update is available" never means "an update that would be
+/// refused is available".
+pub async fn check_for_update(
+    store: &Arc<crate::store::Store>,
+    blobs: &Arc<crate::blob::BlobStore>,
+    paths: &crate::paths::StatePaths,
+    auto: bool,
+    cmd_tx: &tokio::sync::mpsc::UnboundedSender<Command>,
+) {
+    use crate::package::trust::TrustStore;
+    use crate::update::{self, Release};
+
+    let trust = TrustStore::load(&paths.publishers_file());
+    let current = crate::VERSION;
+    let platform = update::current_platform();
+
+    let mut best: Option<Release> = None;
+    for doc in crate::query::query_docs(store, "release", None) {
+        if doc["fields"]["status"].as_str() == Some("withdrawn") {
+            continue;
+        }
+        let Some(raw) = doc["fields"]["manifest"].as_str() else {
+            continue;
+        };
+        let Ok(r) = serde_json::from_str::<Release>(raw) else {
+            continue;
+        };
+        // Untrusted publisher, bad signature, wrong platform or not newer: all
+        // reasons this node would refuse, so none of them is "available".
+        if !trust.is_trusted(&r.publisher_key)
+            || r.verify().is_err()
+            || !r.runs_on(platform)
+            || !r.is_newer_than(current)
+        {
+            continue;
+        }
+        let better = match &best {
+            None => true,
+            Some(b) => matches!(
+                update::compare(&r.version, &b.version),
+                Some(std::cmp::Ordering::Greater)
+            ),
+        };
+        if better {
+            best = Some(r);
+        }
+    }
+
+    let Some(release) = best else {
+        tracing::debug!("no newer release for {platform} (running {current})");
+        return;
+    };
+
+    let missing = blobs.missing(&release.binary).len();
+    if missing > 0 {
+        tracing::info!(
+            "release {} is available; fetching {missing} remaining chunks",
+            release.version
+        );
+        let _ = cmd_tx.send(Command::FetchBlob {
+            blob: release.binary.clone(),
+        });
+        return;
+    }
+
+    if !auto {
+        // The notification IS the feature when auto is off. Logged at info so
+        // it survives the default filter, and surfaced by /api/updates.
+        tracing::info!(
+            "release {} is available (running {current}). Apply it from the console, \
+             or set update.auto to apply signed releases automatically.",
+            release.version
+        );
+        return;
+    }
+
+    let Ok(exe) = std::env::current_exe() else {
+        tracing::warn!("update.auto is on but the running binary cannot be located");
+        return;
+    };
+    match crate::update::apply::apply(&release, blobs, &exe, &paths.root, current) {
+        Ok(target) => {
+            if target != exe {
+                // The container case: the image binary is on a read-only root,
+                // so the update lives in the state directory. Say so loudly --
+                // `kubectl` will keep reporting the image tag, and a silent
+                // divergence between the two is worse than a noisy one.
+                tracing::warn!(
+                    "applied release {} to {} -- this is NOT the binary this process \
+                     started from ({}), so the image tag no longer describes what runs",
+                    release.version,
+                    target.display(),
+                    exe.display()
+                );
+            } else {
+                tracing::warn!("applied release {} to {}", release.version, target.display());
+            }
+            tracing::warn!("stopping so the supervisor starts the new binary");
+            let _ = cmd_tx.send(Command::Quit);
+        }
+        Err(e) => tracing::warn!("could not apply release {}: {e}", release.version),
+    }
+}
 
 #[cfg(test)]
 mod tests {

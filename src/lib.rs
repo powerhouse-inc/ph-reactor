@@ -39,6 +39,7 @@ pub mod query;
 pub mod settings;
 pub mod status;
 pub mod store;
+pub mod update;
 pub mod tray;
 
 pub const APP_NAME: &str = "Powerhouse Reactor";

@@ -6,6 +6,7 @@
 
 pub mod assets;
 pub mod packages;
+pub mod updates;
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -43,6 +44,10 @@ pub struct Settings {
     processor_handle: crate::processor::ProcessorHandle,
     /// Content-addressed chunks: plugin editor bundles live here.
     blobs: Arc<crate::blob::BlobStore>,
+    /// Whether a verified newer release from a trusted publisher is applied
+    /// without asking. Reported by `/api/updates` so the console can say which
+    /// mode this node is in rather than leave it to be inferred.
+    update_auto: bool,
 }
 
 pub struct SettingsHandle {
@@ -64,6 +69,7 @@ impl Settings {
         paths: StatePaths,
         processor_handle: crate::processor::ProcessorHandle,
         blobs: Arc<crate::blob::BlobStore>,
+        update_auto: bool,
     ) -> Self {
         Self {
             cmd_tx,
@@ -72,6 +78,7 @@ impl Settings {
             paths,
             processor_handle,
             blobs,
+            update_auto,
         }
     }
 
@@ -102,7 +109,20 @@ impl Settings {
             .route("/api/plugins/:name", delete(packages::uninstall))
             .route("/api/packages", get(packages::list).post(packages::publish))
             .route("/api/packages/:doc/install", post(packages::install_pkg))
-            .route("/api/publishers", get(packages::publishers))
+            .route(
+                "/api/publishers",
+                get(packages::publishers).post(packages::trust_publisher),
+            )
+            .route("/api/updates", get(updates::list))
+            .route("/api/updates/apply", post(updates::apply_update))
+            .route(
+                "/api/releases",
+                // A release binary is tens of megabytes; the default 2 MiB
+                // limit rejects every real one. Raised on THIS route only, so
+                // nothing else on the API gains a large-body surface.
+                post(updates::publish)
+                    .layer(axum::extract::DefaultBodyLimit::max(512 * 1024 * 1024)),
+            )
             .route("/api/publishers/:key/revoke", post(packages::revoke_publisher))
             .route("/api/plugins/:name/query", post(plugin_query))
             .route("/api/plugins/:name/action", post(plugin_action))

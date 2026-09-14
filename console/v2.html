@@ -199,6 +199,18 @@
   .doc-name { font-family: var(--mono); color: var(--cyan); }
   .link { color: var(--cyan); cursor: pointer; text-decoration: none; }
 
+  /* ---- update banner ---- */
+  .updbar {
+    display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+    padding: 11px 16px; margin-bottom: 16px; border-radius: 12px;
+    border: 1px solid rgba(56,225,255,0.35);
+    background: linear-gradient(90deg, rgba(56,225,255,0.10), rgba(167,139,250,0.07));
+    font-size: 13px;
+  }
+  .updbar b { color: var(--text); }
+  .updbar .sep { flex: 1; }
+  .updbar .note { color: var(--muted); font-size: 12px; }
+
   /* ---- plugins ---- */
   .plug-card { display: grid; grid-template-columns: 44px 1fr auto; gap: 14px; align-items: start; }
   .plug-ico {
@@ -381,6 +393,7 @@ async function applyRoute() {
     (RENDER[r.tab] || renderOverview)();
   }
   markActiveNav();
+  renderUpdateBanner();
 }
 
 function head(tab) {
@@ -1512,6 +1525,58 @@ async function renderPlugins() {
   }));
 }
 
+/* ---- self-update ----
+ *
+ * The daemon does the deciding: /api/updates only lists releases this node
+ * would actually run -- trusted key, good signature, right platform, strictly
+ * newer, all bytes present. So the console never has to interpret whether an
+ * offer is real, and an Update button that appears is one that can work.
+ */
+async function renderUpdateBanner() {
+  let info;
+  try { info = await get("/api/updates"); } catch { return; }
+  const ready = (info.releases || []).filter(
+    (r) => r.trusted && r.signatureOk && r.runsHere && r.newer);
+  const host = $("#content");
+  if (!ready.length || !host || host.querySelector(".updbar")) return;
+
+  // Newest first, so a node several versions behind is offered the latest.
+  ready.sort((a, b) => (a.version < b.version ? 1 : -1));
+  const r = ready[0];
+
+  const bar = document.createElement("div");
+  bar.className = "updbar";
+  bar.innerHTML = `
+    <span class="badge b-cyan"><span class="dot"></span>update</span>
+    <span>ph-reactor <b>${esc(r.version)}</b> is available — running ${esc(info.current)}${r.notes ? ` · ${esc(r.notes)}` : ""}</span>
+    <span class="sep"></span>
+    ${r.ready
+      ? `<button class="btn primary sm" id="upd-go">Install &amp; restart</button>`
+      : `<span class="note">fetching ${esc(r.bytesMissing)} chunks from peers…</span>`}
+    ${info.auto ? `<span class="note">auto-update is on</span>` : ""}`;
+  host.prepend(bar);
+
+  const go = $("#upd-go", bar);
+  if (go) go.onclick = async () => {
+    go.disabled = true;
+    go.textContent = "installing…";
+    try {
+      const out = await post("/api/updates/apply", { doc: r.doc });
+      // The daemon stops itself so its supervisor starts the new binary, so
+      // the console is about to lose its connection. Say that rather than let
+      // it look like a failure.
+      bar.innerHTML = `<span class="badge b-green"><span class="dot"></span>installed</span>
+        <span>${esc(out.applied)} installed${out.replacedRunningBinary === false
+          ? " to " + esc(out.installedAt) + " (not the binary this process started from)" : ""}.
+        The daemon is restarting — this page will reconnect.</span>`;
+    } catch (e) {
+      go.disabled = false;
+      go.textContent = "Install & restart";
+      toast(e.message, true);
+    }
+  };
+}
+
 /* ---- plugin-provided sidebar entries ---- */
 /*
  * A plugin declares these in its signed manifest and the daemon validates them
@@ -1668,6 +1733,8 @@ $$(".nav-item").forEach((n) => (n.onclick = () => switchTab(n.dataset.tab)));
 window.addEventListener("hashchange", applyRoute);
 renderPluginNav();
 applyRoute();
+renderUpdateBanner();
+setInterval(renderUpdateBanner, 5 * 60 * 1000);
 </script>
 </body>
 </html>
