@@ -340,6 +340,19 @@ impl Store {
     pub fn quarantined_count(&self) -> u64 {
         self.inner.lock().quarantined
     }
+    /// The peer ids (base58) whose keys this store has pinned — the *remote*
+    /// peers it has authenticated, from any handshake. The local origin's key
+    /// is also pinned (so local actions verify) but is filtered out here: the
+    /// caller adds one for "yourself" to get a peer count that is never zero.
+    pub fn known_peers(&self) -> Vec<String> {
+        let inner = self.inner.lock();
+        inner
+            .known_keys
+            .keys()
+            .filter(|id| *id != &inner.origin)
+            .cloned()
+            .collect()
+    }
 
     /// Record a peer's public key (from a Hello handshake) so its actions
     /// verify. Trust-on-first-use: the first key seen for a peer id is
@@ -974,6 +987,18 @@ impl Inner {
         if let Some(spec) = model.quorum(action.kind.as_str()) {
             if let Some(problem) = self.quorum_problem(&spec, action) {
                 return self.reject(action, &problem);
+            }
+        }
+        // 3c. Model-declared authorization (declared like quorum; checked here
+        //     because it can reach this document's full state). For a group
+        //     `post`, this is the *private-channel* gate: the actor must be in
+        //     the target channel's allow-list — a nested object a plain
+        //     `actor-in` cannot express. Runs before step 4, so a failed auth
+        //     never mutates the entry. Skipped when the doc is not loaded yet
+        //     (its preconditions/reduce decide the outcome).
+        if let Some(entry) = self.entries.get(&action.doc_id) {
+            if let Err(r) = model.authorize(&entry.doc, action) {
+                return self.reject(action, &r.describe());
             }
         }
         // 4. Precondition + reduce + per-field merge (one entries borrow).

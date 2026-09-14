@@ -48,6 +48,9 @@ pub struct L1 {
     fields: Value,
     reducers: Value,
     checks: Value,
+    /// Per-reducer authorization rules (checked by the store via
+    /// [`Model::authorize`]). An optional JSON map keyed by reducer kind.
+    auth: Value,
 }
 
 impl L1 {
@@ -78,12 +81,14 @@ impl L1 {
         let fields = def.get("fields").cloned().unwrap_or(Value::Null);
         let reducers = def.get("reducers").cloned().unwrap_or(Value::Null);
         let checks = def.get("checks").cloned().unwrap_or(Value::Null);
+        let auth = def.get("auth").cloned().unwrap_or(Value::Null);
         Ok(Self {
             ref_,
             def,
             fields,
             reducers,
             checks,
+            auth,
         })
     }
 
@@ -345,6 +350,59 @@ impl Model for L1 {
 
     fn quorum(&self, kind: &str) -> Option<QuorumSpec> {
         self.pre_list(kind).iter().copied().find_map(parse_quorum)
+    }
+    fn authorize(&self, state: &Doc, action: &Action) -> Result<(), Reject> {
+        // The model declares per-kind authorization rules (optional). A rule
+        // locates an entry in an array field whose key matches a payload
+        // value; when that entry is marked private, the actor must be in its
+        // allow-list. This reaches nested objects the precondition DSL
+        // cannot, and is definition-driven (auditable + distributed).
+        let Some(rule) = self.auth.get(action.kind.as_str()) else {
+            return Ok(());
+        };
+        let field = rule.get("field").and_then(Value::as_str).unwrap_or("");
+        let name_key = rule.get("name").and_then(Value::as_str).unwrap_or("name");
+        let match_val = self.eval_template(action, rule.get("match").unwrap_or(&Value::Null));
+        let vis_key = rule
+            .get("visibility")
+            .and_then(Value::as_str)
+            .unwrap_or("visibility");
+        let private_value = Value::String(
+            rule.get("private")
+                .and_then(Value::as_str)
+                .unwrap_or("private")
+                .to_string(),
+        );
+        let allow_key = rule
+            .get("allow")
+            .and_then(Value::as_str)
+            .unwrap_or("members");
+        for entry in current_array(state, field).iter() {
+            if entry.get(name_key) != Some(&match_val) {
+                continue;
+            }
+            // A public (or unmarked) entry is governed by the model's
+            // preconditions alone; only a private one needs this check.
+            if entry.get(vis_key) != Some(&private_value) {
+                continue;
+            }
+            let allow = entry
+                .get(allow_key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            let allowed = allow
+                .iter()
+                .any(|m| m.as_str() == Some(action.origin.as_str()));
+            if !allowed {
+                return Err(Reject::Precondition(format!(
+                    "actor {} is not a member of the private channel '{}'",
+                    action.origin,
+                    match_val.as_str().unwrap_or("?")
+                )));
+            }
+        }
+        Ok(())
     }
 
     fn definition(&self) -> Option<Value> {

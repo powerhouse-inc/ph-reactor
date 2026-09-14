@@ -1,24 +1,46 @@
 //! `group` — the built-in membership model, an [`L1`](super::l1) definition.
 //!
-//! A group is a membership container that doubles as a shared space. Fields:
-//! - `members` — every peer granted read access; the group doc (and its
-//!   channel and drive) is replicated to them;
-//! - `managers` — the peers who may edit membership and remove drive docs.
+//! A group is a **shared space** — a membership container that also holds the
+//! space its members collaborate in. The space lives in the group doc so it is
+//! signed, hash-chained, replicated only to members, and `doc verify`-able
+//! like any document. Three parts:
 //!
-//! The space lives in the group doc so it is signed, hash-chained, replicated
-//! only to members, and `doc verify`-able like any document:
-//! - a **channel** — `msg_from` / `msg_text` / `msg_ts` / `msg_channel`,
-//!   parallel arrays appended atomically by `post` (a member's message);
-//! - a **drive** — `drive`, doc names a member adds and a manager removes.
+//! - a **channel set** — `channels`, an array of `{ name, visibility,
+//!   members }`. A `public` channel any member can read/post to; a `private`
+//!   one only its `members` (an allow-list that is a *nested* object, so it
+//!   cannot be a plain `actor-in` — it is enforced by the model's `auth` rule,
+//!   checked by the store). Posts append to the parallel `msg_from` /
+//!   `msg_text` / `msg_ts` / `msg_channel` arrays, tagged with the channel
+//!   name. A default `general` public channel is seeded on `init`.
+//! - a **drive** — `drive`, an array of `{ name, kind, model, parent }`.
+//!   `kind` is `folder` (a container entry, no separate doc) or `doc` (a real
+//!   document of `model`, created by the store); `parent` names the enclosing
+//!   folder (or `null` for the root), so the drive is a tree. Members add
+//!   folders/docs; managers remove items.
+//! - **membership** — `members` (read access; the group doc replicates to
+//!   them) and `managers` (edit membership, remove drive items).
 //!
 //! Reducers:
-//! - `init { name, members, managers }` — bootstrap (no precondition).
+//! - `init { name, members, managers }` — bootstrap; seeds `general` + an empty drive.
 //! - `add-member` / `remove-member { member }` — a **manager** edits members.
 //! - `add-manager { member }` — **quorum-gated**: 2 co-signers who are members
 //!   (the two-person rule, checked by the store against the group's `members`).
-//! - `post { text, channel }` — a **member** appends a message to the channel.
-//! - `add-doc { name }` — a **member** adds a doc to the drive;
-//!   `remove-doc { name }` — a **manager** removes one.
+//! - `post { text, channel }` — a **member** appends a message. A *private*
+//!   channel additionally requires the actor to be in that channel's `members`
+//!   (the model's `auth` rule, enforced in the store on every apply path).
+//! - `add-channel { item }` — a **member** adds a channel;
+//!   `remove-channel { channels }` — a **manager** removes one (the whole
+//!   array is recomputed and `set`; it converges under per-field LWW).
+//! - `add-folder { item }` / `add-doc { item }` — a **member** adds a drive
+//!   entry; `remove-item { drive }` — a **manager** removes one (a recomputed
+//!   array `set`).
+//!
+//! **Migration:** this definition extends the earlier flat-drive form (its
+//! `drive` was a `string[]` of note names). The field is now `array`, so a
+//! pre-existing `string[]` value still passes `check_state`; the console and
+//! the drive API treat a legacy *string* entry as a root `note` doc. Because
+//! the definition's content hash changes, group documents written under the
+//! older hash no longer verify against it — re-issue their `init` to adopt.
 
 use serde_json::json;
 
@@ -36,7 +58,18 @@ pub fn group_def() -> serde_json::Value {
             "msg_text": "string[]",
             "msg_ts": "number[]",
             "msg_channel": "string[]",
-            "drive": "string[]"
+            "channels": "array",
+            "drive": "array"
+        },
+        "auth": {
+            "post": {
+                "field": "channels",
+                "name": "name",
+                "match": "$payload.channel",
+                "visibility": "visibility",
+                "private": "private",
+                "allow": "members"
+            }
         },
         "reducers": {
             "init": {
@@ -53,6 +86,7 @@ pub fn group_def() -> serde_json::Value {
                     "msg_text": { "set": [] },
                     "msg_ts": { "set": [] },
                     "msg_channel": { "set": [] },
+                    "channels": { "set": [ { "name": "general", "visibility": "public", "members": [] } ] },
                     "drive": { "set": [] }
                 },
                 "pre": []
@@ -85,14 +119,29 @@ pub fn group_def() -> serde_json::Value {
                 },
                 "pre": [ { "actor-in": "members" } ]
             },
-            "add-doc": {
-                "payload": { "name": "string" },
-                "writes": { "drive": { "append": "$payload.name" } },
+            "add-channel": {
+                "payload": { "item": "object" },
+                "writes": { "channels": { "append": "$payload.item" } },
                 "pre": [ { "actor-in": "members" } ]
             },
-            "remove-doc": {
-                "payload": { "name": "string" },
-                "writes": { "drive": { "remove": "$payload.name" } },
+            "remove-channel": {
+                "payload": { "channels": "array" },
+                "writes": { "channels": { "set": "$payload.channels" } },
+                "pre": [ { "actor-in": "managers" } ]
+            },
+            "add-folder": {
+                "payload": { "item": "object" },
+                "writes": { "drive": { "append": "$payload.item" } },
+                "pre": [ { "actor-in": "members" } ]
+            },
+            "add-doc": {
+                "payload": { "item": "object" },
+                "writes": { "drive": { "append": "$payload.item" } },
+                "pre": [ { "actor-in": "members" } ]
+            },
+            "remove-item": {
+                "payload": { "drive": "array" },
+                "writes": { "drive": { "set": "$payload.drive" } },
                 "pre": [ { "actor-in": "managers" } ]
             }
         }
@@ -147,7 +196,12 @@ mod tests {
         Value::Array(items.iter().map(|s| Value::String((*s).into())).collect())
     }
 
-    /// A group doc with the given members and managers; empty channel and drive.
+    fn general_channel() -> Value {
+        json!({ "name": "general", "visibility": "public", "members": [] })
+    }
+
+    /// A group doc with the given members and managers, the default `general`
+    /// public channel, and empty message/drive arrays.
     fn doc(members: &[&str], managers: &[&str]) -> Doc {
         let mut v = serde_json::Map::new();
         v.insert("members".into(), arr(members));
@@ -156,6 +210,7 @@ mod tests {
         v.insert("msg_text".into(), Value::Array(vec![]));
         v.insert("msg_ts".into(), Value::Array(vec![]));
         v.insert("msg_channel".into(), Value::Array(vec![]));
+        v.insert("channels".into(), Value::Array(vec![general_channel()]));
         v.insert("drive".into(), Value::Array(vec![]));
         let fields = v
             .into_iter()
@@ -179,6 +234,22 @@ mod tests {
         }
     }
 
+    /// A doc whose `channels` is the default `general` plus a *private* `ops`
+    /// channel whose allow-list is `private_members`.
+    fn doc_with_private_channel(
+        members: &[&str],
+        managers: &[&str],
+        private_members: &[&str],
+    ) -> Doc {
+        let mut d = doc(members, managers);
+        let mut chans = vec![general_channel()];
+        chans.push(
+            json!({ "name": "ops", "visibility": "private", "members": arr(private_members) }),
+        );
+        d.fields.insert("channels".into(), f(Value::Array(chans)));
+        d
+    }
+
     /// Map the ops a reduce produced, keyed by field, for order-independent asserts.
     fn writes(ops: &[Op]) -> std::collections::BTreeMap<String, Value> {
         ops.iter()
@@ -191,8 +262,10 @@ mod tests {
             .collect()
     }
 
+    // ---- init ----
+
     #[test]
-    fn init_writes_membership_and_empty_space() {
+    fn init_seeds_general_channel_and_empty_drive() {
         let m = model();
         let ops = m
             .reduce(
@@ -209,7 +282,13 @@ mod tests {
         assert_eq!(w.get("managers"), Some(&json!(["a"])));
         assert_eq!(w.get("drive"), Some(&json!([])));
         assert_eq!(w.get("msg_text"), Some(&json!([])));
+        let channels = w.get("channels").unwrap().as_array().unwrap();
+        assert_eq!(channels.len(), 1, "init seeds exactly one channel");
+        assert_eq!(channels[0]["name"], json!("general"));
+        assert_eq!(channels[0]["visibility"], json!("public"));
     }
+
+    // ---- post: member gate (precondition) ----
 
     #[test]
     fn post_by_member_appends_to_every_channel_field() {
@@ -229,7 +308,6 @@ mod tests {
         assert_eq!(w.get("msg_from"), Some(&json!(["alice"])));
         assert_eq!(w.get("msg_text"), Some(&json!(["hi"])));
         assert_eq!(w.get("msg_channel"), Some(&json!(["general"])));
-        // ts is opaque to the exact numeric type; assert shape, not value.
         assert_eq!(w.get("msg_ts").unwrap().as_array().unwrap().len(), 1);
     }
 
@@ -268,12 +346,11 @@ mod tests {
     }
 
     /// A manager who is not also a member cannot post — the contract the
-    /// create-group seeding relies on (the creator must be a member, not only a
-    /// manager, to use the channel and drive).
+    /// create-group seeding relies on.
     #[test]
     fn manager_not_in_members_cannot_post() {
         let m = model();
-        let d = doc(&[], &["alice"]); // alice is a manager, not a member
+        let d = doc(&[], &["alice"]);
         assert!(matches!(
             m.check_precondition(
                 &d,
@@ -287,51 +364,224 @@ mod tests {
         ));
     }
 
+    // ---- post: private-channel authorization (the model's `auth` rule) ----
+
     #[test]
-    fn add_doc_by_member_appends_to_drive() {
+    fn post_to_private_channel_by_nonmember_is_rejected_by_auth() {
+        let m = model();
+        // alice is a group member (precondition passes) but not in the
+        // private `ops` channel's allow-list.
+        let d = doc_with_private_channel(&["alice", "bob"], &["alice"], &["bob"]);
+        let a = action("post", json!({ "text": "s", "channel": "ops" }), "alice");
+        assert!(
+            m.check_precondition(&d, &a).is_ok(),
+            "group-member gate passes"
+        );
+        assert!(matches!(m.authorize(&d, &a), Err(Reject::Precondition(_))));
+    }
+
+    #[test]
+    fn post_to_private_channel_by_member_is_allowed_by_auth() {
+        let m = model();
+        let d = doc_with_private_channel(&["alice", "bob"], &["alice"], &["bob"]);
+        let a = action("post", json!({ "text": "s", "channel": "ops" }), "bob");
+        assert!(m.authorize(&d, &a).is_ok());
+        let w = writes(&m.reduce(&d, &a).unwrap());
+        assert_eq!(w.get("msg_channel"), Some(&json!(["ops"])));
+    }
+
+    #[test]
+    fn post_to_public_channel_is_not_private_gated() {
+        let m = model();
+        // general is public: any group member posts with no allow-list.
+        let d = doc(&["alice"], &["alice"]);
+        assert!(m
+            .authorize(
+                &d,
+                &action(
+                    "post",
+                    json!({ "text": "s", "channel": "general" }),
+                    "alice"
+                )
+            )
+            .is_ok());
+    }
+
+    // ---- channels: add (member) / remove (manager) ----
+
+    #[test]
+    fn add_channel_by_member_appends() {
         let m = model();
         let ops = m
             .reduce(
                 &doc(&["alice"], &["alice"]),
-                &action("add-doc", json!({ "name": "note-1" }), "alice"),
+                &action(
+                    "add-channel",
+                    json!({ "item": { "name": "design", "visibility": "public", "members": [] } }),
+                    "alice",
+                ),
             )
             .unwrap();
         let w = writes(&ops);
-        assert_eq!(w.get("drive"), Some(&json!(["note-1"])));
+        let chans = w.get("channels").unwrap().as_array().unwrap();
+        assert_eq!(chans.len(), 2, "general + the new channel");
+        assert_eq!(chans[1]["name"], json!("design"));
+    }
+
+    #[test]
+    fn add_channel_by_nonmember_is_rejected() {
+        let m = model();
+        assert!(matches!(
+            m.check_precondition(
+                &doc(&["alice"], &["alice"]),
+                &action(
+                    "add-channel",
+                    json!({ "item": { "name": "x", "visibility": "public", "members": [] } }),
+                    "eve"
+                )
+            ),
+            Err(Reject::Precondition(_))
+        ));
+    }
+
+    #[test]
+    fn remove_channel_by_manager_sets_recomputed_array() {
+        let m = model();
+        let mut d = doc(&["alice"], &["alice"]);
+        d.fields.insert(
+            "channels".into(),
+            f(Value::Array(vec![
+                general_channel(),
+                json!({ "name": "design", "visibility": "public", "members": [] }),
+            ])),
+        );
+        // The store recomputes the array (drops "design") and `set`s it.
+        let ops = m
+            .reduce(
+                &d,
+                &action(
+                    "remove-channel",
+                    json!({ "channels": [ { "name": "general", "visibility": "public", "members": [] } ] }),
+                    "alice",
+                ),
+            )
+            .unwrap();
+        assert_eq!(
+            writes(&ops).get("channels"),
+            Some(&json!([ { "name": "general", "visibility": "public", "members": [] } ]))
+        );
+    }
+
+    #[test]
+    fn remove_channel_by_nonmanager_is_rejected() {
+        let m = model();
+        let d = doc(&["alice", "bob"], &["alice"]); // bob: member, not manager
+        assert!(matches!(
+            m.check_precondition(
+                &d,
+                &action("remove-channel", json!({ "channels": [] }), "bob")
+            ),
+            Err(Reject::Precondition(_))
+        ));
+    }
+
+    // ---- drive: folders + multi-type docs ----
+
+    #[test]
+    fn add_folder_by_member_appends_tree_item() {
+        let m = model();
+        let ops = m
+            .reduce(
+                &doc(&["alice"], &["alice"]),
+                &action(
+                    "add-folder",
+                    json!({ "item": { "name": "plans", "kind": "folder", "parent": null } }),
+                    "alice",
+                ),
+            )
+            .unwrap();
+        let w = writes(&ops);
+        let items = w.get("drive").unwrap().as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["name"], json!("plans"));
+        assert_eq!(items[0]["kind"], json!("folder"));
+        assert!(items[0]["parent"].is_null(), "root folder has null parent");
+    }
+
+    #[test]
+    fn add_doc_by_member_appends_typed_item() {
+        let m = model();
+        let ops = m
+            .reduce(
+                &doc(&["alice"], &["alice"]),
+                &action(
+                    "add-doc",
+                    json!({ "item": { "name": "t1", "kind": "doc", "model": "task", "parent": "plans" } }),
+                    "alice",
+                ),
+            )
+            .unwrap();
+        let item = writes(&ops).get("drive").unwrap().as_array().unwrap()[0].clone();
+        assert_eq!(item["name"], json!("t1"));
+        assert_eq!(item["kind"], json!("doc"));
+        assert_eq!(item["model"], json!("task"));
+        assert_eq!(item["parent"], json!("plans"));
     }
 
     #[test]
     fn add_doc_by_nonmember_is_rejected() {
         let m = model();
-        let d = doc(&["alice"], &["alice"]);
         assert!(matches!(
-            m.check_precondition(&d, &action("add-doc", json!({ "name": "n" }), "eve")),
+            m.check_precondition(
+                &doc(&["alice"], &["alice"]),
+                &action(
+                    "add-doc",
+                    json!({ "item": { "name": "n", "kind": "doc", "model": "note", "parent": null } }),
+                    "eve"
+                )
+            ),
             Err(Reject::Precondition(_))
         ));
     }
 
     #[test]
-    fn remove_doc_by_manager_removes_from_drive() {
+    fn remove_item_by_manager_sets_recomputed_drive() {
         let m = model();
         let mut d = doc(&["alice"], &["alice"]);
-        d.fields.insert("drive".into(), f(json!(["d1", "d2"])));
+        d.fields.insert(
+            "drive".into(),
+            f(json!([
+                { "name": "a", "kind": "folder", "parent": null },
+                { "name": "b", "kind": "doc", "model": "note", "parent": "a" }
+            ])),
+        );
         let ops = m
-            .reduce(&d, &action("remove-doc", json!({ "name": "d1" }), "alice"))
+            .reduce(
+                &d,
+                &action(
+                    "remove-item",
+                    json!({ "drive": [ { "name": "a", "kind": "folder", "parent": null } ] }),
+                    "alice",
+                ),
+            )
             .unwrap();
-        let w = writes(&ops);
-        assert_eq!(w.get("drive"), Some(&json!(["d2"])));
+        assert_eq!(
+            writes(&ops).get("drive"),
+            Some(&json!([ { "name": "a", "kind": "folder", "parent": null } ]))
+        );
     }
 
     #[test]
-    fn remove_doc_by_nonmanager_is_rejected() {
+    fn remove_item_by_nonmanager_is_rejected() {
         let m = model();
-        let mut d = doc(&["alice", "bob"], &["alice"]); // bob: member, not manager
-        d.fields.insert("drive".into(), f(json!(["d1"])));
+        let d = doc(&["alice", "bob"], &["alice"]); // bob: member, not manager
         assert!(matches!(
-            m.check_precondition(&d, &action("remove-doc", json!({ "name": "d1" }), "bob")),
+            m.check_precondition(&d, &action("remove-item", json!({ "drive": [] }), "bob")),
             Err(Reject::Precondition(_))
         ));
     }
+
+    // ---- membership ----
 
     #[test]
     fn add_member_by_manager_appends_to_members() {
@@ -342,8 +592,7 @@ mod tests {
                 &action("add-member", json!({ "member": "bob" }), "alice"),
             )
             .unwrap();
-        let w = writes(&ops);
-        assert_eq!(w.get("members"), Some(&json!(["alice", "bob"])));
+        assert_eq!(writes(&ops).get("members"), Some(&json!(["alice", "bob"])));
     }
 
     #[test]

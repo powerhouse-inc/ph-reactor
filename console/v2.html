@@ -199,6 +199,28 @@
   .doc-name { font-family: var(--mono); color: var(--cyan); }
   .link { color: var(--cyan); cursor: pointer; text-decoration: none; }
   .link:hover { text-decoration: underline; }
+  /* group-space sub-tab bar */
+  .subtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 14px 0 4px; }
+  .subtab { background: transparent; border: none; border-bottom: 2px solid transparent; color: var(--muted); padding: 8px 14px; font-size: 13px; cursor: pointer; }
+  .subtab:hover { color: var(--fg); }
+  .subtab.active { color: var(--cyan); border-bottom-color: var(--cyan); }
+  /* rich editor widgets */
+  .ed-list { display: flex; flex-direction: column; gap: 6px; margin: 6px 0; }
+  .ed-list .row { display: flex; gap: 6px; }
+  .ed-list .row input { flex: 1; }
+  .ed-list .rm { border: 1px solid var(--line); background: var(--bg-2); color: var(--muted); border-radius: 6px; width: 30px; cursor: pointer; }
+  .ed-list .rm:hover { color: #ff8a8a; border-color: #ff8a8a; }
+  .ed-add { border: 1px dashed var(--line); background: transparent; color: var(--muted); padding: 6px 12px; border-radius: 8px; cursor: pointer; font-size: 12px; }
+  .ed-add:hover { color: var(--cyan); border-color: var(--cyan); }
+  /* drive tree */
+  .drive-item { display: flex; align-items: center; gap: 10px; padding: 9px 12px; border: 1px solid var(--line); border-radius: 10px; cursor: pointer; }
+  .drive-item:hover { border-color: var(--line-2); background: var(--bg-2); }
+  .drive-item .ic { font-size: 15px; }
+  .crumb { display: flex; align-items: center; gap: 6px; flex-wrap: wrap; font-size: 13px; margin: 8px 0 14px; }
+  .crumb .c { color: var(--muted); cursor: pointer; }
+  .crumb .c:hover { color: var(--cyan); }
+  .crumb .c.here { color: var(--fg); cursor: default; }
+  .crumb .sep { color: var(--dim); }
 </style>
 </head>
 <body>
@@ -208,12 +230,10 @@
       <div class="logo">R</div>
       <div class="name">Reactor<small>local console</small></div>
     </div>
-    <div class="nav-item active" data-tab="overview"><span class="ico">◈</span> Overview</div>
-    <div class="nav-item" data-tab="documents"><span class="ico">▤</span> Documents</div>
-    <div class="nav-item" data-tab="types"><span class="ico">❖</span> Types</div>
-    <div class="nav-item" data-tab="folders"><span class="ico">▣</span> Folders</div>
+    <div class="nav-item active" data-tab="overview"><span class="ico">◈</span> Home</div>
     <div class="nav-item" data-tab="groups"><span class="ico">⬡</span> Groups</div>
     <div class="nav-item" data-tab="settings"><span class="ico">⚙</span> Settings</div>
+    <div class="nav-item" data-tab="profile"><span class="ico">☺</span> Profile</div>
     <div class="foot">
       <div class="row"><span>peers</span><span class="mono" id="side-peers">–</span></div>
       <div class="row"><span>docs</span><span class="mono" id="side-docs">–</span></div>
@@ -258,12 +278,14 @@ function toast(msg, isErr = false) {
 
 const state = { tab: "overview", fireCursor: {}, lastFire: {} };
 const TITLES = {
-  overview: ["Overview", "peers, live processor fires, and your subscriptions"],
+  overview: ["Home", "peers, live activity, and your subscriptions"],
+  groups: ["Groups", "shared spaces — channels and a folder drive, signed and synced over the mesh"],
+  settings: ["Settings", "drive, identity, and LLM configuration"],
+  profile: ["Profile", "this node's identity on the mesh"],
+  // kept for deep-links / back-compat; no longer sidebar items:
   documents: ["Documents", "create, inspect, and organize documents"],
   types: ["Types", "draft, register, and use document model types"],
   folders: ["Folders", "membership containers that group documents"],
-  groups: ["Groups", "shared spaces — a channel and a drive, signed and synced over the mesh"],
-  settings: ["Settings", "drive, identity, and LLM configuration"],
 };
 
 function switchTab(tab) {
@@ -707,22 +729,24 @@ async function renderFolders() {
   }
 }
 
-/* ============================ GROUPS ============================ */
+/* ============================ GROUPS (shared space) ============================ */
+// Ephemeral per-group UI state: selected sub-tab, channel, and drive folder.
+const groupUi = {};
+const shortPeer = (p) => (!p ? "?" : (p.length > 24 ? p.slice(0, 8) + "…" + p.slice(-6) : p));
+
 async function renderGroups() {
   const groups = await get("/api/groups").catch(() => []);
-  const shortPeer = (p) =>
-    !p ? "?" : p.length > 24 ? p.slice(0, 8) + "…" + p.slice(-6) : p;
   const el = document.createElement("div");
   el.innerHTML = head("groups") + `
   <div id="groups-main">
     <div class="grid g-2fr">
       <div class="card">
-        <h3>Groups <span class="muted" style="font-size:12px;font-weight:400">a channel to talk + a drive to share, replicated over the mesh</span></h3>
+        <h3>Groups <span class="muted" style="font-size:12px;font-weight:400">a shared space — channels and a folder drive, replicated over the mesh</span></h3>
         <div id="groups-list"></div>
       </div>
       <div style="display:flex;flex-direction:column;gap:14px">
         <div class="card"><h3>1 · Create a group</h3>
-          <div class="muted" style="font-size:12.5px;margin-bottom:10px">A group is a shared space: a channel and a drive. You become a manager; then share its invite link.</div>
+          <div class="muted" style="font-size:12.5px;margin-bottom:10px">A group is a shared space: channels and a drive. You become a member + manager; then share its invite link.</div>
           <label class="field"><span>name</span><input id="grp-name" placeholder="core-team"></label>
           <label class="field"><span>initial members (comma-separated peer ids — optional)</span><input id="grp-members" placeholder="peer-a, peer-b"></label>
           <button class="btn primary" id="grp-create">+ Create group</button>
@@ -741,7 +765,7 @@ async function renderGroups() {
   const load = () => {
     const box = $("#groups-list");
     box.innerHTML = groups.length
-      ? `<table class="table"><thead><tr><th>name</th><th>members</th><th>managers</th><th>msgs</th><th>files</th></tr></thead><tbody>${groups.map((g) => `<tr class="rowclick" data-grp="${esc(g.name)}"><td class="doc-name">${esc(g.name)}</td><td>${g.memberCount}</td><td>${g.managerCount}</td><td>${g.msgCount}</td><td>${g.driveCount}</td></tr>`).join("")}</tbody></table>`
+      ? `<table class="table"><thead><tr><th>name</th><th>members</th><th>managers</th><th>messages</th><th>drive</th></tr></thead><tbody>${groups.map((g) => `<tr class="rowclick" data-grp="${esc(g.name)}"><td class="doc-name">${esc(g.name)}</td><td>${g.memberCount}</td><td>${g.managerCount}</td><td>${g.msgCount}</td><td>${g.driveCount}</td></tr>`).join("")}</tbody></table>`
       : `<div class="empty"><div class="big">⬡</div>No groups yet. Create one, then share its invite link.</div>`;
     $$("#groups-list tr.rowclick").forEach((tr) => (tr.onclick = () => showGroup(tr.dataset.grp)));
   };
@@ -753,10 +777,9 @@ async function renderGroups() {
     const members = $("#grp-members").value.split(",").map((s) => s.trim()).filter(Boolean);
     try {
       await post("/api/groups", { name, members, managers: [] });
-      toast("created group " + name + " — you are a manager");
+      toast("created group " + name + " — you are a member and manager");
       const fresh = await get("/api/groups");
-      groups.length = 0;
-      fresh.forEach((g) => groups.push(g));
+      groups.length = 0; fresh.forEach((g) => groups.push(g));
       load();
       showGroup(name);
     } catch (e) { toast(e.message, true); }
@@ -769,144 +792,394 @@ async function renderGroups() {
       await post("/api/join", { invite });
       toast("joined — syncing with the inviter; you're being added to the group(s) in the invite");
       const fresh = await get("/api/groups");
-      groups.length = 0;
-      fresh.forEach((g) => groups.push(g));
+      groups.length = 0; fresh.forEach((g) => groups.push(g));
       load();
     } catch (e) { toast(e.message, true); }
   };
+}
 
-  async function showGroup(name) {
-    const g = await get(`/api/groups/${encodeURIComponent(name)}`).catch(() => null);
-    if (!g) return;
-    const drive = await get(`/api/groups/${encodeURIComponent(name)}/drive`).catch(() => []);
-    $("#groups-main").style.display = "none";
-    const card = $("#group-detail");
-    card.style.display = "";
-
-    const msgs = g.msgText || [];
-    const msgHtml = msgs.length
-      ? msgs.map((t, i) => {
-          const from = (g.msgFrom || [])[i] || "?";
-          const ts = (g.msgTs || [])[i];
-          const ch = (g.msgChannel || [])[i];
-          const chTag = ch && ch !== "general" ? `<span class="badge b-violet" style="margin-left:6px">#${esc(ch)}</span>` : "";
-          return `<div class="msg" style="margin-bottom:10px">
-            <div style="margin-bottom:3px"><span class="badge b-cyan mono">${esc(shortPeer(from))}</span><span class="dim mono" style="font-size:11px;margin-left:8px">${esc(fmtTs(ts))}</span>${chTag}</div>
-            <div style="font-size:13.5px;white-space:pre-wrap">${esc(t)}</div></div>`;
-        }).join("")
-      : `<div class="muted" style="font-size:12.5px">No messages yet — say something below.</div>`;
-
-    const driveHtml = drive.length
-      ? drive.map((d) =>
-          d.missing
-            ? `<div style="border:1px solid var(--line-2);border-radius:10px;padding:10px"><span class="doc-name">${esc(d.name)}</span> <span class="badge b-red">missing</span></div>`
-            : `<div style="border:1px solid var(--line-2);border-radius:10px;padding:10px">
-                <div style="display:flex;justify-content:space-between;align-items:center;gap:8px"><span class="doc-name">${esc((d.fields && d.fields.title) || d.name)}</span><span class="dim mono" style="font-size:11px">${esc(d.name)}</span></div>
-                <div class="muted" style="font-size:12.5px;margin-top:6px;white-space:pre-wrap">${esc((d.fields && d.fields.body) || "")}</div></div>`
-        ).join("")
-      : `<div class="muted" style="font-size:12.5px">No files yet — add one below.</div>`;
-
-    const members = g.members || [];
-    const managers = g.managers || [];
-
-    card.innerHTML = `
-      <button class="btn ghost sm" id="grp-back" style="margin-bottom:12px">← all groups</button>
-      <div class="card" style="border-color:var(--line-2)">
+// The group space: a sub-tabbed view — Overview | Channels | Drive.
+async function showGroup(name) {
+  const g = await get(`/api/groups/${encodeURIComponent(name)}`).catch(() => null);
+  if (!g) return;
+  $("#groups-main").style.display = "none";
+  const card = $("#group-detail");
+  card.style.display = "";
+  const ui = groupUi[name] || (groupUi[name] = { subtab: "overview", channel: "general", folder: null });
+  card.innerHTML = `
+    <button class="btn ghost sm" id="grp-back" style="margin-bottom:12px">← all groups</button>
+    <div class="card" style="border-color:var(--line-2)">
+      <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:4px">
         <h3>${esc(name)}</h3>
-        <div class="muted" style="font-size:12.5px;margin-bottom:4px">${members.length} member(s) · ${managers.length} manager(s)</div>
+        <span class="muted" style="font-size:12.5px">${(g.members || []).length} member(s) · ${(g.managers || []).length} manager(s)</span>
+      </div>
+      <div class="subtabs" id="grp-subtabs">
+        <button class="subtab" data-sub="overview">Overview</button>
+        <button class="subtab" data-sub="channels">Channels</button>
+        <button class="subtab" data-sub="drive">Drive</button>
+      </div>
+      <div id="grp-subbody"></div>
+    </div>`;
+  $("#grp-back").onclick = () => { card.style.display = "none"; $("#groups-main").style.display = ""; };
+  $$("#grp-subtabs .subtab").forEach((b) => (b.onclick = () => { ui.subtab = b.dataset.sub; renderGroupSub(name, ui); }));
+  await renderGroupSub(name, ui);
+}
 
-        <div style="background:linear-gradient(90deg,rgba(56,225,255,0.07),rgba(167,139,250,0.05));border:1px solid var(--line-2);border-radius:12px;padding:14px;margin-top:12px">
-          <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px"><h4 style="margin:0">⬡ Invite people</h4><span class="muted" style="font-size:12px">the one link that adds someone to this group</span></div>
-          <div id="grp-invite-out" style="display:none;margin-top:8px">
-            <textarea id="grp-invite-token" class="mono" readonly rows="3" style="width:100%;box-sizing:border-box;font-size:11px"></textarea>
-            <div style="display:flex;gap:8px;margin-top:8px"><button class="btn primary sm" id="grp-invite-copy">copy link</button></div>
-            <div class="muted" style="font-size:12px;margin-top:8px">Send this to a member. They paste it into <b>Groups → 2 · Join</b> (or run <span class="mono">ph-reactor join &lt;link&gt;</span>). They connect to your node and are added to this group — then they can use the channel and drive.</div>
+async function renderGroupSub(name, ui) {
+  $$("#grp-subtabs .subtab").forEach((b) => b.classList.toggle("active", b.dataset.sub === ui.subtab));
+  if (ui.subtab === "overview") {
+    const g = await get(`/api/groups/${encodeURIComponent(name)}`).catch(() => ({}));
+    renderGroupOverview(name, g, ui);
+  } else if (ui.subtab === "channels") renderGroupChannels(name, ui);
+  else renderGroupDrive(name, ui);
+}
+
+// Overview sub-tab: invite + membership.
+function renderGroupOverview(name, g, ui) {
+  const body = $("#grp-subbody");
+  const members = g.members || [], managers = g.managers || [];
+  body.innerHTML = `
+    <div style="background:linear-gradient(90deg,rgba(56,225,255,0.07),rgba(167,139,250,0.05));border:1px solid var(--line-2);border-radius:12px;padding:14px;margin-top:12px">
+      <div style="display:flex;align-items:baseline;gap:8px;margin-bottom:4px"><h4 style="margin:0">⬡ Invite people</h4><span class="muted" style="font-size:12px">the one link that adds someone to this group</span></div>
+      <div id="grp-invite-out" style="display:none;margin-top:8px">
+        <textarea id="grp-invite-token" class="mono" readonly rows="3" style="width:100%;box-sizing:border-box;font-size:11px"></textarea>
+        <div style="display:flex;gap:8px;margin-top:8px"><button class="btn primary sm" id="grp-invite-copy">copy link</button></div>
+        <div class="muted" style="font-size:12px;margin-top:8px">Send this to a member. They paste it into <b>Groups → 2 · Join</b> (or run <span class="mono">ph-reactor join &lt;link&gt;</span>). They connect to your node and are added to this group.</div>
+      </div>
+      <button class="btn primary" id="grp-invite" style="margin-top:10px">⬡ Generate invite link</button>
+    </div>
+    <div class="divider"></div>
+    <h4>Members</h4>
+    <div class="pill-row">${members.map((m) => `<span class="badge b-cyan mono">${esc(shortPeer(m))}</span>`).join("") || '<span class="muted">none</span>'}</div>
+    <div style="margin-top:10px"><div class="field-row"><input id="grp-add" placeholder="add a member (peer id)"><button class="btn sm" id="grp-add-go">add</button></div></div>
+    <div class="divider"></div>
+    <h4>Managers <span class="muted" style="font-weight:400;font-size:12px">edit membership, remove drive items</span></h4>
+    <div class="pill-row">${managers.map((m) => `<span class="badge b-violet mono">${esc(shortPeer(m))}</span>`).join("") || '<span class="muted">none</span>'}</div>
+    <div class="muted" style="font-size:11.5px;margin-top:8px">Adding a <b>second manager</b> needs a 2-member quorum — the two-person rule.</div>`;
+  $("#grp-invite").onclick = async () => {
+    try {
+      const r = await post("/api/invite", { groups: [name] });
+      $("#grp-invite").style.display = "none";
+      $("#grp-invite-out").style.display = "";
+      $("#grp-invite-token").value = r.invite;
+      toast("invite link ready — copy it and share");
+    } catch (e) { toast(e.message, true); }
+  };
+  $("#grp-invite-copy").onclick = async () => {
+    const tok = $("#grp-invite-token").value;
+    try { await navigator.clipboard.writeText(tok); toast("invite copied to clipboard"); }
+    catch { $("#grp-invite-token").select(); document.execCommand("copy"); toast("invite selected"); }
+  };
+  $("#grp-add-go").onclick = async () => {
+    const m = $("#grp-add").value.trim();
+    if (!m) return;
+    try {
+      await post(`/api/groups/${encodeURIComponent(name)}/action`, { kind: "add-member", payload: { member: m } });
+      toast("added " + m);
+      showGroup(name);
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+// Channels sub-tab: list, create (public/private), composer, filtered messages.
+async function renderGroupChannels(name, ui) {
+  const body = $("#grp-subbody");
+  const g = await get(`/api/groups/${encodeURIComponent(name)}`).catch(() => ({}));
+  const ov = await get("/api/overview").catch(() => ({}));
+  const me = ov.peerId || "";
+  const channels = g.channels || [];
+  const isPriv = (c) => c && c.visibility === "private";
+  const canRead = (c) => !isPriv(c) || (c.members || []).includes(me);
+  let sel = channels.find((c) => c.name === ui.channel) ? ui.channel : (channels[0] ? channels[0].name : "general");
+  ui.channel = sel;
+  const selChan = channels.find((c) => c.name === sel) || { name: sel, visibility: "public", members: [] };
+  const readable = canRead(selChan);
+  // messages in the selected channel (filtered from the parallel arrays)
+  const from = g.msgFrom || [], text = g.msgText || [], ts = g.msgTs || [], chan = g.msgChannel || [];
+  const msgHtml = text
+    .map((t, i) => (chan[i] === sel ? `<div class="msg" style="margin-bottom:10px">
+      <div style="margin-bottom:3px"><span class="badge b-cyan mono">${esc(shortPeer(from[i] || "?"))}</span><span class="dim mono" style="font-size:11px;margin-left:8px">${esc(fmtTs(ts[i]))}</span></div>
+      <div style="font-size:13.5px;white-space:pre-wrap">${esc(t)}</div></div>` : ""))
+    .join("");
+  body.innerHTML = `
+    <div style="display:flex;gap:12px;align-items:flex-start">
+      <div style="flex:0 0 230px">
+        <h4 style="margin:8px 0 8px">Channels</h4>
+        <div style="display:flex;flex-direction:column;gap:4px">
+          ${channels.map((c) => `<div class="drive-item" data-ch="${esc(c.name)}" style="${c.name === sel ? "border-color:var(--cyan)" : ""}">
+            <span class="ic">${isPriv(c) ? "🔒" : "💬"}</span>
+            <span style="flex:1">#${esc(c.name)}</span>
+            <span class="badge ${isPriv(c) ? "b-violet" : "b-green"}" style="font-size:10px">${esc(c.visibility || "public")}</span>
+          </div>`).join("") || '<div class="muted" style="font-size:12px">no channels</div>'}
+        </div>
+        <div class="divider"></div>
+        <h4 style="margin:8px 0 8px">New channel</h4>
+        <label class="field"><span>name</span><input id="ch-name" placeholder="design"></label>
+        <div class="field-row" style="margin:8px 0">
+          <label class="switch"><input type="radio" name="ch-vis" value="public" checked><span class="track"></span> public</label>
+          <label class="switch"><input type="radio" name="ch-vis" value="private"><span class="track"></span> private</label>
+        </div>
+        <div id="ch-members-wrap" style="display:none"><label class="field"><span>members (comma-separated peer ids — who may read/post)</span><input id="ch-members" placeholder="${esc(me || "peer-a, peer-b")}"></label></div>
+        <button class="btn sm" id="ch-add">+ Create channel</button>
+      </div>
+      <div style="flex:1">
+        <div class="field-row" style="margin-bottom:10px;gap:12px">
+          <label class="field" style="flex:0 0 200px"><span>posting to</span><select id="ch-sel">${channels.map((c) => `<option value="${esc(c.name)}" ${c.name === sel ? "selected" : ""} ${isPriv(c) && !canRead(c) ? "disabled" : ""}>${isPriv(c) ? "🔒 " : ""}#${esc(c.name)}</option>`).join("")}</select></label>
+          <span class="muted" style="font-size:11.5px;align-self:flex-end">${isPriv(selChan) ? "private — only its members can read/post" : "public — any member can read/post"}</span>
+        </div>
+        ${readable ? `
+          <div style="max-height:280px;overflow-y:auto;border:1px solid var(--line-2);border-radius:10px;padding:12px;margin-bottom:10px">
+            ${msgHtml || `<div class="muted" style="font-size:12.5px">No messages in #${esc(sel)} yet — say something below.</div>`}
           </div>
-          <button class="btn primary" id="grp-invite" style="margin-top:10px">⬡ Generate invite link</button>
-        </div>
-
-        <div class="divider"></div>
-        <h4>Channel <span class="muted" style="font-weight:400;font-size:12px">shared conversation — signed + replicated</span></h4>
-        <div style="max-height:260px;overflow-y:auto;border:1px solid var(--line-2);border-radius:10px;padding:12px;margin:10px 0">${msgHtml}</div>
-        <div class="field-row" style="gap:8px">
-          <input id="grp-msg" placeholder="post to the channel…" style="flex:1">
-          <button class="btn primary sm" id="grp-msg-send">post</button>
-        </div>
-
-        <div class="divider"></div>
-        <h4>Drive <span class="muted" style="font-weight:400;font-size:12px">shared files</span></h4>
-        <div style="display:flex;flex-direction:column;gap:8px;margin:10px 0">${driveHtml}</div>
-        <details>
-          <summary class="muted" style="font-size:12.5px;cursor:pointer">add a file to the drive</summary>
-          <label class="field" style="margin-top:8px"><span>title</span><input id="grp-file-title" placeholder="Q3 plan"></label>
-          <label class="field"><span>body</span><textarea id="grp-file-body" class="mono" rows="3" style="width:100%;box-sizing:border-box"></textarea></label>
-          <button class="btn sm" id="grp-file-add">+ add file</button>
-        </details>
-
-        <div class="divider"></div>
-        <h4>Members</h4>
-        <div class="pill-row">${members.map((m) => `<span class="badge b-cyan mono">${esc(shortPeer(m))}</span>`).join("") || '<span class="muted">none</span>'}</div>
-        <h4>Managers</h4>
-        <div class="pill-row">${managers.map((m) => `<span class="badge b-violet mono">${esc(shortPeer(m))}</span>`).join("") || '<span class="muted">none</span>'}</div>
-        <div class="field" style="margin-top:10px"><div class="field-row"><input id="grp-add" placeholder="add a member (peer id)"><button class="btn sm" id="grp-add-go">add</button></div></div>
-        <div class="muted" style="font-size:11.5px;margin-top:8px">Adding a <b>second manager</b> needs a 2-member quorum — the two-person rule.</div>
-      </div>`;
-
-    $("#grp-back").onclick = () => {
-      card.style.display = "none";
-      $("#groups-main").style.display = "";
-    };
-    $("#grp-invite").onclick = async () => {
-      try {
-        const r = await post("/api/invite", { groups: [name] });
-        $("#grp-invite").style.display = "none";
-        $("#grp-invite-out").style.display = "";
-        $("#grp-invite-token").value = r.invite;
-        toast("invite link ready — copy it and share");
-      } catch (e) { toast(e.message, true); }
-    };
-    $("#grp-invite-copy").onclick = async () => {
-      const tok = $("#grp-invite-token").value;
-      try {
-        await navigator.clipboard.writeText(tok);
-        toast("invite copied to clipboard");
-      } catch {
-        $("#grp-invite-token").select();
-        document.execCommand("copy");
-        toast("invite selected");
-      }
-    };
-    const sendMsg = async () => {
-      const text = $("#grp-msg").value.trim();
-      if (!text) return;
-      try {
-        await post(`/api/groups/${encodeURIComponent(name)}/action`, { kind: "post", payload: { text, channel: "general" } });
-        showGroup(name);
-      } catch (e) { toast(e.message, true); }
-    };
+          <div class="field-row" style="gap:8px">
+            <input id="grp-msg" placeholder="post to #${esc(sel)}…" style="flex:1">
+            <button class="btn primary sm" id="grp-msg-send">post</button>
+          </div>` : `
+          <div style="border:1px solid var(--line-2);border-radius:10px;padding:16px;font-size:13px;color:var(--muted)">🔒 You are not a member of this private channel, so you can't read or post here. Ask a member to add your peer id.</div>`}
+      </div>
+    </div>`;
+  // toggle the members field when private is chosen
+  const toggleMembers = () => { $("#ch-members-wrap").style.display = ($("input[name=ch-vis]:checked").value === "private") ? "" : "none"; };
+  $$("#ch-vis").forEach((r) => (r.onchange = toggleMembers));
+  $$("#grp-subbody [data-ch]").forEach((row) => (row.onclick = () => { ui.channel = row.dataset.ch; renderGroupChannels(name, ui); }));
+  $("#ch-sel").onchange = () => { ui.channel = $("#ch-sel").value; renderGroupChannels(name, ui); };
+  $("#ch-add").onclick = async () => {
+    const n = $("#ch-name").value.trim();
+    if (!n) return toast("give the channel a name", true);
+    const vis = $("input[name=ch-vis]:checked").value;
+    const members = vis === "private" ? $("#ch-members").value.split(",").map((s) => s.trim()).filter(Boolean) : [];
+    try {
+      await post(`/api/groups/${encodeURIComponent(name)}/channels`, { name: n, visibility: vis, members });
+      toast("created #" + n + " (" + vis + ")");
+      ui.channel = n;
+      renderGroupChannels(name, ui);
+    } catch (e) { toast(e.message, true); }
+  };
+  const sendMsg = async () => {
+    const t = $("#grp-msg").value.trim();
+    if (!t) return;
+    try {
+      await post(`/api/groups/${encodeURIComponent(name)}/action`, { kind: "post", payload: { text: t, channel: sel } });
+      renderGroupChannels(name, ui);
+    } catch (e) { toast(e.message, true); }
+  };
+  if (readable) {
     $("#grp-msg-send").onclick = sendMsg;
     $("#grp-msg").addEventListener("keydown", (e) => { if (e.key === "Enter") sendMsg(); });
-    $("#grp-file-add").onclick = async () => {
-      const title = $("#grp-file-title").value.trim();
-      const body = $("#grp-file-body").value;
-      try {
-        await post(`/api/groups/${encodeURIComponent(name)}/drive`, { title, body });
-        toast("added file to the drive");
-        showGroup(name);
-      } catch (e) { toast(e.message, true); }
-    };
-    $("#grp-add-go").onclick = async () => {
-      const m = $("#grp-add").value.trim();
-      if (!m) return;
-      try {
-        await post(`/api/groups/${encodeURIComponent(name)}/action`, { kind: "add-member", payload: { member: m } });
-        toast("added " + m);
-        showGroup(name);
-      } catch (e) { toast(e.message, true); }
-    };
   }
 }
 
+// Drive sub-tab: folder tree + breadcrumb + New (folder / typed doc).
+async function renderGroupDrive(name, ui) {
+  const body = $("#grp-subbody");
+  const items = await get(`/api/groups/${encodeURIComponent(name)}/drive`).catch(() => []);
+  const models = await get("/api/models").catch(() => []);
+  const byName = {}; items.forEach((i) => (byName[i.name] = i));
+  const cur = ui.folder || null;
+  // breadcrumb: walk parents from the current folder up to the root
+  const path = [];
+  let c = cur;
+  while (c != null) { path.unshift(c); const it = byName[c]; c = it && it.parent != null ? it.parent : null; }
+  const kids = items.filter((i) => (i.parent == null ? null : i.parent) === cur);
+  const crumb = ['<span class="c" data-crumb="">root</span>'].concat(
+    path.map((p, idx) => `<span class="sep">›</span><span class="c ${idx === path.length - 1 ? "here" : ""}" data-crumb="${esc(p)}">${esc(p)}</span>`)
+  ).join("");
+  const itemRow = (i) => i.kind === "folder"
+    ? `<div class="drive-item" data-open="${esc(i.name)}"><span class="ic">📁</span><span style="flex:1">${esc(i.name)}</span><button class="btn ghost sm" data-del="${esc(i.name)}">delete</button></div>`
+    : `<div class="drive-item" data-open="${esc(i.name)}" data-doc="${esc(i.name)}"><span class="ic">📄</span><span style="flex:1">${esc(i.title || i.name)}</span><span class="badge b-cyan" style="font-size:10px">${esc(i.model || "doc")}</span><button class="btn ghost sm" data-del="${esc(i.name)}">delete</button></div>`;
+  body.innerHTML = `
+    <div class="crumb">${crumb}</div>
+    <div style="display:flex;gap:12px;align-items:flex-start">
+      <div style="flex:1">
+        <div style="display:flex;flex-direction:column;gap:8px">
+          ${kids.map(itemRow).join("") || '<div class="muted" style="font-size:12.5px">This folder is empty. Use <b>New</b> to add a folder or a document.</div>'}
+        </div>
+      </div>
+      <div style="flex:0 0 250px">
+        <div class="card" style="margin:0">
+          <h4 style="margin-bottom:10px">New <span class="muted" style="font-weight:400;font-size:11px">in ${cur ? "#" + esc(cur) : "root"}</span></h4>
+          <details open>
+            <summary class="muted" style="font-size:12.5px;cursor:pointer">Folder</summary>
+            <label class="field" style="margin-top:8px"><span>name</span><input id="nf-name" placeholder="Q3 plans"></label>
+            <button class="btn sm" id="nf-add">+ New folder</button>
+          </details>
+          <div class="divider"></div>
+          <details open>
+            <summary class="muted" style="font-size:12.5px;cursor:pointer">Document</summary>
+            <label class="field" style="margin-top:8px"><span>type</span><select id="nd-model">${models.filter((m) => !["group", "folder"].includes(m.name)).map((m) => `<option value="${esc(m.name)}">${esc(m.name)}@${esc(m.version)}</option>`).join("")}</select></label>
+            <label class="field"><span>name (optional)</span><input id="nd-name" placeholder="auto if blank"></label>
+            <button class="btn primary sm" id="nd-add">+ New document</button>
+          </details>
+        </div>
+      </div>
+    </div>`;
+  $$("#grp-subbody [data-crumb]").forEach((cr) => (cr.onclick = () => {
+    if (cr.classList.contains("here")) return;
+    ui.folder = cr.dataset.crumb || null;
+    renderGroupDrive(name, ui);
+  }));
+  $$("#grp-subbody [data-open]").forEach((row) => (row.onclick = (e) => {
+    if (e.target.closest("[data-del]")) return;
+    if (row.dataset.doc) openEditor(row.dataset.doc, name, models, ui);
+    else { ui.folder = row.dataset.open; renderGroupDrive(name, ui); }
+  }));
+  $$("#grp-subbody [data-del]").forEach((b) => (b.onclick = async (e) => {
+    e.stopPropagation();
+    try {
+      await del(`/api/groups/${encodeURIComponent(name)}/drive/${encodeURIComponent(b.dataset.del)}`);
+      toast("deleted " + b.dataset.del);
+      renderGroupDrive(name, ui);
+    } catch (err) { toast(err.message, true); }
+  }));
+  $("#nf-add").onclick = async () => {
+    const n = $("#nf-name").value.trim();
+    if (!n) return toast("name the folder", true);
+    try {
+      await post(`/api/groups/${encodeURIComponent(name)}/drive/folder`, { name: n, parent: cur });
+      toast("added folder " + n);
+      renderGroupDrive(name, ui);
+    } catch (e) { toast(e.message, true); }
+  };
+  $("#nd-add").onclick = async () => {
+    const model = $("#nd-model").value;
+    const nm = $("#nd-name").value.trim();
+    try {
+      await post(`/api/groups/${encodeURIComponent(name)}/drive/doc`, { name: nm || undefined, model, parent: cur });
+      toast("created " + model + " document");
+      renderGroupDrive(name, ui);
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
+// Rich editor: field-type-aware widgets; each field saves via the model's own
+// reducer (set-<field>, or the open-model `set` fallback).
+async function openEditor(docName, groupName, models, ui) {
+  const body = $("#grp-subbody");
+  let d;
+  try { d = await get("/api/docs/" + encodeURIComponent(docName)); }
+  catch (e) { return toast(e.message, true); }
+  const model = models.find((m) => m.name === d.model);
+  const fdef = (model && model.fields) || {};
+  const enums = (model && model.enums) || {};
+  const reducers = (model && model.reducers) || {};
+  const cur = d.fields || {};
+  const canEdit = (k) => !!reducers["set-" + k] || !!reducers["set"];
+
+  const widget = (k, type) => {
+    const val = cur[k];
+    if (!canEdit(k)) {
+      const shown = Array.isArray(val) ? val.join(", ") : (val == null ? "" : (typeof val === "object" ? JSON.stringify(val) : val));
+      return `<div class="kv"><span class="k">${esc(k)}</span><span class="v">${esc(shown)} <span class="muted" style="font-size:10px">(read-only)</span></span></div>`;
+    }
+    if (type === "string" && Array.isArray(enums[k])) {
+      const opts = enums[k].map((o) => `<option ${o === val ? "selected" : ""}>${esc(o)}</option>`).join("");
+      const extra = (val != null && !enums[k].includes(val)) ? `<option selected>${esc(val)}</option>` : "";
+      return `<label class="field"><span>${esc(k)} <span class="muted mono" style="font-size:10px">(select)</span></span><select id="ed-${k}">${extra}${opts}</select></label>`;
+    }
+    if (type === "string") return `<label class="field"><span>${esc(k)}</span><input id="ed-${k}" value="${esc(val == null ? "" : val)}"></label>`;
+    if (type === "number") return `<label class="field"><span>${esc(k)}</span><input id="ed-${k}" type="number" value="${esc(val == null ? "" : val)}"></label>`;
+    if (type === "boolean") return `<label class="switch" style="margin:8px 0"><input id="ed-${k}" type="checkbox" ${val ? "checked" : ""}><span class="track"></span> ${esc(k)}</label>`;
+    if (type === "string[]" || type === "number[]" || type === "boolean[]" || type === "array") {
+      const items = Array.isArray(val) ? val : (val == null ? [] : [val]);
+      const rows = items.map((x) => `<div class="row"><input value="${esc(typeof x === "string" ? x : JSON.stringify(x))}"><button class="rm">✕</button></div>`).join("");
+      return `<div style="margin:8px 0"><span class="muted" style="font-size:12px">${esc(k)} <span class="mono" style="font-size:10px">(${esc(type)})</span></span>
+        <div class="ed-list" id="ed-${k}-list">${rows}</div>
+        <button class="ed-add" id="ed-${k}-add">+ add item</button></div>`;
+    }
+    // object / unknown → editable JSON
+    return `<label class="field"><span>${esc(k)} <span class="muted mono" style="font-size:10px">(JSON)</span></span><textarea id="ed-${k}" class="mono" rows="3">${esc(JSON.stringify(val == null ? null : val))}</textarea></label>`;
+  };
+
+  const setters = Object.keys(reducers).filter((r) => r.startsWith("set-"));
+  body.innerHTML = `
+    <button class="btn ghost sm" id="ed-back" style="margin-bottom:12px">← back to drive</button>
+    <div class="card" style="border-color:var(--line-2)">
+      <h3>${esc(docName)} <span class="badge b-violet" style="font-size:11px;vertical-align:middle">${esc(d.model)}</span></h3>
+      <div class="muted" style="font-size:12px;margin-bottom:14px">Each field saves with the model's own reducer${setters.length ? " (" + setters.join(", ") + ")" : " (set)"}. Changes are signed and sync over the mesh.</div>
+      <div style="display:flex;flex-direction:column;gap:6px">${Object.keys(fdef).map((k) => widget(k, fdef[k])).join("") || '<div class="muted">No fields.</div>'}</div>
+      <div style="margin-top:16px;display:flex;gap:10px">
+        <button class="btn primary" id="ed-save">Save</button>
+        <button class="btn ghost" id="ed-cancel">cancel</button>
+      </div>
+    </div>`;
+  // wire list add/remove
+  Object.keys(fdef).forEach((k) => {
+    const list = $(`#ed-${k}-list`);
+    if (!list) return;
+    const addBtn = $(`#ed-${k}-add`);
+    if (addBtn) addBtn.onclick = () => {
+      const row = document.createElement("div"); row.className = "row";
+      row.innerHTML = `<input value=""><button class="rm">✕</button>`;
+      list.appendChild(row);
+    };
+    list.querySelectorAll(".rm").forEach((b) => (b.onclick = () => b.closest(".row").remove()));
+  });
+  const collect = (k, type) => {
+    if (type === "boolean") return $(`#ed-${k}`).checked;
+    if (type === "number") { const v = $(`#ed-${k}`).value; return v === "" ? 0 : Number(v); }
+    if (type === "string[]" || type === "number[]" || type === "boolean[]" || type === "array") {
+      const inputs = $(`#ed-${k}-list`).querySelectorAll(".row input");
+      return Array.from(inputs).map((i) => i.value);
+    }
+    if (type === "object") { const raw = $(`#ed-${k}`).value.trim(); try { return JSON.parse(raw || "null"); } catch { return cur[k]; } }
+    return $(`#ed-${k}`).value; // string / select
+  };
+  const save = async () => {
+    let changed = 0;
+    for (const k of Object.keys(fdef)) {
+      if (!canEdit(k)) continue;
+      const nv = collect(k, fdef[k]);
+      if (JSON.stringify(nv) === JSON.stringify(cur[k])) continue;
+      const setter = "set-" + k;
+      const kind = reducers[setter] ? setter : "set";
+      const payload = kind === "set" ? { field: k, value: nv } : { [k]: nv };
+      changed++;
+      try {
+        await post("/api/docs/action", { name: d.name, model: d.model, kind, payload });
+      } catch (e) { return toast(`${k}: ${e.message}`, true); }
+    }
+    toast(changed ? "saved " + changed + " field(s)" : "no changes");
+    if (changed) openEditor(docName, groupName, models, ui);
+  };
+  $("#ed-save").onclick = save;
+  const back = () => { ui.subtab = "drive"; renderGroupDrive(groupName, ui); };
+  $("#ed-back").onclick = back;
+  $("#ed-cancel").onclick = back;
+}
+
+/* ============================ PROFILE (this node) ============================ */
+async function renderProfile() {
+  const ov = await get("/api/overview").catch(() => ({}));
+  const cfg = await get("/api/config").catch(() => ({}));
+  const inst = cfg.instance || {};
+  const peerId = ov.peerId || "";
+  const short = (p) => (!p ? "?" : (p.length > 24 ? p.slice(0, 10) + "…" + p.slice(-8) : p));
+  const known = ov.knownPeers || [];
+  const el = document.createElement("div");
+  el.innerHTML = head("profile") + `
+  <div class="grid g-2fr">
+    <div class="card">
+      <div style="display:flex;align-items:center;gap:10px;margin-bottom:14px">
+        <span class="badge b-green" style="margin-left:6px">you</span>
+        <h3 style="margin:0">${esc(short(peerId))}</h3>
+      </div>
+      <div class="kv"><span class="k">peer id</span><span class="v mono" style="font-size:11px;word-break:break-all" title="${esc(peerId)}">${esc(peerId || "—")}</span></div>
+      <div class="kv"><span class="k">instance name</span><span class="v">${esc(inst.name || "—")}</span></div>
+      <div class="kv"><span class="k">listen</span><span class="v mono" style="font-size:11px">${esc(ov.listen || "—")}</span></div>
+      <div class="kv"><span class="k">live docs on this node</span><span class="v">${ov.liveDocCount ?? 0}</span></div>
+      <div class="kv"><span class="k">peer count</span><span class="v">${ov.peerCount ?? 1} <span class="muted" style="font-size:11px">(includes you)</span></span></div>
+    </div>
+    <div class="card">
+      <h3>Nodes on the mesh <span class="muted" style="font-weight:400;font-size:12px">this node + known remote peers</span></h3>
+      <div class="pill-row" style="margin-top:10px">
+        <span class="badge b-green mono" title="you">${esc(short(peerId))} · you</span>
+        ${known.map((p) => `<span class="badge b-cyan mono">${esc(short(p))}</span>`).join("") || '<span class="muted">no remote peers yet</span>'}
+      </div>
+      <div class="hint" style="margin-top:12px">The sidebar's <b>peers</b> count is this list's length — it is never zero (≥ 1 = you), and grows as you discover remote peers via handshakes, invites, and sync.</div>
+    </div>
+  </div>`;
+  $("#content").replaceChildren(el);
+}
 /* ============================ SETTINGS ============================ */
 async function renderSettings() {
   const [cfg, ov] = await Promise.all([get("/api/config").catch(() => ({})), get("/api/overview").catch(() => ({}))]);
@@ -981,6 +1254,7 @@ const RENDER = {
   folders: renderFolders,
   groups: renderGroups,
   settings: renderSettings,
+  profile: renderProfile,
 };
 function render() { $$(".view").forEach((v) => v.remove()); (RENDER[state.tab] || renderOverview)(); }
 
