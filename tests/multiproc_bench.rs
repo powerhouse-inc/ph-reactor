@@ -69,11 +69,18 @@ async fn store_write_throughput() {
         elapsed, n
     );
     feeder.abort();
-    // Profile-dependent (ed25519 is ~100x slower unoptimized): the floor is
-    // a collapse detector, not a target. Release measures ~12k ops/s.
+    // Profile-dependent (ed25519 is ~100x slower unoptimized): the floor is a
+    // collapse detector, not a target. It has to be per-profile, because one
+    // number cannot be both. A single floor of 100 failed on healthy hardware
+    // in debug -- measured 71 ops/s on a machine doing 19.4k in release -- and
+    // a detector that fires on a healthy store is worse than no detector,
+    // because the next person silently raises the threshold instead of reading
+    // it. Debug catches an order-of-magnitude collapse; release catches a real
+    // regression.
+    let floor = if cfg!(debug_assertions) { 20.0 } else { 5_000.0 };
     assert!(
-        ops > 100.0,
-        "store write throughput collapsed: {ops:.1} ops/s"
+        ops > floor,
+        "store write throughput collapsed: {ops:.1} ops/s (floor {floor:.0})"
     );
 }
 

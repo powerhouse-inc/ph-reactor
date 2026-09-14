@@ -28,6 +28,8 @@ use crate::action::Action;
 use crate::doc::{Doc, Hash32, ModelRef, Op};
 use crate::model::open::Open;
 
+pub mod chat;
+pub mod drive;
 pub mod group;
 pub mod l1;
 pub mod open;
@@ -119,6 +121,24 @@ pub trait Model: Send + Sync {
         None
     }
 
+    /// Must the actor appear in one of the document's *space*'s lists?
+    ///
+    /// Declared here and checked by the store, for the same reason as
+    /// [`Model::quorum`]: it needs a different document's state, and
+    /// `reduce`/`check_precondition` stay pure.
+    ///
+    /// This is the mechanism by which an app inherits its space's membership
+    /// instead of reinventing it. Without it every app has to carry its own
+    /// access list -- which is what `rfp.approvers`, `agreement.builder` and
+    /// `group.members` each are, five apps with five unenforced answers to
+    /// "who may see this". One list, checked in one place, is the whole point
+    /// of a space.
+    /// Returns the space field the actor must appear in -- `members` or
+    /// `managers` -- or `None` when this reducer has no such requirement.
+    fn requires_space_member(&self, _kind: &str) -> Option<String> {
+        None
+    }
+
     /// The model's canonical definition, if it has a distributable form
     /// (the JSON an [`L1`](l1::L1) interpreter is built from). Mesh
     /// model-distribution uses this: a peer that lacks the model requests
@@ -169,6 +189,8 @@ impl ModelRegistry {
         r.insert(Arc::new(package::package()));
         r.insert(Arc::new(release::release()));
     r.insert(Arc::new(space::space()));
+    r.insert(Arc::new(chat::chat()));
+    r.insert(Arc::new(drive::drive()));
         r
     }
 

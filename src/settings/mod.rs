@@ -5,6 +5,7 @@
 //! race the poller or the tray menu.
 
 pub mod assets;
+pub mod migrate;
 pub mod packages;
 pub mod spaces;
 pub mod updates;
@@ -142,6 +143,7 @@ impl Settings {
             )
             .route("/api/processors/:name/fires", get(processor_fires_api))
             .route("/api/spaces", get(spaces::list).post(spaces::create))
+            .route("/api/migrate/groups", post(migrate::groups))
             .route("/api/spaces/:name/action", post(spaces::action))
             .route("/api/spaces/:name/apps", post(spaces::enable_app))
             .route("/api/spaces/:name/apps/:app", delete(spaces::disable_app))

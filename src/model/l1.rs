@@ -302,7 +302,7 @@ impl Model for L1 {
         for p in self.pre_list(action.kind.as_str()) {
             // Quorum is declared here but checked by the store (it needs the
             // group's state, a different document).
-            if is_quorum(p) {
+            if is_quorum(p) || is_space_member(p) {
                 continue;
             }
             self.eval_precond(state, action, p, 0)?;
@@ -350,6 +350,14 @@ impl Model for L1 {
 
     fn quorum(&self, kind: &str) -> Option<QuorumSpec> {
         self.pre_list(kind).iter().copied().find_map(parse_quorum)
+    }
+    fn requires_space_member(&self, kind: &str) -> Option<String> {
+        self.pre_list(kind).iter().find_map(|p| {
+            let v = p.get("space-member")?;
+            // `{"space-member": true}` means members; `{"space-member":
+            // "managers"}` names a different list on the space.
+            Some(v.as_str().unwrap_or("members").to_string())
+        })
     }
     fn authorize(&self, state: &Doc, action: &Action) -> Result<(), Reject> {
         // The model declares per-kind authorization rules (optional). A rule
@@ -451,6 +459,13 @@ fn string_arg(arg: &Value, key: &str) -> Result<String, Reject> {
     arg.as_str()
         .map(str::to_string)
         .ok_or_else(|| Reject::Precondition(format!("'{key}' requires a string argument")))
+}
+
+/// `{"space-member": true}` -- declared by the model, checked by the store.
+fn is_space_member(p: &Value) -> bool {
+    p.as_object()
+        .map(|o| o.contains_key("space-member"))
+        .unwrap_or(false)
 }
 
 fn is_quorum(p: &Value) -> bool {

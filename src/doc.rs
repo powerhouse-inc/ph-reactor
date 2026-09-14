@@ -31,6 +31,24 @@ impl DocId {
             .map(Self)
             .map_err(|e| format!("invalid doc id '{s}': {e}"))
     }
+
+    /// A stable id derived from `seed`.
+    ///
+    /// Migration needs this: the laptop and the cluster both hold the same
+    /// group, and if each generated a fresh id for its replacement space they
+    /// would produce two spaces that never reconcile -- a permanent fork of
+    /// the thing being migrated. Deriving the id from the old document's id
+    /// makes the migration idempotent and makes running it twice, anywhere, a
+    /// no-op instead of a split.
+    pub fn derived(seed: &str) -> Self {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(seed.as_bytes());
+        let d = h.finalize();
+        let mut b = [0u8; 16];
+        b.copy_from_slice(&d[..16]);
+        Self(Uuid::from_bytes(b))
+    }
 }
 
 impl Default for DocId {

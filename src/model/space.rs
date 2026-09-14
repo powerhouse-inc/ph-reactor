@@ -153,8 +153,13 @@ pub fn visibility_of(doc: &crate::doc::Doc) -> String {
 
 /// The members named by a space document.
 pub fn members_of(doc: &crate::doc::Doc) -> Vec<String> {
+    list_of(doc, "members")
+}
+
+/// One of a space document's principal lists, by field name.
+pub fn list_of(doc: &crate::doc::Doc, field: &str) -> Vec<String> {
     doc.fields
-        .get("members")
+        .get(field)
         .and_then(|f| f.value.as_array())
         .map(|a| {
             a.iter()

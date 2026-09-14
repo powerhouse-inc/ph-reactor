@@ -573,12 +573,26 @@ impl Store {
     /// reading the document that names you would require already being able
     /// to read it.
     pub fn create_space(&self, name: &str, payload: &serde_json::Value) -> Result<DocId, String> {
+        self.create_space_at(DocId::new(), name, payload)
+    }
+
+    /// Create a space at a chosen id. Migration uses this with
+    /// [`DocId::derived`] so the same group becomes the same space on every
+    /// node that migrates it.
+    pub fn create_space_at(
+        &self,
+        id: DocId,
+        name: &str,
+        payload: &serde_json::Value,
+    ) -> Result<DocId, String> {
         Store::validate_name(name)?;
         let mut inner = self.inner.lock();
         if inner.names.contains_key(name) {
             return Err(format!("a doc named {name} already exists"));
         }
-        let id = DocId::new();
+        if inner.entries.contains_key(&id) {
+            return Err(format!("a doc with id {id} already exists"));
+        }
         let mut entry = Entry::new(id);
         entry.space = Some(id);
         inner.entries.insert(id, entry);
@@ -1214,6 +1228,31 @@ impl Inner {
         if let Some(entry) = self.entries.get(&action.doc_id) {
             if let Err(r) = model.authorize(&entry.doc, action) {
                 return self.reject(action, &r.describe());
+            }
+        }
+        // 3c-bis. Space membership. Declared by the model, checked here
+        //     because it needs the *space* document's state -- exactly the
+        //     arrangement quorum uses. This is how an app inherits its space's
+        //     members instead of carrying its own copy of them.
+        if let Some(list) = model.requires_space_member(action.kind.as_str()) {
+            let Some(space_id) = action
+                .space
+                .or_else(|| self.entries.get(&action.doc_id).and_then(|e| e.space))
+            else {
+                return self.reject(action, "this reducer requires a space, and the document has none");
+            };
+            let members = match self.entries.get(&space_id) {
+                Some(e) => crate::model::space::list_of(&e.doc, &list),
+                // Refusing a write because the space document has not arrived
+                // is recoverable -- the writer retries. Allowing it because we
+                // could not check is not.
+                None => return self.reject(action, "the space document is not here yet"),
+            };
+            if !members.iter().any(|m| m == &action.origin) {
+                return self.reject(
+                    action,
+                    &format!("actor {} is not in this space's {list}", action.origin),
+                );
             }
         }
         // 3d. Space binding. A document's space is decided by its first action
@@ -2870,5 +2909,110 @@ mod tests {
 
         let members = s.summary_for("alice");
         assert!(members.contains_key(&prot_doc), "a member still syncs it");
+    }
+
+    /// The point of a space: an app does not carry its own access list, it
+    /// inherits the space's. A member may post to a channel in that space; a
+    /// non-member may not -- and `chat@1` says nothing about either of them.
+    #[test]
+    fn an_app_inherits_its_spaces_membership() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let (space_id, _) = seed_space(&s, "protected", &["alice", "bob"], "alice", &k);
+
+        let chat_id = DocId::new();
+        let mk = |kind: &str, payload: serde_json::Value, who: &str, ts: u64, n: u64| {
+            let mut a = Action {
+                doc_id: chat_id,
+                model: ModelRef::new("chat", "1"),
+                kind: kind.into(),
+                payload,
+                ts,
+                clock: clock1(who, n),
+                origin: who.into(),
+                cosig: Vec::new(),
+                sig: [0; 64],
+                prev_hash: None,
+                space: Some(space_id),
+            };
+            let mb = a.message_bytes();
+            a.sig = k.sign(&mb).to_bytes();
+            a
+        };
+
+        s.apply_remote_action(&mk(
+            "init",
+            serde_json::json!({ "name": "general", "channel": "general" }),
+            "alice",
+            2000,
+            2,
+        ))
+        .expect("a member opens a channel");
+
+        s.apply_remote_action(&mk(
+            "post",
+            serde_json::json!({ "text": "hello" }),
+            "bob",
+            2001,
+            1,
+        ))
+        .expect("another member posts");
+
+        let err = match s.apply_remote_action(&mk(
+            "post",
+            serde_json::json!({ "text": "let me in" }),
+            "mallory",
+            2002,
+            1,
+        )) {
+            Err(e) => e,
+            Ok(_) => panic!("a non-member must not be able to post"),
+        };
+        assert!(
+            err.contains("members"),
+            "the refusal names the space's list: {err}"
+        );
+
+        let texts: Vec<String> = s
+            .get("general")
+            .unwrap()
+            .fields
+            .get("msg_text")
+            .and_then(|f| f.value.as_array().cloned())
+            .unwrap_or_default()
+            .iter()
+            .filter_map(|v| v.as_str().map(str::to_string))
+            .collect();
+        assert_eq!(texts, vec!["hello".to_string()]);
+    }
+
+    /// Refusing because we cannot check is recoverable; allowing because we
+    /// cannot check is not.
+    #[test]
+    fn a_write_is_refused_while_the_space_document_is_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (s, k) = space_store(dir.path());
+        let absent = DocId::new();
+        let chat_id = DocId::new();
+        let mut a = Action {
+            doc_id: chat_id,
+            model: ModelRef::new("chat", "1"),
+            kind: "init".into(),
+            payload: serde_json::json!({ "name": "ghost", "channel": "general" }),
+            ts: 2000,
+            clock: clock1("alice", 1),
+            origin: "alice".into(),
+            cosig: Vec::new(),
+            sig: [0; 64],
+            prev_hash: None,
+            space: Some(absent),
+        };
+        let mb = a.message_bytes();
+        a.sig = k.sign(&mb).to_bytes();
+        let err = match s.apply_remote_action(&a) {
+            Err(e) => e,
+            Ok(_) => panic!("must not apply against a space we do not have"),
+        };
+        assert!(err.contains("space"), "{err}");
     }
 }
