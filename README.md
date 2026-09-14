@@ -97,6 +97,19 @@ Or seed the DHT without pinning a drive, by adding it to `p2p.bootstraps` in
 the IP directly: libp2p dials it without a DNS round trip, and the address is
 a stable Hetzner load-balancer IP.
 
+**If your network blocks outbound 25422**, the same node is reachable over
+WebSocket-Secure on 443, which almost nothing blocks:
+
+```sh
+ph-reactor drive add \
+  /dns4/ws.reactor.vetra.io/tcp/443/tls/ws/p2p/12D3KooWPTgWt8RdEdD23qDpkUM3vNeXebm7u2E7XAvhWi5Htdeg \
+  --name "Powerhouse"
+```
+
+Both addresses reach the same peer id, so pick whichever your network allows —
+there is no need to configure both. (If you do configure both, libp2p opens a
+single connection per peer, so only one drive will show as `synced`.)
+
 The node listens on **TCP 25422**, not the 4201 default. 25422 sits in IANA's
 explicitly-unassigned `25101-25470` block, inside RFC 6335's User range, and
 below the Linux ephemeral floor of 32768 — so a fixed listener there cannot
