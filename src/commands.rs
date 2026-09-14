@@ -75,6 +75,21 @@ pub enum Command {
         /// The governing model, as a `name@version` ref.
         model: String,
         payload: Value,
+        /// The space this document belongs to, by name. `None` creates a
+        /// document with no space, which replicates to everyone -- see the
+        /// spaces design doc on why there is no safe default here.
+        space: Option<String>,
+        reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
+    },
+    /// Create a `space@1` document: the unit of access. Separate from
+    /// `CreateDocModel` because a space document lives in itself, which the
+    /// generic path cannot express.
+    CreateSpace {
+        name: String,
+        /// `public`, `protected` or `private`. Fixed for the life of the space.
+        visibility: String,
+        members: Vec<String>,
+        managers: Vec<String>,
         reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
     /// Generate a signed invite (the daemon's identity + a challenge) for a

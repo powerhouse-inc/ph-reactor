@@ -537,16 +537,59 @@ impl Store {
         model: &ModelRef,
         payload: &serde_json::Value,
     ) -> Result<DocId, String> {
+        self.create_doc_in_space(name, model, payload, None)
+    }
+
+    /// Create a document that lives in `space`.
+    ///
+    /// The space is stamped on the entry before the `init` action is built, so
+    /// `build_action` signs it into the first action -- which is what makes the
+    /// binding immutable afterwards.
+    pub fn create_doc_in_space(
+        &self,
+        name: &str,
+        model: &ModelRef,
+        payload: &serde_json::Value,
+        space: Option<DocId>,
+    ) -> Result<DocId, String> {
         Store::validate_name(name)?;
         let mut inner = self.inner.lock();
         if inner.names.contains_key(name) {
             return Err(format!("a doc named {name} already exists"));
         }
         let id = DocId::new();
-        inner.entries.insert(id, Entry::new(id));
+        let mut entry = Entry::new(id);
+        entry.space = space;
+        inner.entries.insert(id, entry);
         let action = inner.build_action(id, model, "init", payload)?;
         inner.apply_action(&action)?;
         Ok(id)
+    }
+
+    /// Create a space document, which lives in itself.
+    ///
+    /// Self-reference is not a trick: it is what lets a member be told they
+    /// are a member. Any other arrangement makes the ACL circular, because
+    /// reading the document that names you would require already being able
+    /// to read it.
+    pub fn create_space(&self, name: &str, payload: &serde_json::Value) -> Result<DocId, String> {
+        Store::validate_name(name)?;
+        let mut inner = self.inner.lock();
+        if inner.names.contains_key(name) {
+            return Err(format!("a doc named {name} already exists"));
+        }
+        let id = DocId::new();
+        let mut entry = Entry::new(id);
+        entry.space = Some(id);
+        inner.entries.insert(id, entry);
+        let action = inner.build_action(id, &ModelRef::new("space", "1"), "init", payload)?;
+        inner.apply_action(&action)?;
+        Ok(id)
+    }
+
+    /// The space a document belongs to, if any.
+    pub fn space_of(&self, id: DocId) -> Option<DocId> {
+        self.inner.lock().entries.get(&id)?.space
     }
 
     pub fn update_field(

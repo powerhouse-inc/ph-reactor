@@ -937,10 +937,20 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
             name,
             model,
             payload,
+            space,
             reply,
-        } => match crate::doc::ModelRef::parse(&model)
-            .and_then(|mr| ctx.store.create_doc_model(&name, &mr, &payload).map(|_| ()))
-        {
+        } => match crate::doc::ModelRef::parse(&model).and_then(|mr| {
+            let space_id = match &space {
+                Some(s) => match ctx.store.get(s) {
+                    Some(d) => Some(d.id),
+                    None => return Err(format!("no space named '{s}'")),
+                },
+                None => None,
+            };
+            ctx.store
+                .create_doc_in_space(&name, &mr, &payload, space_id)
+                .map(|_| ())
+        }) {
             Ok(()) => {
                 ctx.last_doc = Some(name.clone());
                 ctx.last_event = Some(format!("created {name} ({model})"));
@@ -952,6 +962,31 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
                 let _ = reply.send(Err(e));
             }
         },
+        Command::CreateSpace {
+            name,
+            visibility,
+            members,
+            managers,
+            reply,
+        } => {
+            let payload = serde_json::json!({
+                "name": name,
+                "visibility": visibility,
+                "members": members,
+                "managers": managers,
+            });
+            match ctx.store.create_space(&name, &payload) {
+                Ok(_) => {
+                    ctx.last_event = Some(format!("created space {name} ({visibility})"));
+                    tracing::info!("created space {name} ({visibility})");
+                    let _ = reply.send(Ok(()));
+                }
+                Err(e) => {
+                    tracing::warn!("space create '{name}' failed: {e}");
+                    let _ = reply.send(Err(e));
+                }
+            }
+        }
         Command::Invite { groups, reply } => {
             // What the JOINER will dial. A configured external address wins
             // over the bind address: behind a load balancer or reverse proxy

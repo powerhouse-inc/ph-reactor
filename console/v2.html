@@ -67,6 +67,14 @@
   }
   .brand .name { font-weight: 700; letter-spacing: 0.04em; font-size: 15px; }
   .brand .name small { display: block; font-weight: 500; color: var(--dim); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; }
+  .space-switch { padding: 10px 14px 12px; border-bottom: 1px solid rgba(120,140,200,0.12); margin-bottom: 8px; }
+  .space-switch label { display: block; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.55; margin-bottom: 4px; }
+  .space-switch select { width: 100%; background: rgba(120,140,200,0.08); color: var(--text); border: 1px solid rgba(120,140,200,0.18); border-radius: 6px; padding: 5px 7px; font: inherit; font-size: 12px; }
+  .space-meaning { font-size: 10.5px; line-height: 1.45; opacity: 0.6; margin-top: 6px; }
+  .tier { display: inline-block; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 1px 6px; border-radius: 999px; border: 1px solid rgba(120,140,200,0.3); opacity: 0.85; }
+  .tier.public { color: var(--cyan); }
+  .tier.protected { color: #e8c07d; }
+  .tier.private { color: #e88; }
   .nav-item {
     display: flex; align-items: center; gap: 11px;
     padding: 9px 12px; border-radius: 10px; cursor: pointer;
@@ -294,7 +302,13 @@
       <div class="logo">R</div>
       <div class="name">Reactor<small>local console</small></div>
     </div>
+    <div class="space-switch">
+      <label for="space-pick">space</label>
+      <select id="space-pick"><option value="">no space</option></select>
+      <div class="space-meaning" id="space-meaning"></div>
+    </div>
     <div class="nav-item active" data-tab="overview"><span class="ico">◈</span> Home</div>
+    <div class="nav-item" data-tab="spaces"><span class="ico">⬢</span> Spaces</div>
     <div class="nav-item" data-tab="groups"><span class="ico">⬡</span> Groups</div>
     <div class="nav-item" data-tab="plugins"><span class="ico">▣</span> Plugins</div>
     <div class="nav-item" data-tab="settings"><span class="ico">⚙</span> Settings</div>
@@ -345,6 +359,7 @@ function toast(msg, isErr = false) {
 const state = { tab: "overview", fireCursor: {}, lastFire: {} };
 const TITLES = {
   overview: ["Home", "peers, live activity, and your subscriptions"],
+  spaces: ["Spaces", "who can read, and which apps run there — a space's tier is fixed when it is made"],
   groups: ["Groups", "shared spaces — channels and a folder drive, signed and synced over the mesh"],
   plugins: ["Plugins", "applications published to the mesh — verified, sandboxed, installed by your decision"],
   settings: ["Settings", "drive, identity, and LLM configuration"],
@@ -1591,9 +1606,16 @@ async function renderPluginNav() {
   let inst = [];
   try { inst = await get("/api/plugins"); } catch { host.innerHTML = ""; return; }
 
+  // Only the apps enabled in the space you are looking at. With no space
+  // selected every installed app is offered, which is what a node with no
+  // spaces yet should do rather than showing an empty sidebar.
+  const sp = SPACES.find((x) => x.name === CURRENT_SPACE);
+  const enabled = sp ? new Set(sp.apps.map((a) => a.name)) : null;
+
   const items = [];
   for (const p of inst) {
     if (!p.hasEditor) continue;
+    if (enabled && !enabled.has(p.name)) continue;
     const nav = Array.isArray(p.nav) && p.nav.length
       ? p.nav
       // A plugin that declares nothing still gets one entry under its own
@@ -1688,11 +1710,11 @@ function openPlugin(name, installed, view) {
     const reply = (out) => { try { frame.contentWindow.postMessage({ id: m.id, ...out }, "*"); } catch {} };
     try {
       if (m.op === "query") {
-        reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/query`, { model: m.model, filter: m.filter ?? null }) });
+        reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/query`, { model: m.model, filter: m.filter ?? null, space: currentSpace() }) });
       } else if (m.op === "history") {
         reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/history`, { model: m.model, name: m.name, limit: m.limit ?? 50 }) });
       } else if (m.op === "action") {
-        reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/action`, { model: m.model, kind: m.kind, name: m.name, payload: m.payload ?? {} }) });
+        reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/action`, { model: m.model, kind: m.kind, name: m.name, payload: m.payload ?? {}, space: currentSpace() }) });
       } else if (m.op === "host") {
         // Handshake: the plugin learns who it is and which theme to wear. No
         // node identity, no peer list, no configuration -- a plugin has no
@@ -1717,8 +1739,161 @@ function openPlugin(name, installed, view) {
 function closeBridge() { if (bridgeOff) { bridgeOff(); bridgeOff = null; } }
 
 /* ============================ DISPATCH ============================ */
+
+/* ---- spaces -----------------------------------------------------------
+ *
+ * A space is the unit of access; an app is the unit of schema and UI. The
+ * switcher above the nav decides which space you are looking at, and the
+ * plugin entries below it are the apps enabled *in that space* -- so Achra
+ * appears when you are in the commons, and contributor billing appears in the
+ * client space where it was enabled.
+ *
+ * The current space is remembered per browser, not per node: it is a view
+ * preference, not state anyone else needs to agree with.
+ */
+/* What each tier actually guarantees, in the words the operator needs.
+ *
+ * Not decoration. "Protected" reads like a private Slack channel and is not
+ * one: every member holds a full plaintext replica, and anyone who ever had
+ * access keeps what they saw. Someone will otherwise put payroll in one. The
+ * daemon returns the same sentences on /api/spaces; these are here so the
+ * creation form can show them before the space exists.
+ */
+const TIER_MEANING = {
+  public: "Anyone on the mesh can read this. Managers manage it.",
+  protected: "Only members can read this. Every member holds a full, unencrypted copy, "
+    + "so anyone who ever had access keeps what they saw \u2014 removing someone stops new "
+    + "data reaching them, it does not take back the old.",
+  private: "Only this node can read this. It is never sent anywhere, which also means "
+    + "there is no copy of it anywhere else if this machine is lost.",
+};
+
+let SPACES = [];
+let CURRENT_SPACE = localStorage.getItem("ph.space") || "";
+
+function currentSpace() { return CURRENT_SPACE || null; }
+
+async function loadSpaces() {
+  try { SPACES = await get("/api/spaces"); } catch { SPACES = []; }
+  // A remembered space that no longer exists must not silently scope every
+  // query to nothing.
+  if (CURRENT_SPACE && !SPACES.some((s) => s.name === CURRENT_SPACE)) {
+    CURRENT_SPACE = "";
+    localStorage.removeItem("ph.space");
+  }
+  const pick = $("#space-pick");
+  if (!pick) return;
+  pick.innerHTML = `<option value="">no space</option>`
+    + SPACES.map((s) => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join("");
+  pick.value = CURRENT_SPACE;
+  pick.onchange = () => {
+    CURRENT_SPACE = pick.value;
+    if (CURRENT_SPACE) localStorage.setItem("ph.space", CURRENT_SPACE);
+    else localStorage.removeItem("ph.space");
+    showSpaceMeaning();
+    renderPluginNav();
+    render();
+  };
+  showSpaceMeaning();
+}
+
+/* The tier's actual guarantee, always in view while you are inside it.
+   "Protected" reads like a private channel and is not one; saying so once at
+   creation time is not enough, because the person reading a document later is
+   usually not the person who made the space. */
+function showSpaceMeaning() {
+  const el = $("#space-meaning");
+  if (!el) return;
+  const s = SPACES.find((x) => x.name === CURRENT_SPACE);
+  el.textContent = s ? s.meaning : "";
+}
+
+async function renderSpaces() {
+  await loadSpaces();
+  let plugins = [];
+  try { plugins = await get("/api/plugins"); } catch {}
+
+  const el = document.createElement("div");
+  el.innerHTML = head("spaces") + `
+  <div class="grid g-2fr">
+    <div class="card">
+      <h3>Spaces <span class="muted" style="font-size:12px;font-weight:400">the unit of access — everything inside one is an app</span></h3>
+      <div id="sp-list"></div>
+    </div>
+    <div class="card"><h3>Create a space</h3>
+      <label class="field"><span>name</span><input id="sp-name" placeholder="acme-client"></label>
+      <label class="field"><span>who can read it</span>
+        <select id="sp-vis">
+          <option value="protected">protected — members only</option>
+          <option value="public">public — anyone on the mesh</option>
+          <option value="private">private — this node only</option>
+        </select>
+      </label>
+      <div class="muted" style="font-size:12px;line-height:1.5;margin-bottom:10px" id="sp-hint"></div>
+      <div class="muted" style="font-size:12px;margin-bottom:10px"><strong>This cannot be changed later.</strong>
+        Opening a space up would disclose everything ever written in it; closing one is meaningless once the data is on every node.</div>
+      <button class="btn primary" id="sp-create">+ Create space</button>
+    </div>
+  </div>`;
+  $("#content").replaceChildren(el);
+
+  const vis = $("#sp-vis"), hint = $("#sp-hint");
+  const showHint = () => { hint.textContent = TIER_MEANING[vis.value] || ""; };
+  vis.onchange = showHint;
+  showHint();
+
+  const load = () => {
+    const box = $("#sp-list");
+    box.innerHTML = SPACES.length
+      ? SPACES.map((sp) => `
+        <div class="card" style="margin-bottom:10px">
+          <div style="display:flex;align-items:center;gap:8px">
+            <strong class="doc-name">${esc(sp.name)}</strong>
+            <span class="tier ${esc(sp.visibility)}">${esc(sp.visibility)}</span>
+          </div>
+          <div class="muted" style="font-size:12px;line-height:1.5;margin:6px 0">${esc(sp.meaning)}</div>
+          <div class="muted" style="font-size:12px">${sp.members.length} member(s) · ${sp.apps.length} app(s) enabled</div>
+          <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">
+            ${plugins.length ? plugins.map((p) => {
+              const on = sp.apps.some((a) => a.name === p.name);
+              return `<button class="btn${on ? " primary" : ""}" style="font-size:11px;padding:3px 8px"
+                data-space="${esc(sp.name)}" data-app="${esc(p.name)}" data-on="${on ? "1" : ""}"
+                >${on ? "✓ " : "+ "}${esc(p.name)}</button>`;
+            }).join("") : `<span class="muted" style="font-size:12px">No apps installed on this node yet.</span>`}
+          </div>
+        </div>`).join("")
+      : `<div class="empty"><div class="big">⬢</div>No spaces yet. Create one, then enable the apps that belong in it.</div>`;
+
+    $$("#sp-list [data-app]").forEach((b) => (b.onclick = async () => {
+      const sp = encodeURIComponent(b.dataset.space), app = encodeURIComponent(b.dataset.app);
+      try {
+        if (b.dataset.on) await del(`/api/spaces/${sp}/apps/${app}`);
+        else await post(`/api/spaces/${sp}/apps`, { app: b.dataset.app });
+        toast(b.dataset.on ? "disabled in " + b.dataset.space : "enabled in " + b.dataset.space);
+        await loadSpaces();
+        load();
+        renderPluginNav();
+      } catch (e) { toast(e.message, true); }
+    }));
+  };
+  load();
+
+  $("#sp-create").onclick = async () => {
+    const name = $("#sp-name").value.trim();
+    if (!name) return toast("a name is required", true);
+    try {
+      await post("/api/spaces", { name, visibility: vis.value, members: [], managers: [] });
+      toast("created " + vis.value + " space " + name);
+      await loadSpaces();
+      load();
+      renderPluginNav();
+    } catch (e) { toast(e.message, true); }
+  };
+}
+
 const RENDER = {
   overview: renderOverview,
+  spaces: renderSpaces,
   documents: renderDocuments,
   types: renderTypes,
   folders: renderFolders,
@@ -1731,7 +1906,7 @@ function render() { closeBridge(); (RENDER[state.tab] || renderOverview)(); }
 
 $$(".nav-item").forEach((n) => (n.onclick = () => switchTab(n.dataset.tab)));
 window.addEventListener("hashchange", applyRoute);
-renderPluginNav();
+loadSpaces().then(renderPluginNav);
 applyRoute();
 renderUpdateBanner();
 setInterval(renderUpdateBanner, 5 * 60 * 1000);

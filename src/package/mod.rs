@@ -134,7 +134,7 @@ impl PluginUi {
 /// look exactly like the real one.
 const RESERVED_NAV_LABELS: &[&str] = &[
     "home", "groups", "plugins", "settings", "profile", "reactor", "documents", "types",
-    "folders", "overview",
+    "folders", "overview", "spaces", "space",
 ];
 
 /// At most this many entries per plugin. A sidebar is a shared surface; one

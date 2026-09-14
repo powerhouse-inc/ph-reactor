@@ -6,6 +6,7 @@
 
 pub mod assets;
 pub mod packages;
+pub mod spaces;
 pub mod updates;
 
 use std::collections::BTreeMap;
@@ -140,6 +141,11 @@ impl Settings {
                 put(processor_update_api).delete(processor_remove_api),
             )
             .route("/api/processors/:name/fires", get(processor_fires_api))
+            .route("/api/spaces", get(spaces::list).post(spaces::create))
+            .route("/api/spaces/:name/action", post(spaces::action))
+            .route("/api/spaces/:name/apps", post(spaces::enable_app))
+            .route("/api/spaces/:name/apps/:app", delete(spaces::disable_app))
+            .route("/api/spaces/:name/docs", post(spaces::add_doc))
             .route("/api/groups", get(groups_api).post(create_group))
             .route("/api/groups/:name", get(group_detail))
             .route("/api/groups/:name/drive", get(drive_list).post(drive_add))
@@ -858,6 +864,19 @@ async fn run_create_doc_model(
     model: &str,
     payload: Value,
 ) -> Response {
+    run_create_doc_in_space(state, name, model, payload, None).await
+}
+
+/// Create a document that belongs to a space. `space` is a space document's
+/// name; `None` creates a document with no space, which replicates to every
+/// peer exactly as documents did before spaces existed.
+pub(super) async fn run_create_doc_in_space(
+    state: &axum::extract::State<Arc<Settings>>,
+    name: &str,
+    model: &str,
+    payload: Value,
+    space: Option<String>,
+) -> Response {
     if !valid_name(name) {
         return (
             StatusCode::BAD_REQUEST,
@@ -870,6 +889,7 @@ async fn run_create_doc_model(
         name: name.to_string(),
         model: model.to_string(),
         payload,
+        space,
         reply,
     };
     if state.cmd_tx.send(cmd).is_err() {
@@ -1041,6 +1061,9 @@ struct PluginQueryBody {
     model: String,
     #[serde(default)]
     filter: Option<crate::query::FieldFilter>,
+    /// The space the plugin is open in. Results are confined to it.
+    #[serde(default)]
+    space: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -1051,6 +1074,9 @@ struct PluginActionBody {
     name: String,
     #[serde(default)]
     payload: Value,
+    /// The space the plugin is open in. A document it creates lands here.
+    #[serde(default)]
+    space: Option<String>,
 }
 
 /// Looks up an installed package. `None` means not installed.
@@ -1106,8 +1132,32 @@ async fn plugin_query(
         )
             .into_response();
     }
+    // A capability says *what* a plugin may read; the space says *where*.
+    // Without the second half a capability is node-wide, and a billing plugin
+    // open in one client's space could read another client's invoices -- same
+    // model, same node, different space.
+    if let Some(space) = &body.space {
+        if !spaces::app_enabled_in(&state, space, &name) {
+            tracing::warn!("plugin {name} read in space '{space}' where it is not enabled");
+            return (
+                StatusCode::FORBIDDEN,
+                format!("'{name}' is not enabled in this space"),
+            )
+                .into_response();
+        }
+    }
     let model = body.model.split('@').next().unwrap_or_default().to_string();
-    let docs = crate::query::query_docs(&state.store, &model, body.filter.as_ref());
+    let mut docs = crate::query::query_docs(&state.store, &model, body.filter.as_ref());
+    if let Some(space) = &body.space {
+        let space_id = state.store.get(space).map(|d| d.id);
+        docs.retain(|d| {
+            d.get("id")
+                .and_then(|v| v.as_str())
+                .and_then(|s| crate::doc::DocId::parse(s).ok())
+                .and_then(|id| state.store.space_of(id))
+                == space_id
+        });
+    }
     (StatusCode::OK, axum::Json(docs)).into_response()
 }
 
@@ -1140,6 +1190,16 @@ async fn plugin_action(
         )
             .into_response();
     }
+    if let Some(space) = &body.space {
+        if !spaces::app_enabled_in(&state, space, &name) {
+            tracing::warn!("plugin {name} wrote in space '{space}' where it is not enabled");
+            return (
+                StatusCode::FORBIDDEN,
+                format!("'{name}' is not enabled in this space"),
+            )
+                .into_response();
+        }
+    }
     // `init` creates a document; every other kind acts on an existing one.
     if body.kind == "init" {
         let mut payload = body.payload.clone();
@@ -1152,7 +1212,10 @@ async fn plugin_action(
         {
             payload["name"] = json!(body.name);
         }
-        return run_create_doc_model(&state, &body.name, &body.model, payload).await;
+        // Created in the space the plugin is open in, so the document is born
+        // with the access it should have rather than being moved later --
+        // which the signed, immutable binding makes impossible anyway.
+        return run_create_doc_in_space(&state, &body.name, &body.model, payload, body.space).await;
     }
     run_create_action(&state, &body.name, &body.model, &body.kind, body.payload).await
 }
@@ -2395,6 +2458,57 @@ mod console_tests {
     /// preventDefault and posts over the bridge silently does nothing. That
     /// failure is invisible -- no exception, no request, just a form that never
     /// fires -- which is exactly how it was found.
+    /// Every bridge call carries the space the plugin is open in. Without it
+    /// the daemon falls back to node-wide scope and a plugin open in one
+    /// client's space reads another client's documents of the same model.
+    #[test]
+    fn the_bridge_tells_the_daemon_which_space_it_is_in() {
+        for endpoint in ["/query", "/action"] {
+            let line = PAGE_V2
+                .lines()
+                .find(|l| l.contains(&format!("/api/plugins/${{encodeURIComponent(name)}}{endpoint}")))
+                .unwrap_or_else(|| panic!("the bridge posts to {endpoint}"));
+            assert!(
+                line.contains("space: currentSpace()"),
+                "{endpoint} must carry the space: {line}"
+            );
+        }
+    }
+
+    /// The console must not describe "protected" in a way that reads like a
+    /// private Slack channel. Every member holds a full plaintext replica and
+    /// keeps it after removal; if the wording ever loses that, someone puts
+    /// payroll in one.
+    #[test]
+    fn the_protected_tier_says_what_it_actually_guarantees() {
+        let i = PAGE_V2
+            .find("const TIER_MEANING")
+            .expect("the console defines the tier wording");
+        let block = &PAGE_V2[i..i + 900];
+        assert!(
+            block.contains("unencrypted"),
+            "protected must say the copies are unencrypted: {block}"
+        );
+        assert!(
+            block.contains("keeps what they saw"),
+            "protected must say removal is not retroactive: {block}"
+        );
+        assert!(
+            block.contains("no copy of it anywhere else"),
+            "private must say it removes the implicit backup: {block}"
+        );
+    }
+
+    /// A space's tier is fixed at creation, and the form has to say so before
+    /// the choice is made rather than after.
+    #[test]
+    fn the_create_form_warns_that_the_tier_is_permanent() {
+        assert!(
+            PAGE_V2.contains("This cannot be changed later."),
+            "the space creation form must say the tier is permanent"
+        );
+    }
+
     #[test]
     fn the_plugin_iframe_sandbox_is_exactly_right() {
         let line = PAGE_V2
