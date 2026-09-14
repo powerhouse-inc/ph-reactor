@@ -107,9 +107,12 @@ impl Plan {
     }
 }
 
-fn plan_for(doc: &Value) -> Option<Plan> {
+/// `group_id` is passed in rather than read from `doc`: the query projection
+/// carries `name`, `model` and `fields` but no id, and reading it from there
+/// produced a plan for every group silently -- zero plans, "nothing to
+/// migrate", no error. Found by running it against a real daemon.
+fn plan_for(doc: &Value, group_id: String) -> Option<Plan> {
     let group = doc.get("name")?.as_str()?.to_string();
-    let group_id = doc.get("id")?.as_str()?.to_string();
     let members = strs(doc, "members");
     let managers = strs(doc, "managers");
 
@@ -163,7 +166,11 @@ pub async fn groups(
             Some(g) => d.get("name").and_then(|v| v.as_str()) == Some(g.as_str()),
             None => true,
         })
-        .filter_map(plan_for)
+        .filter_map(|d| {
+            let name = d.get("name")?.as_str()?;
+            let id = state.store.get(name)?.id.to_string();
+            plan_for(d, id)
+        })
         .collect();
 
     if !body.apply {
@@ -250,10 +257,13 @@ async fn apply_one(state: &Arc<Settings>, p: &Plan) -> Result<(), String> {
 mod tests {
     use super::*;
 
-    fn group_doc(name: &str, id: &str) -> Value {
+    /// Exactly what `query_docs` returns: name, model, fields -- and no id.
+    /// The shape matters; assuming an id here is what shipped a migration that
+    /// found nothing.
+    fn group_doc(name: &str) -> Value {
         json!({
             "name": name,
-            "id": id,
+            "model": { "name": "group", "version": "1" },
             "fields": {
                 "members": ["alice", "bob"],
                 "managers": ["alice"],
@@ -268,9 +278,21 @@ mod tests {
         })
     }
 
+    /// The projection a real daemon returns has no id. If this ever gains one,
+    /// the fixture has drifted from reality and these tests stop proving
+    /// anything about the running system.
+    #[test]
+    fn the_query_projection_carries_no_document_id() {
+        let d = group_doc("core");
+        assert!(
+            d.get("id").is_none(),
+            "query_docs returns name/model/fields only: {d}"
+        );
+    }
+
     #[test]
     fn a_plan_names_every_document_it_would_create_and_the_one_it_deletes() {
-        let p = plan_for(&group_doc("core", "11111111-1111-1111-1111-111111111111")).unwrap();
+        let p = plan_for(&group_doc("core"), "11111111-1111-1111-1111-111111111111".into()).unwrap();
         let d = p.describe();
         assert_eq!(d["creates"]["space"]["visibility"], "protected");
         assert_eq!(d["creates"]["chats"].as_array().unwrap().len(), 2);
@@ -280,7 +302,7 @@ mod tests {
 
     #[test]
     fn messages_are_counted_per_channel() {
-        let p = plan_for(&group_doc("core", "11111111-1111-1111-1111-111111111111")).unwrap();
+        let p = plan_for(&group_doc("core"), "11111111-1111-1111-1111-111111111111".into()).unwrap();
         let general = p.chats.iter().find(|(_, c, _)| c == "general").unwrap();
         let ops = p.chats.iter().find(|(_, c, _)| c == "ops").unwrap();
         assert_eq!(general.2, 2);
@@ -291,11 +313,11 @@ mod tests {
     /// migration forks the thing it is migrating.
     #[test]
     fn the_space_id_is_derived_from_the_group_not_minted() {
-        let a = plan_for(&group_doc("core", "11111111-1111-1111-1111-111111111111")).unwrap();
-        let b = plan_for(&group_doc("core", "11111111-1111-1111-1111-111111111111")).unwrap();
+        let a = plan_for(&group_doc("core"), "11111111-1111-1111-1111-111111111111".into()).unwrap();
+        let b = plan_for(&group_doc("core"), "11111111-1111-1111-1111-111111111111".into()).unwrap();
         assert_eq!(a.space_id, b.space_id);
 
-        let other = plan_for(&group_doc("core", "22222222-2222-2222-2222-222222222222")).unwrap();
+        let other = plan_for(&group_doc("core"), "22222222-2222-2222-2222-222222222222".into()).unwrap();
         assert_ne!(
             a.space_id, other.space_id,
             "different groups must not collide"
@@ -305,10 +327,10 @@ mod tests {
     /// A group written before channels existed keeps its messages.
     #[test]
     fn an_untagged_group_migrates_into_general() {
-        let mut d = group_doc("old", "33333333-3333-3333-3333-333333333333");
+        let mut d = group_doc("old");
         d["fields"]["channels"] = json!([]);
         d["fields"]["msg_channel"] = json!([]);
-        let p = plan_for(&d).unwrap();
+        let p = plan_for(&d, "33333333-3333-3333-3333-333333333333".into()).unwrap();
         assert_eq!(p.chats.len(), 1);
         assert_eq!(p.chats[0].1, "general");
         assert_eq!(p.chats[0].2, 3, "all three messages carry over");

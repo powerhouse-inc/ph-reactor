@@ -1060,14 +1060,31 @@ impl Inner {
         entry.doc.id = id;
         lift_name(&mut entry.doc);
         if let Ok(content) = std::fs::read_to_string(&alog_path) {
+            // The WAL is in arrival order, which is not the canonical order.
+            // Folding it as written would make a restarted node disagree with
+            // one that stayed up, which is the same divergence the canonical
+            // fold exists to prevent -- just triggered by a restart instead of
+            // by the network.
+            let mut actions: Vec<Action> = Vec::new();
             for line in content.lines().filter(|l| !l.trim().is_empty()) {
-                let action: Action = match serde_json::from_str(line) {
-                    Ok(a) => a,
-                    Err(e) => {
-                        warn!("skipping malformed action in {alog_path:?}: {e}");
-                        continue;
-                    }
-                };
+                match serde_json::from_str::<Action>(line) {
+                    Ok(a) => actions.push(a),
+                    Err(e) => warn!("skipping malformed action in {alog_path:?}: {e}"),
+                }
+            }
+            actions.sort_by_key(canon_key);
+            for action in actions {
+                // A document's space is carried by its actions, and replay has
+                // to restore it. It did not, and the consequence was not a
+                // missing field: `may_peer_read` treats a document with no
+                // space as one written before spaces existed and serves it to
+                // anyone. Every protected and private document on the node
+                // became world-readable at the next restart -- silently, with
+                // the console still displaying the right tier. Found by
+                // restarting a node mid-test, not by a unit test.
+                if entry.space.is_none() {
+                    entry.space = action.space;
+                }
                 match self.models.find(&action.model) {
                     Some(model) => {
                         let (applied, deleted) =
@@ -3014,5 +3031,46 @@ mod tests {
             Ok(_) => panic!("must not apply against a space we do not have"),
         };
         assert!(err.contains("space"), "{err}");
+    }
+
+    /// A restart must not change who may read a document.
+    ///
+    /// Replay rebuilt entries without their space, and `may_peer_read` treats
+    /// a document with no space as one written before spaces existed -- so it
+    /// served it to anyone. Every protected and private document on the node
+    /// became world-readable at the next restart, silently, with the console
+    /// still showing the right tier.
+    #[test]
+    fn a_restart_does_not_make_a_private_space_world_readable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (space_id, doc_id, prot_space, prot_doc) = {
+            let (s, k) = space_store(dir.path());
+            let (sp, d) = seed_space(&s, "private", &["alice"], "alice", &k);
+            let (psp, pd) = seed_space(&s, "protected", &["alice"], "alice", &k);
+            assert!(!s.may_peer_read("mallory", d), "private, before restart");
+            assert!(!s.may_peer_read("mallory", pd), "protected, before restart");
+            (sp, d, psp, pd)
+        };
+
+        // Reopen from disk: the same thing the daemon does on restart.
+        let s = open_store(dir.path());
+        assert_eq!(
+            s.space_of(doc_id),
+            Some(space_id),
+            "the space survives the restart"
+        );
+        assert_eq!(s.space_of(prot_doc), Some(prot_space));
+        assert!(
+            !s.may_peer_read("mallory", doc_id),
+            "a private document must still be private after a restart"
+        );
+        assert!(
+            !s.may_peer_read("mallory", prot_doc),
+            "a protected document must still be protected after a restart"
+        );
+        assert!(
+            !s.summary_for("mallory").contains_key(&doc_id),
+            "and must not appear in a stranger's summary"
+        );
     }
 }
