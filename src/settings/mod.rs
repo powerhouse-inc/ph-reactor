@@ -1478,13 +1478,11 @@ fn llm_base_url_ok(base: &str) -> Result<(), String> {
     } else {
         hostport.split(':').next().unwrap_or(hostport)
     };
-    if let Ok(ip) = host.parse::<std::net::IpAddr>() {
-        if let std::net::IpAddr::V4(v4) = ip {
-            if v4.to_bits() >> 16 == 169 * 256 + 254 {
-                return Err(
-                    "refusing LLM request to a link-local (cloud metadata) address".into(),
-                );
-            }
+    if let Ok(std::net::IpAddr::V4(v4)) = host.parse::<std::net::IpAddr>() {
+        if v4.to_bits() >> 16 == 169 * 256 + 254 {
+            return Err(
+                "refusing LLM request to a link-local (cloud metadata) address".into(),
+            );
         }
     }
     Ok(())
@@ -2040,6 +2038,8 @@ const PAGE_V2: &str = include_str!("../../console/v2.html");
 
 #[cfg(test)]
 mod tests {
+    use super::llm_base_url_ok;
+
     #[test]
     fn llm_base_url_rejects_link_local_metadata_allows_real_llm() {
         // The cloud metadata IP (AWS/Azure) is in the 169.254.0.0/16 range.
