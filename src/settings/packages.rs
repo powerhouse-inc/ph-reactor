@@ -52,6 +52,27 @@ pub async fn list(state: State<Arc<Settings>>) -> Response {
     let installed = Installed::load(&state.paths.packages_file());
     let docs = crate::query::query_docs(&state.store, "package", None);
 
+    // Which group's drive, if any, each package document sits in. Read from
+    // the groups themselves rather than stored on the package, so it stays
+    // true when a manager removes the item.
+    let mut group_of: std::collections::BTreeMap<String, String> = Default::default();
+    for g in crate::query::query_docs(&state.store, "group", None) {
+        let Some(gname) = g.get("name").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(items) = g.get("fields").and_then(|f| f.get("drive")).and_then(Value::as_array)
+        else {
+            continue;
+        };
+        for item in items {
+            if item.get("model").and_then(Value::as_str) == Some("package") {
+                if let Some(n) = item.get("name").and_then(Value::as_str) {
+                    group_of.insert(n.to_string(), gname.to_string());
+                }
+            }
+        }
+    }
+
     let mut out = Vec::new();
     for doc in &docs {
         let name = doc.get("name").and_then(Value::as_str).unwrap_or_default();
@@ -101,6 +122,7 @@ pub async fn list(state: State<Arc<Settings>>) -> Response {
             "bundleChunks": chunks,
             "bundleMissing": missing,
             "installed": installed.get(&m.name).map(|p| p.manifest.version.clone()),
+            "group": group_of.get(name),
         }));
     }
     (StatusCode::OK, axum::Json(out)).into_response()
@@ -323,6 +345,18 @@ pub struct PublishBody {
     /// Sidebar entries the plugin asks the console to show.
     #[serde(default)]
     pub ui: crate::package::PluginUi,
+    /// Publish into a group's drive, so the package is organizationally that
+    /// group's rather than a loose document.
+    ///
+    /// This is attribution and placement, NOT a distribution boundary. Every
+    /// document on this node replicates to every authenticated drive peer --
+    /// `Store::summary` is unfiltered and `CatchUp` serves any doc it is asked
+    /// for -- so a group's membership decides who may WRITE, never who may
+    /// read. Saying "published by the Powerhouse group" is a true statement
+    /// about who stands behind the package; it is not a claim that only members
+    /// receive it.
+    #[serde(default)]
+    pub group: Option<String>,
     /// The editor, as an HTML document. Stored as content-addressed chunks and
     /// referenced from the manifest by hash.
     #[serde(default)]
@@ -424,7 +458,51 @@ pub async fn publish(state: State<Arc<Settings>>, body: axum::Json<PublishBody>)
         "manifest": serialized,
     });
 
-    super::run_create_doc_model(&state, &doc, "package@1", payload).await
+    let created = super::run_create_doc_model(&state, &doc, "package@1", payload).await;
+    if created.status() != StatusCode::OK {
+        return created;
+    }
+
+    // Placing it in a group's drive is a second action, and a failure here is
+    // reported rather than swallowed: the package IS published either way, so
+    // saying "done" while the group attribution silently did not happen would
+    // be the wrong kind of quiet.
+    if let Some(group) = b.group.as_deref().filter(|g| !g.trim().is_empty()) {
+        let item = json!({
+            "name": doc,
+            "kind": "doc",
+            "model": "package",
+            "parent": null,
+        });
+        let placed = super::run_create_action(
+            &state,
+            group,
+            "group@1",
+            "add-doc",
+            json!({ "item": item }),
+        )
+        .await;
+        if placed.status() != StatusCode::OK {
+            return (
+                StatusCode::OK,
+                axum::Json(json!({
+                    "ok": true,
+                    "published": doc,
+                    "groupError": format!(
+                        "published, but could not add it to the {group} drive (status {})",
+                        placed.status()
+                    ),
+                })),
+            )
+                .into_response();
+        }
+        return (
+            StatusCode::OK,
+            axum::Json(json!({ "ok": true, "published": doc, "group": group })),
+        )
+            .into_response();
+    }
+    created
 }
 
 #[cfg(test)]

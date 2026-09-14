@@ -11,7 +11,7 @@
     "would be a hole in exactly the provenance the signature exists to give."
   ],
   "name": "@powerhousedao/achra",
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A marketplace for global coordination: objectives published, proposals signed, agreements kept.",
   "category": "Coordination",
   "publisher": {

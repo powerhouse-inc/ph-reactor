@@ -348,3 +348,77 @@ fn uninstalling_does_not_collect_a_package_this_node_still_offers() {
         "a package this node still advertises must still be servable"
     );
 }
+
+/// The history endpoint is gated on the READ capability for the model, and on
+/// the named document actually being of that model.
+///
+/// Without the second check a read capability on `rfp@1` would be a capability
+/// to read the action log of ANY document by name -- including a group's, whose
+/// log carries its membership changes. The capability names a model, so the
+/// model is what it grants.
+#[test]
+fn a_read_capability_names_a_model_not_every_document() {
+    let caps = Capabilities {
+        read: vec!["rfp@1".into()],
+        write: vec![],
+    };
+
+    assert!(caps.may_read("rfp@1"));
+    assert!(!caps.may_read("group@1"), "reading rfps is not reading groups");
+    assert!(!caps.may_read("package@1"));
+    assert!(
+        !caps.may_read("rfp@2"),
+        "a different version is a different model"
+    );
+
+    // And the store must be able to say what model a document actually is,
+    // which is what the endpoint checks the requested name against.
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = Store::open(&dir.path().join("docs"), &node(), "node-a").expect("store");
+    let def = rfp_def();
+    store.add_model(std::sync::Arc::new(
+        ph_reactor::model::l1::L1::from_def(def).expect("rfp model"),
+    ));
+    store
+        .create_doc_model(
+            "an-rfp",
+            &ModelRef::parse("rfp@1").expect("ref"),
+            &json!({ "name": "an-rfp", "title": "A thing" }),
+        )
+        .expect("create");
+
+    let doc = store.get("an-rfp").expect("exists");
+    let state = store.full_state(doc.id).expect("state");
+    assert_eq!(state.model.name, "rfp");
+    assert_ne!(
+        state.model.name, "group",
+        "the model check is what stops a name-based read of someone else's log"
+    );
+}
+
+/// The action log is the record, so it must actually carry who signed each
+/// action -- an audit trail that cannot name the signer is decoration.
+#[test]
+fn the_action_log_names_who_signed_each_action() {
+    let dir = tempfile::tempdir().expect("tmp");
+    let store = Store::open(&dir.path().join("docs"), &node(), "node-a").expect("store");
+    store.add_model(std::sync::Arc::new(
+        ph_reactor::model::l1::L1::from_def(rfp_def()).expect("rfp model"),
+    ));
+    store
+        .create_doc_model(
+            "an-rfp",
+            &ModelRef::parse("rfp@1").expect("ref"),
+            &json!({ "name": "an-rfp", "title": "A thing" }),
+        )
+        .expect("create");
+
+    let doc = store.get("an-rfp").expect("exists");
+    let (_, actions) = store.catch_up(doc.id, &ph_reactor::doc::VecClock::default());
+    assert!(!actions.is_empty(), "creating a document records an action");
+    for a in &actions {
+        assert!(!a.kind.is_empty(), "every action has a kind");
+        assert!(!a.origin.is_empty(), "every action names the key that signed it");
+        assert!(a.ts > 0, "every action is timestamped");
+    }
+}

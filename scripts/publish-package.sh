@@ -2,7 +2,7 @@
 #
 # Build a plugin package and publish it to the local reactor.
 #
-#   scripts/publish-package.sh packages/achra [console-url]
+#   scripts/publish-package.sh packages/achra [console-url] [group]
 #
 # "Build" is two steps, because a bundle is deliberately a single self-contained
 # HTML document -- no archive, so no paths inside it, so no path traversal and
@@ -17,17 +17,22 @@
 # installed anywhere until an operator says yes to the publisher key.
 set -euo pipefail
 
-dir="${1:?usage: publish-package.sh <package-dir> [console-url]}"
+dir="${1:?usage: publish-package.sh <package-dir> [console-url] [group]}"
 console="${2:-http://127.0.0.1:4002}"
+# Optional: put the package in a group's drive, so it is published BY that
+# group rather than as a loose document. Attribution and placement only --
+# every document replicates to every drive peer regardless of group.
+group="${3:-}"
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 manifest="$dir/powerhouse.manifest.json"
 
 [ -f "$manifest" ] || { echo "no powerhouse.manifest.json in $dir" >&2; exit 1; }
 
-body="$(python3 - "$dir" "$repo" <<'PY'
+body="$(python3 - "$dir" "$repo" "$group" <<'PY'
 import json, os, sys
 
 pkg_dir, repo = sys.argv[1], sys.argv[2]
+group = sys.argv[3] if len(sys.argv) > 3 else ""
 man = json.load(open(os.path.join(pkg_dir, "powerhouse.manifest.json")))
 
 # -- the editor, with the SDK inlined --------------------------------------
@@ -61,6 +66,7 @@ print(json.dumps({
     "processors": man.get("processors", []),
     "capabilities": man.get("capabilities", {"read": [], "write": []}),
     "ui": man.get("ui", {"nav": []}),
+    "group": group or None,
     "editor": editor,
 }))
 PY

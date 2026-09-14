@@ -1428,8 +1428,12 @@ async function renderPlugins() {
   try { [avail, inst, pubs] = await Promise.all([get("/api/packages"), get("/api/plugins"), get("/api/publishers")]); }
   catch (e) { $("#plug-body").innerHTML = `<div class="card"><div class="empty">${esc(e.message)}</div></div>`; return; }
 
-  const installedNames = new Set(inst.map((p) => p.name));
-  const offers = avail.filter((p) => p.name && !installedNames.has(p.name));
+  // An offer is anything on the mesh this node is not already running. A
+  // DIFFERENT version of something installed is still an offer -- hiding it by
+  // name meant a published upgrade was invisible, which is the one moment the
+  // list most needs to speak up.
+  const installedVersion = new Map(inst.map((p) => [p.name, p.version]));
+  const offers = avail.filter((p) => p.name && installedVersion.get(p.name) !== p.version);
 
   const installedCards = inst.map((p) => `
     <div class="card plug-card" data-open="${esc(p.name)}">
@@ -1449,12 +1453,14 @@ async function renderPlugins() {
   const offerCards = offers.map((p) => {
     const bad = !p.signatureOk;
     const withdrawn = p.status === "withdrawn";
+    const have = installedVersion.get(p.name);
     return `
     <div class="card plug-card">
       <div class="plug-ico${p.trusted && !bad ? "" : " untrusted"}">${esc(initials(p.name))}</div>
       <div>
         <div class="plug-title">${esc(p.name)} <span class="muted" style="font-weight:400">v${esc(p.version)}</span></div>
-        <div class="plug-by">${esc(p.publisher || "unnamed publisher")}
+        <div class="plug-by">${esc(p.publisher || "unnamed publisher")}${p.group ? ` \u00b7 via the <b style="color:var(--text)">${esc(p.group)}</b> group` : ""}
+          ${have ? `<span class="badge b-cyan" style="margin-left:6px"><span class="dot"></span>update from v${esc(have)}</span>` : ""}
           ${p.trusted ? '<span class="badge b-green" style="margin-left:6px"><span class="dot"></span>trusted key</span>'
                       : '<span class="badge b-amber" style="margin-left:6px"><span class="dot"></span>new publisher</span>'}
           ${bad ? '<span class="badge b-red" style="margin-left:6px"><span class="dot"></span>bad signature</span>' : ""}
@@ -1465,7 +1471,7 @@ async function renderPlugins() {
         ${p.bundleMissing > 0 ? `<div class="plug-desc">editor: ${p.bundleMissing} of ${p.bundleChunks} chunks still arriving from peers</div>` : ""}
       </div>
       <div class="plug-actions">
-        <button class="btn ${bad || withdrawn ? "ghost" : "primary"} sm" data-install="${esc(p.doc)}"${bad ? " disabled" : ""}>Review & install</button>
+        <button class="btn ${bad || withdrawn ? "ghost" : "primary"} sm" data-install="${esc(p.doc)}"${bad ? " disabled" : ""}>${have ? "Review & update" : "Review & install"}</button>
       </div>
     </div>`;
   }).join("");
@@ -1618,6 +1624,8 @@ function openPlugin(name, installed, view) {
     try {
       if (m.op === "query") {
         reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/query`, { model: m.model, filter: m.filter ?? null }) });
+      } else if (m.op === "history") {
+        reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/history`, { model: m.model, name: m.name, limit: m.limit ?? 50 }) });
       } else if (m.op === "action") {
         reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/action`, { model: m.model, kind: m.kind, name: m.name, payload: m.payload ?? {} }) });
       } else if (m.op === "host") {

@@ -121,7 +121,20 @@ export function createClient(options = {}) {
   /** The reactor-browser-shaped alias. */
   const useSubmit = () => submit;
 
-  return { host, query, useQuery, submit, useSubmit };
+  /**
+   * One document's signed action log, newest first.
+   *
+   * Each entry is `{kind, actor, ts, cosigners, payload}`. `actor` is the
+   * public key that signed it, and `cosigners` are the keys that co-signed a
+   * quorum-gated action — which is the whole reason this is worth showing:
+   * agreement is a property of the record, not a claim a server makes about it.
+   *
+   * Gated on the read capability for the model, so a plugin that may read a
+   * document may see how it came to say what it says.
+   */
+  const history = (model, name, limit) => call("history", { model, name, limit });
+
+  return { host, query, useQuery, submit, useSubmit, history };
 }
 
 export default createClient;

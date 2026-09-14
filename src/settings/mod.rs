@@ -106,6 +106,7 @@ impl Settings {
             .route("/api/publishers/:key/revoke", post(packages::revoke_publisher))
             .route("/api/plugins/:name/query", post(plugin_query))
             .route("/api/plugins/:name/action", post(plugin_action))
+            .route("/api/plugins/:name/history", post(plugin_history))
             .route("/api/join", post(join_invite))
             .route("/api/ban", post(ban_peer))
             .route("/api/unban", post(unban_peer))
@@ -1134,6 +1135,92 @@ async fn plugin_action(
         return run_create_doc_model(&state, &body.name, &body.model, payload).await;
     }
     run_create_action(&state, &body.name, &body.model, &body.kind, body.payload).await
+}
+
+#[derive(serde::Deserialize)]
+struct PluginHistoryBody {
+    /// The governing model, checked against the READ capability: seeing who
+    /// did what to a document is a read of that document.
+    model: String,
+    /// The document to show the trail for.
+    name: String,
+    #[serde(default)]
+    limit: Option<usize>,
+}
+
+/// `POST /api/plugins/:name/history` — a document's signed action log.
+///
+/// This is the part of an event-sourced store that is worth showing: every
+/// action carries the key that signed it, so "who agreed to what, and when" is
+/// answerable from the document itself rather than from a server's word for it.
+///
+/// Gated on the read capability, not a separate one. A plugin that may read a
+/// document may see how it came to say what it says — the history is the
+/// document, and pretending otherwise would suggest the current state is
+/// somehow less revealing than the log that produced it.
+async fn plugin_history(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<PluginHistoryBody>,
+) -> Response {
+    let Some(pkg) = installed_package(&state, &name) else {
+        return (StatusCode::NOT_FOUND, "no such package installed").into_response();
+    };
+    if !pkg.manifest.capabilities.may_read(&body.model) {
+        tracing::warn!(
+            "plugin {name} attempted to read the history of {} without the capability",
+            body.model
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            format!("this plugin may not read {}", body.model),
+        )
+            .into_response();
+    }
+    let Some(doc) = state.store.get(&body.name) else {
+        return (StatusCode::NOT_FOUND, "no such document").into_response();
+    };
+    // The capability names a model, so check the document actually IS one --
+    // otherwise a read capability on `rfp@1` would open every document by name.
+    let model_name = body.model.split('@').next().unwrap_or_default();
+    let is_that_model = state
+        .store
+        .full_state(doc.id)
+        .map(|st| st.model.name == model_name)
+        .unwrap_or(false);
+    if !is_that_model {
+        return (
+            StatusCode::FORBIDDEN,
+            format!("{} is not a {}", body.name, body.model),
+        )
+            .into_response();
+    }
+
+    let (_, actions) = state.store.catch_up(doc.id, &VecClock::default());
+    let limit = body.limit.unwrap_or(50).min(200);
+    let out: Vec<Value> = actions
+        .iter()
+        .rev()
+        .take(limit)
+        .map(|a| {
+            json!({
+                "kind": a.kind,
+                "actor": a.origin,
+                // Raw, as the store records it: MICROseconds since the epoch.
+                // Kept because it is what the signed record contains.
+                "ts": a.ts,
+                // And the same instant unambiguously. Processor fires in this
+                // same API are milliseconds, so a bare integer is a unit a
+                // consumer has to guess at -- and guessing wrong renders an
+                // audit trail dated to the year 58000, which is how this was
+                // noticed.
+                "at": crate::status::rfc3339(a.ts / 1_000_000),
+                "cosigners": a.cosig.iter().map(|c| c.origin.clone()).collect::<Vec<_>>(),
+                "payload": a.payload,
+            })
+        })
+        .collect();
+    (StatusCode::OK, axum::Json(out)).into_response()
 }
 
 /// `GET /api/groups/:name/activity` — the group's recent signed actions.

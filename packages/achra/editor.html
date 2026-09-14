@@ -113,6 +113,40 @@
   @media (prefers-reduced-motion: reduce) { .skel { animation: none; } .card.act:hover { transform: none; } }
   @media (max-width: 620px) { .stats { grid-template-columns: 1fr 1fr; } .two { grid-template-columns: 1fr; } }
 
+  /* ---- audit trail ---- */
+  .trail-toggle {
+    margin-top: 12px; font: inherit; font-size: 12.5px; font-weight: 550;
+    background: none; border: none; padding: 0; cursor: pointer;
+    color: var(--muted); display: inline-flex; align-items: center; gap: 6px;
+  }
+  .trail-toggle:hover { color: var(--ink); }
+  .trail-toggle .chev { transition: transform .15s; display: inline-block; }
+  .trail-toggle[aria-expanded="true"] .chev { transform: rotate(90deg); }
+  .trail { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 12px; }
+  .trail ol { list-style: none; margin: 0; padding: 0 0 0 16px; position: relative; }
+  .trail ol::before {
+    content: ""; position: absolute; left: 3px; top: 6px; bottom: 6px;
+    width: 1px; background: var(--line-2);
+  }
+  .trail li { position: relative; padding: 5px 0; font-size: 12.5px; line-height: 1.5; }
+  .trail li::before {
+    content: ""; position: absolute; left: -16px; top: 11px;
+    width: 7px; height: 7px; border-radius: 50%;
+    background: var(--raise); border: 1.5px solid var(--line-2);
+  }
+  .trail li:first-child::before { background: var(--ok); border-color: var(--ok); }
+  .trail .kind { font-weight: 650; color: var(--ink); }
+  .trail .who {
+    font-family: ui-monospace, "SF Mono", Menlo, monospace; font-size: 11.5px;
+    color: var(--muted);
+  }
+  .trail .when { color: var(--faint); }
+  .trail .cosig {
+    display: inline-block; margin-left: 6px; padding: 1px 7px; border-radius: 999px;
+    font-size: 10.5px; font-weight: 650; background: var(--ok-bg); color: var(--ok);
+  }
+  .trail .loading, .trail .none { color: var(--faint); font-size: 12.5px; }
+
   footer { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line);
            color: var(--faint); font-size: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
   .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); display: inline-block; }
@@ -178,6 +212,27 @@ const statusPill = (s) => {
   return `<span class="pill ${cls}">${esc(s || "—")}</span>`;
 };
 
+/* An actor is a public key. Showing all 52 characters of it in a list drowns
+   everything else, so it is abbreviated -- but never rewritten into a display
+   name, because the key IS the identity and a friendly label nobody can verify
+   would be worse than none. The full value stays in the title attribute. */
+const who = (k) => (k ? String(k).slice(0, 8) + "\u2026" + String(k).slice(-4) : "unknown");
+
+/* `at` is RFC 3339 and is what the host sends; `ts` is the raw microseconds
+   from the signed record, kept as a fallback for an older host. Never parse
+   `ts` as milliseconds -- it is a thousand times too large and renders as the
+   year 58000. */
+const when = (a) => {
+  const d = new Date(a.at || Number(a.ts) / 1000);
+  if (isNaN(d)) return String(a.at ?? a.ts ?? "");
+  const mins = Math.round((Date.now() - d) / 60000);
+  if (mins < 1) return "just now";
+  if (mins < 60) return `${mins}m ago`;
+  if (mins < 1440) return `${Math.round(mins / 60)}h ago`;
+  return d.toLocaleDateString(undefined, { day: "numeric", month: "short" })
+    + " " + d.toLocaleTimeString(undefined, { hour: "2-digit", minute: "2-digit" });
+};
+
 const view = $("#view");
 const skel = (n = 3) => { view.innerHTML = Array.from({ length: n }, () => '<div class="skel"></div>').join(""); };
 const empty = (t, h) => { view.innerHTML = `<div class="empty"><div class="big">◇</div><strong>${esc(t)}</strong><div>${esc(h)}</div></div>`; };
@@ -226,9 +281,11 @@ function showRfps() {
         ? `<div style="margin-top:13px"><button class="go" data-propose="${esc(r.name)}">Submit a proposal</button></div>`
         : f(r, "winner") ? `<div class="meta"><span>awarded to <b>${esc(String(f(r, "winner")).slice(0, 16))}…</b> for <b>${esc(money(f(r, "award_amount")))}</b></span></div>` : ""}
       <div data-form="${esc(r.name)}"></div>
+      ${trailFor("rfp@1", r.name)}
     </article>`).join("");
 
   view.querySelectorAll("[data-propose]").forEach((b) => (b.onclick = () => proposeForm(b.dataset.propose, b)));
+  bindTrails();
 }
 
 function proposeForm(rfpName, btn) {
@@ -291,7 +348,9 @@ function showProposals() {
       </div>
       ${f(p, "status") === "submitted"
         ? `<div style="margin-top:12px"><button class="go quiet" data-withdraw="${esc(p.name)}">Withdraw</button></div>` : ""}
+      ${trailFor("proposal@1", p.name)}
     </article>`).join("");
+  bindTrails();
 
   view.querySelectorAll("[data-withdraw]").forEach((b) => (b.onclick = async () => {
     b.disabled = true;
@@ -325,8 +384,10 @@ function showAgreements() {
       <div style="margin-top:12px;height:5px;border-radius:5px;background:var(--line);overflow:hidden">
         <div style="height:100%;width:${pct}%;background:var(--ok)"></div>
       </div>
+      ${trailFor("agreement@1", a.name)}
     </article>`;
   }).join("");
+  bindTrails();
 }
 
 function showMilestones() {
@@ -344,8 +405,59 @@ function showMilestones() {
         <span>amount <b>${esc(money(f(m, "amount")))}</b></span>
         ${f(m, "evidence") ? `<span>evidence <b>${esc(String(f(m, "evidence")).slice(0, 48))}</b></span>` : ""}
       </div>
+      ${trailFor("milestone@1", m.name)}
     </article>`).join("");
+  bindTrails();
 }
+
+/* The audit trail.
+
+   Every action in this store is signed, so the log is not a convenience view
+   over a database -- it is the record, and the state is derived from it. That
+   is the thing worth putting in front of someone deciding whether to trust an
+   agreement, so it lives inline under each entry rather than behind a separate
+   "history" screen nobody opens.
+
+   Loaded on expand, not with the list: a page of twenty entries should not
+   fetch twenty logs to show a closed disclosure. */
+async function toggleTrail(btn) {
+  const wrap = btn.nextElementSibling;
+  const open = btn.getAttribute("aria-expanded") === "true";
+  btn.setAttribute("aria-expanded", String(!open));
+  btn.querySelector(".label").textContent = open ? "Show audit trail" : "Hide audit trail";
+  if (open) { wrap.innerHTML = ""; return; }
+
+  wrap.innerHTML = `<div class="trail"><div class="loading">reading the signed log\u2026</div></div>`;
+  try {
+    const log = await ph.history(btn.dataset.model, btn.dataset.doc, 50);
+    if (!log.length) {
+      wrap.innerHTML = `<div class="trail"><div class="none">No actions recorded.</div></div>`;
+      return;
+    }
+    wrap.innerHTML = `<div class="trail"><ol>` + log.map((a) => `
+      <li>
+        <span class="kind">${esc(a.kind)}</span>
+        by <span class="who" title="${esc(a.actor)}">${esc(who(a.actor))}</span>
+        <span class="when" title="${esc(a.at || "")}">\u00b7 ${esc(when(a))}</span>
+        ${a.cosigners && a.cosigners.length
+          ? `<span class="cosig" title="${esc(a.cosigners.join(", "))}">co-signed by ${a.cosigners.length}</span>`
+          : ""}
+      </li>`).join("") + `</ol></div>`;
+  } catch (e) {
+    wrap.innerHTML = `<div class="trail"><div class="none">${esc(e.message)}</div></div>`;
+  }
+}
+
+/* Wires every trail button in the current view. Called after each render. */
+function bindTrails() {
+  view.querySelectorAll(".trail-toggle").forEach((b) => (b.onclick = () => toggleTrail(b)));
+}
+
+/* The markup for one entry's disclosure. */
+const trailFor = (model, doc) => `
+  <button class="trail-toggle" aria-expanded="false" data-model="${esc(model)}" data-doc="${esc(doc)}">
+    <span class="chev">\u203a</span><span class="label">Show audit trail</span>
+  </button><div></div>`;
 
 const VIEWS = { rfps: showRfps, proposals: showProposals, agreements: showAgreements, milestones: showMilestones };
 
@@ -364,9 +476,12 @@ async function poll() {
     ]);
     Object.assign(data, { rfp, proposal, agreement, milestone });
     refreshStats();
-    // Re-render only if nothing is half-typed: clobbering a form someone is
-    // filling in because a poll came back would be its own kind of bug.
-    if (!view.querySelector("form")) VIEWS[current]();
+    // Re-render only if nothing is half-typed and no trail is open: clobbering
+    // a form someone is filling in -- or collapsing a log they are reading --
+    // because a poll came back would be its own kind of bug.
+    const busy = view.querySelector("form")
+      || view.querySelector('.trail-toggle[aria-expanded="true"]');
+    if (!busy) VIEWS[current]();
     $("#dot").classList.remove("off");
     $("#conn").textContent = `connected · ${rfp.length} objective${rfp.length === 1 ? "" : "s"}, ${proposal.length} proposal${proposal.length === 1 ? "" : "s"}`;
     everFailed = false;
