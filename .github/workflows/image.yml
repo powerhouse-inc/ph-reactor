@@ -32,6 +32,11 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y musl-tools
 
+      - name: Cache cargo registry and target dir
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: musl
+
       - name: Build the static binary
         env:
           # cc-rs builds ring for the musl target; point it at musl-gcc so the
@@ -78,5 +83,7 @@ jobs:
           tags: |
             cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:${{ steps.tags.outputs.version }}
             cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:${{ steps.tags.outputs.sha }}
-          cache-from: type=gha
-          cache-to: type=gha,mode=max
+          # No buildx cache on purpose. It would need the docker-container
+          # driver (setup-buildx-action) and would buy nothing: the Dockerfile
+          # only copies an already-built binary. The expensive work is the
+          # cargo build above, which is cached by rust-cache instead.
