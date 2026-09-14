@@ -220,11 +220,40 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         .iter()
         .filter_map(|s| PeerId::from_str(s).ok())
         .collect();
+    // Optional WebSocket listener. A bad multiaddr is a config error worth
+    // shouting about, but it must not stop the TCP listener from coming up.
+    let listen_ws = match config.instance.listen_ws.as_deref() {
+        Some(raw) => match Multiaddr::from_str(raw) {
+            Ok(addr) => Some(addr),
+            Err(err) => {
+                tracing::warn!("ignoring invalid instance.listenWs {raw:?}: {err}");
+                None
+            }
+        },
+        None => None,
+    };
+    // Addresses to announce. Same tolerance: a typo in one entry must not
+    // take the node down.
+    let external: Vec<Multiaddr> = config
+        .instance
+        .external
+        .iter()
+        .filter_map(|raw| match Multiaddr::from_str(raw) {
+            Ok(addr) => Some(addr),
+            Err(err) => {
+                tracing::warn!("ignoring invalid instance.external entry {raw:?}: {err}");
+                None
+            }
+        })
+        .collect();
+
     let engine = SyncEngine::new(
         &kp,
         store.clone(),
         &config.instance.name,
         listen,
+        listen_ws,
+        external,
         config.p2p.mdns,
         config.p2p.dht,
         config.p2p.relay,
@@ -233,6 +262,7 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         eng_cmd_rx,
         evt_tx,
     )
+    .await
     .context("building the p2p engine")?;
     let mut engine_task = tokio::spawn(async move {
         engine.run().await;

@@ -71,6 +71,8 @@ libp2p = { version = "0.56", default-features = false, features = [
   "identify",
   "kad",
   "relay",
+  "websocket",
+  "dns",
 ] }
 
 [features]

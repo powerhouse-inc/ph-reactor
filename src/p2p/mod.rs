@@ -243,6 +243,10 @@ pub struct SyncEngine {
     peer_id: PeerId,
     pub_name: String,
     listen: Multiaddr,
+    /// Optional second listener for the WebSocket transport.
+    listen_ws: Option<Multiaddr>,
+    /// Addresses announced to peers via `add_external_address`.
+    external: Vec<Multiaddr>,
     /// Local token (from the config's `p2p.tokenEnv` env var), if any.
     token: Option<String>,
     drives: HashMap<String, DriveRuntime>,
@@ -298,11 +302,13 @@ impl SyncEngine {
     /// Builds the engine. `listen` is the configured listen multiaddr.
     /// `token` is the local shared secret (already env-resolved).
     #[allow(clippy::too_many_arguments)] // every parameter is required construction input
-    pub fn new(
+    pub async fn new(
         key: &Keypair,
         store: Arc<Store>,
         pub_name: &str,
         listen: Multiaddr,
+        listen_ws: Option<Multiaddr>,
+        external: Vec<Multiaddr>,
         mdns_enabled: bool,
         dht_enabled: bool,
         relay_enabled: bool,
@@ -362,6 +368,18 @@ impl SyncEngine {
                 yamux::Config::default,
             )
             .map_err(|e| anyhow::anyhow!("tcp transport: {e}"))?
+            // DNS first: the builder's phase order requires it before the
+            // websocket step, and it is what makes /dns4/ and /dns6/
+            // multiaddrs resolve at all -- without it a hostname-based
+            // bootstrap address simply fails to dial.
+            .with_dns()
+            .map_err(|e| anyhow::anyhow!("dns transport: {e}"))?
+            // WebSocket is a second transport, not a replacement: it lets a
+            // peer reach this node over :443 through a reverse proxy, which
+            // traverses networks that block an arbitrary high TCP port.
+            .with_websocket(noise::Config::new, yamux::Config::default)
+            .await
+            .map_err(|e| anyhow::anyhow!("websocket transport: {e}"))?
             .with_relay_client(noise::Config::new, yamux::Config::default)
             .map_err(|e| anyhow::anyhow!("relay client: {e}"))?
             .with_behaviour(move |_kp, relay_client| {
@@ -388,6 +406,8 @@ impl SyncEngine {
             peer_id,
             pub_name: pub_name.to_string(),
             listen,
+            listen_ws,
+            external,
             token,
             banned,
             drives: HashMap::new(),
@@ -417,6 +437,22 @@ impl SyncEngine {
         // NewListenAddr event, not here.
         if let Err(err) = self.swarm.listen_on(self.listen.clone()) {
             tracing::warn!("cannot listen on {:?}: {err:?}", self.listen);
+        }
+        if let Some(ws) = self.listen_ws.clone() {
+            match self.swarm.listen_on(ws.clone()) {
+                Ok(_) => tracing::info!("websocket listener on {ws}"),
+                Err(err) => tracing::warn!("cannot listen on {ws:?}: {err:?}"),
+            }
+        }
+
+        // Announce the addresses peers must dial. A node behind a load
+        // balancer or reverse proxy cannot observe these itself, so without
+        // them it advertises only a private bind address that nobody can
+        // reach -- and identify, Kademlia and the relay all propagate that
+        // useless address to the rest of the mesh.
+        for addr in self.external.clone() {
+            tracing::info!("announcing external address {addr}");
+            self.swarm.add_external_address(addr);
         }
 
         // The store's outbound feed: local actions are published as soon
@@ -474,7 +510,11 @@ impl SyncEngine {
         };
         match serde_json::to_vec(&msg) {
             Ok(bytes) => {
-                let _ = self.swarm.behaviour_mut().gossipsub.publish(topic.hash(), bytes);
+                let _ = self
+                    .swarm
+                    .behaviour_mut()
+                    .gossipsub
+                    .publish(topic.hash(), bytes);
             }
             Err(e) => tracing::warn!("gossip encode failed: {e}"),
         }
@@ -1488,7 +1528,7 @@ mod tests {
 
     /// A minimal engine for exercising `record_auth_failure` without the
     /// full handshake (no event loop is run; only the fields matter).
-    fn engine_with_token(token: Option<&str>) -> SyncEngine {
+    async fn engine_with_token(token: Option<&str>) -> SyncEngine {
         let key = Keypair::generate_ed25519();
         let peer = kp_peer_id(&key);
         let dir = tempfile::tempdir().expect("temp dir");
@@ -1503,14 +1543,17 @@ mod tests {
             store,
             "test",
             listen,
-            false, // no mDNS
-            false, // no DHT
-            false, // no relay
+            None,       // no websocket listener
+            Vec::new(), // no announced addresses
+            false,      // no mDNS
+            false,      // no DHT
+            false,      // no relay
             token.map(str::to_string),
             HashSet::new(),
             cmd_rx,
             evt_tx,
         )
+        .await
         .expect("engine");
         drop(cmd_tx);
         engine
@@ -1520,7 +1563,7 @@ mod tests {
     /// is auto-banned; a distinct peer is unaffected.
     #[tokio::test]
     async fn auto_ban_after_auth_threshold() {
-        let mut e = engine_with_token(Some("secret"));
+        let mut e = engine_with_token(Some("secret")).await;
         let attacker = Keypair::generate_ed25519();
         let attacker_id = kp_peer_id(&attacker);
 

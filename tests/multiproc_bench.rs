@@ -53,9 +53,7 @@ async fn store_write_throughput() {
     // (plus a read-model consumer when a query is active). Consuming it
     // keeps the feed's channel drained, as in production.
     let mut feed = store.subscribe_changes();
-    let feeder = tokio::spawn(async move {
-        while feed.recv().await.is_some() {}
-    });
+    let feeder = tokio::spawn(async move { while feed.recv().await.is_some() {} });
     // One field update per action — the common write.
     let n = 500u64;
     let start = std::time::Instant::now();
@@ -97,8 +95,7 @@ async fn spawn_node(tag: &str) -> Node {
     let key = Keypair::generate_ed25519();
     let peer = key.public().to_peer_id();
     let signing = p2p::signing_key(&key).expect("signing key");
-    let store =
-        Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
+    let store = Store::open(&dir.path().join("docs"), &signing, &peer.to_base58()).expect("store");
     let (cmd_tx, cmd_rx) = mpsc::unbounded_channel();
     let (evt_tx, mut evt_rx) = mpsc::unbounded_channel();
     let listen = Multiaddr::from_str("/ip4/127.0.0.1/tcp/0").expect("listen addr");
@@ -107,6 +104,8 @@ async fn spawn_node(tag: &str) -> Node {
         store.clone(),
         tag,
         listen,
+        None,       // no websocket listener in the test
+        Vec::new(), // no announced addresses in the test
         false,
         false,
         false,
@@ -115,6 +114,7 @@ async fn spawn_node(tag: &str) -> Node {
         cmd_rx,
         evt_tx,
     )
+    .await
     .expect("engine");
     tokio::spawn(async move {
         engine.run().await;
@@ -144,17 +144,12 @@ fn with_peer(addr: Multiaddr, peer: PeerId) -> Multiaddr {
     addr.with(Protocol::P2p(peer))
 }
 
-async fn wait_synced(
-    rx: &mut mpsc::UnboundedReceiver<EngineEvent>,
-    name: &str,
-) -> Result<(), ()> {
+async fn wait_synced(rx: &mut mpsc::UnboundedReceiver<EngineEvent>, name: &str) -> Result<(), ()> {
     let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
     while tokio::time::Instant::now() < deadline {
         match tokio::time::timeout(Duration::from_millis(250), rx.recv()).await {
             Ok(Some(EngineEvent::DriveStatus {
-                name: n,
-                status,
-                ..
+                name: n, status, ..
             })) if n == name && status == DriveStatus::Synced => return Ok(()),
             Ok(Some(_)) => {}
             Ok(None) => return Err(()),
@@ -189,8 +184,12 @@ async fn convergence_latency_two_nodes() {
     a.cmd_tx.send(EngineCommand::AddDrive(drive_b)).unwrap();
     b.cmd_tx.send(EngineCommand::AddDrive(drive_a)).unwrap();
 
-    wait_synced(&mut a.evt_rx, "beta").await.expect("a<->b sync");
-    wait_synced(&mut b.evt_rx, "alpha").await.expect("b<->a sync");
+    wait_synced(&mut a.evt_rx, "beta")
+        .await
+        .expect("a<->b sync");
+    wait_synced(&mut b.evt_rx, "alpha")
+        .await
+        .expect("b<->a sync");
 
     let rounds = 3;
     let mut total = Duration::ZERO;
@@ -199,9 +198,7 @@ async fn convergence_latency_two_nodes() {
         let mut fields = BTreeMap::new();
         fields.insert("body".into(), serde_json::json!(i));
         let t0 = std::time::Instant::now();
-        a.store
-            .create_doc(&name, fields.clone())
-            .expect("create");
+        a.store.create_doc(&name, fields.clone()).expect("create");
         // Wait until B's store has the doc with the right field.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
         loop {

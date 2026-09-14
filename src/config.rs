@@ -10,7 +10,9 @@
 //! ```json
 //! {
 //!   "schemaVersion": 2,
-//!   "instance": { "name": "my-mac", "listen": "/ip4/0.0.0.0/tcp/4201" },
+//!   "instance": { "name": "my-mac", "listen": "/ip4/0.0.0.0/tcp/4201",
+//!                  "listenWs": "/ip4/0.0.0.0/tcp/25423/ws",
+//!                  "external": ["/dns4/ws.example/tcp/443/tls/ws"] },
 //!   "p2p": { "mdns": true, "tokenEnv": null },
 //!   "drives": [
 //!     {
@@ -64,6 +66,26 @@ pub struct InstanceConfig {
     pub name: String,
     /// The libp2p listen multiaddr.
     pub listen: String,
+    /// An optional second listen multiaddr for the WebSocket transport,
+    /// e.g. `/ip4/0.0.0.0/tcp/25423/ws`.
+    ///
+    /// Plain `ws`, not `wss`: the expected deployment terminates TLS at a
+    /// reverse proxy and forwards a plain WebSocket to this process. Peers
+    /// still dial `/dns4/<host>/tcp/443/tls/ws/...` -- TLS is a transport
+    /// concern handled by the proxy, so the two ends agree.
+    ///
+    /// Empty (the default) means the WebSocket listener is not started.
+    #[serde(default, rename = "listenWs", skip_serializing_if = "Option::is_none")]
+    pub listen_ws: Option<String>,
+    /// Multiaddrs this node should advertise to peers, for when the address
+    /// others must dial is not one this process can observe -- behind a load
+    /// balancer, a reverse proxy, or NAT.
+    ///
+    /// Without this a node announces only what it is bound to, which for a
+    /// container is a private address no peer can reach. Each entry is passed
+    /// to `Swarm::add_external_address`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub external: Vec<String>,
 }
 
 impl Default for InstanceConfig {
@@ -71,6 +93,8 @@ impl Default for InstanceConfig {
         Self {
             name: DEFAULT_INSTANCE_NAME.into(),
             listen: DEFAULT_LISTEN.into(),
+            listen_ws: None,
+            external: Vec::new(),
         }
     }
 }

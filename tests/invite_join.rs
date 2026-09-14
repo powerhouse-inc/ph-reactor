@@ -56,6 +56,8 @@ async fn spawn_node(tag: &str) -> Node {
         store.clone(),
         tag,
         listen,
+        None,           // no websocket listener in the test
+        Vec::new(),     // no announced addresses in the test
         false,          // no mDNS
         false,          // no DHT
         false,          // no relay
@@ -64,6 +66,7 @@ async fn spawn_node(tag: &str) -> Node {
         cmd_rx,
         evt_tx,
     )
+    .await
     .expect("engine");
     tokio::spawn(async move {
         engine.run().await;
