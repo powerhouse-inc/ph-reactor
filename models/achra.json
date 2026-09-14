@@ -1,0 +1,453 @@
+{
+  "$comment": [
+    "Achra MVP domain models \u2014 the coordination loop: an organization publishes",
+    "an RFP, builders submit proposals, the org awards one, an agreement is",
+    "created, and milestones are tracked to a recorded payout intent.",
+    "",
+    "Registered at runtime with POST /api/models {definition: <one of these>};",
+    "no recompile and no redeploy. See",
+    "docs/superpowers/specs/2026-09-14-achra-mvp-design.md.",
+    "",
+    "CONVENTION: single-owner fields (publisher, submitter, org, builder) are",
+    "string[] holding exactly one entry. That is not an accident \u2014 the",
+    "precondition DSL's `actor-is` compares the actor to a LITERAL string, so",
+    "the only way to say 'the actor must be this document's publisher' is",
+    "`actor-in` over a list field.",
+    "",
+    "CONFIDENTIALITY: rfp documents live in the public marketplace group;",
+    "proposal, agreement and milestone live in a group containing only the org",
+    "and one builder. Reads are not access-gated and sync converges whole",
+    "documents to every group member, so separation is by group topology.",
+    "",
+    "NAMING: every init reducer must write __name__. create_doc_model() validates a name and rejects a duplicate, but it is the reducer's __name__ write that actually registers it -- without it the document is created and then unfindable by name.",
+    "PRECONDITION SYNTAX: `actor-in` takes a bare string (the field name); `field-is` / `field-not` take an OBJECT {field, value}. Mixing them up yields \"'field-is' requires a 'field' string\" at apply time, not at registration -- which is why these models are tested."
+  ],
+  "models": [
+    {
+      "name": "rfp",
+      "version": "1",
+      "$comment": "A published objective. Lives in the public marketplace group.",
+      "fields": {
+        "publisher": "string[]",
+        "approvers": "string[]",
+        "title": "string",
+        "brief": "string",
+        "budget": "number",
+        "currency": "string",
+        "deadline": "string",
+        "status": "string",
+        "winner": "string",
+        "award_amount": "number"
+      },
+      "reducers": {
+        "init": {
+          "payload": {
+            "name": "string",
+            "title": "string",
+            "brief": "string",
+            "budget": "number",
+            "currency": "string",
+            "deadline": "string",
+            "approvers": "string[]"
+          },
+          "writes": {
+            "__name__": {
+              "set": "$payload.name"
+            },
+            "publisher": {
+              "append": "$actor"
+            },
+            "approvers": {
+              "set": "$payload.approvers"
+            },
+            "title": {
+              "set": "$payload.title"
+            },
+            "brief": {
+              "set": "$payload.brief"
+            },
+            "budget": {
+              "set": "$payload.budget"
+            },
+            "currency": {
+              "set": "$payload.currency"
+            },
+            "deadline": {
+              "set": "$payload.deadline"
+            },
+            "status": {
+              "set": "open"
+            }
+          }
+        },
+        "cancel": {
+          "payload": {},
+          "writes": {
+            "status": {
+              "set": "cancelled"
+            }
+          },
+          "pre": [
+            {
+              "actor-in": "publisher"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "open"
+              }
+            }
+          ]
+        },
+        "award": {
+          "$comment": [
+            "EVERY award needs two distinct approvers to sign, not only awards",
+            "above a threshold. The design called for a per-amount threshold,",
+            "but quorum() is declared per REDUCER KIND and cannot branch on a",
+            "payload value \u2014 so a conditional quorum is not expressible. Rather",
+            "than add an `award-large` variant nothing would compel anyone to",
+            "use, awarding is always a two-person decision. That is stricter",
+            "than specified, and simpler to reason about.",
+            "",
+            "The quorum reads `approvers` from the RFP document itself via",
+            "$self, so it is the publishing org's own people who must agree \u2014",
+            "not any two members of the marketplace."
+          ],
+          "payload": {
+            "builder": "string",
+            "amount": "number"
+          },
+          "writes": {
+            "status": {
+              "set": "awarded"
+            },
+            "winner": {
+              "set": "$payload.builder"
+            },
+            "award_amount": {
+              "set": "$payload.amount"
+            }
+          },
+          "pre": [
+            {
+              "field-is": {
+                "field": "status",
+                "value": "open"
+              }
+            },
+            {
+              "quorum": {
+                "group": "$self",
+                "min": 2,
+                "field": "approvers"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "proposal",
+      "version": "1",
+      "$comment": "A builder's bid. Lives in the org<->builder engagement group only.",
+      "fields": {
+        "rfp_ref": "string",
+        "submitter": "string[]",
+        "summary": "string",
+        "amount": "number",
+        "status": "string"
+      },
+      "reducers": {
+        "init": {
+          "payload": {
+            "name": "string",
+            "rfp_ref": "string",
+            "summary": "string",
+            "amount": "number"
+          },
+          "writes": {
+            "__name__": {
+              "set": "$payload.name"
+            },
+            "rfp_ref": {
+              "set": "$payload.rfp_ref"
+            },
+            "submitter": {
+              "append": "$actor"
+            },
+            "summary": {
+              "set": "$payload.summary"
+            },
+            "amount": {
+              "set": "$payload.amount"
+            },
+            "status": {
+              "set": "submitted"
+            }
+          }
+        },
+        "withdraw": {
+          "payload": {},
+          "writes": {
+            "status": {
+              "set": "withdrawn"
+            }
+          },
+          "pre": [
+            {
+              "actor-in": "submitter"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "submitted"
+              }
+            }
+          ]
+        },
+        "accept": {
+          "payload": {},
+          "writes": {
+            "status": {
+              "set": "accepted"
+            }
+          },
+          "pre": [
+            {
+              "actor-not-in": "submitter"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "submitted"
+              }
+            }
+          ]
+        },
+        "decline": {
+          "payload": {},
+          "writes": {
+            "status": {
+              "set": "declined"
+            }
+          },
+          "pre": [
+            {
+              "actor-not-in": "submitter"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "submitted"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "agreement",
+      "version": "1",
+      "$comment": "The accepted engagement. Lives in the engagement group.",
+      "fields": {
+        "rfp_ref": "string",
+        "proposal_ref": "string",
+        "org": "string[]",
+        "builder": "string[]",
+        "total": "number",
+        "status": "string"
+      },
+      "reducers": {
+        "init": {
+          "payload": {
+            "name": "string",
+            "rfp_ref": "string",
+            "proposal_ref": "string",
+            "builder": "string",
+            "total": "number"
+          },
+          "writes": {
+            "__name__": {
+              "set": "$payload.name"
+            },
+            "rfp_ref": {
+              "set": "$payload.rfp_ref"
+            },
+            "proposal_ref": {
+              "set": "$payload.proposal_ref"
+            },
+            "org": {
+              "append": "$actor"
+            },
+            "builder": {
+              "append": "$payload.builder"
+            },
+            "total": {
+              "set": "$payload.total"
+            },
+            "status": {
+              "set": "active"
+            }
+          }
+        },
+        "complete": {
+          "payload": {},
+          "writes": {
+            "status": {
+              "set": "completed"
+            }
+          },
+          "pre": [
+            {
+              "actor-in": "org"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "active"
+              }
+            }
+          ]
+        },
+        "terminate": {
+          "payload": {
+            "reason": "string"
+          },
+          "writes": {
+            "status": {
+              "set": "terminated"
+            }
+          },
+          "pre": [
+            {
+              "actor-in": "org"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "active"
+              }
+            }
+          ]
+        }
+      }
+    },
+    {
+      "name": "milestone",
+      "version": "1",
+      "$comment": [
+        "A unit of delivery. `accepted` records a payout INTENT only \u2014 no",
+        "money moves. Settlement is explicitly out of scope for the MVP."
+      ],
+      "fields": {
+        "agreement_ref": "string",
+        "org": "string[]",
+        "builder": "string[]",
+        "title": "string",
+        "amount": "number",
+        "evidence": "string",
+        "status": "string"
+      },
+      "reducers": {
+        "init": {
+          "payload": {
+            "name": "string",
+            "agreement_ref": "string",
+            "builder": "string",
+            "title": "string",
+            "amount": "number"
+          },
+          "writes": {
+            "__name__": {
+              "set": "$payload.name"
+            },
+            "agreement_ref": {
+              "set": "$payload.agreement_ref"
+            },
+            "org": {
+              "append": "$actor"
+            },
+            "builder": {
+              "append": "$payload.builder"
+            },
+            "title": {
+              "set": "$payload.title"
+            },
+            "amount": {
+              "set": "$payload.amount"
+            },
+            "status": {
+              "set": "pending"
+            }
+          }
+        },
+        "submit": {
+          "$comment": "Only the builder may claim a milestone is done.",
+          "payload": {
+            "evidence": "string"
+          },
+          "writes": {
+            "evidence": {
+              "set": "$payload.evidence"
+            },
+            "status": {
+              "set": "submitted"
+            }
+          },
+          "pre": [
+            {
+              "actor-in": "builder"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "pending"
+              }
+            }
+          ]
+        },
+        "accept": {
+          "$comment": "Only the org may accept it. Records payout intent.",
+          "payload": {},
+          "writes": {
+            "status": {
+              "set": "accepted"
+            }
+          },
+          "pre": [
+            {
+              "actor-in": "org"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "submitted"
+              }
+            }
+          ]
+        },
+        "reject": {
+          "payload": {
+            "reason": "string"
+          },
+          "writes": {
+            "status": {
+              "set": "pending"
+            }
+          },
+          "pre": [
+            {
+              "actor-in": "org"
+            },
+            {
+              "field-is": {
+                "field": "status",
+                "value": "submitted"
+              }
+            }
+          ]
+        }
+      }
+    }
+  ]
+}

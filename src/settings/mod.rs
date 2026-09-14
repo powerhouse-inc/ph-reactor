@@ -906,10 +906,18 @@ async fn group_action(
 
 #[derive(serde::Deserialize)]
 struct ProposeBody {
+    /// The document the action targets. Named `group` because the first
+    /// quorum-gated reducer was `group`'s `add-manager`, but any document
+    /// whose model declares a quorum works.
     group: String,
     kind: String,
     #[serde(default)]
     payload: Value,
+    /// The governing model. Defaults to `group@1` for the membership actions
+    /// this was built for; domain models that declare their own quorum (the
+    /// Achra `rfp` model gates `award` on two approvers) pass their own.
+    #[serde(default)]
+    model: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -944,9 +952,14 @@ async fn propose_api(
     state: axum::extract::State<Arc<Settings>>,
     axum::extract::Json(body): axum::extract::Json<ProposeBody>,
 ) -> Response {
+    let model = match body.model {
+        Some(m) if m.contains('@') => m,
+        Some(m) => format!("{m}@1"),
+        None => "group@1".into(),
+    };
     string_command(&state, |reply| Command::Propose {
         name: body.group,
-        model: "group@1".into(),
+        model,
         kind: body.kind,
         payload: body.payload,
         reply,
