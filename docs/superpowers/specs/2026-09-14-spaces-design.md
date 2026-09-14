@@ -242,6 +242,7 @@ Three rules:
 | # | Risk | Handling |
 |---|------|----------|
 | 1 | Concurrent membership edits diverge; a removed member is resurrected | **Fixed in `caf6f89`** before this work, with two regression tests |
+| 1b | A restart silently made protected and private documents world-readable | **Fixed in `b8442df`**, found live; see below |
 | 2 | Changing `message_bytes` silently partitions old and new nodes | `skip_serializing_if`; a mixed-version sync test (a real 1.9.0 node against a new build) is a merge gate; cluster auto-update **already turned off** (`38ddce81` in the hosting repo) |
 | 3 | No safe default for unstamped documents | Explicit per-model mapping + `--dry-run`; no implicit default exists |
 | 4 | ACL bootstrap is circular; revocation is eventually consistent | A space document is served to anyone named in the server's own copy of it. Stated plainly: **revocation is best-effort and forward-only**; someone who stops syncing keeps a valid-looking membership |
@@ -252,24 +253,62 @@ Three rules:
 | 9 | The commons is world-writable: spam, and GC cannot collect referenced junk | **Unsolved.** Out of scope for v1 and called out as a gap in the marketplace story |
 | 10 | One long branch against a deployed, self-updating daemon | Phased below; each phase ships on its own |
 
-## Phases
+## Phases — all delivered
 
-Each is independently shippable and independently valuable.
+1. ~~Canonical action order and re-fold~~ — `caf6f89`
+2. ~~The signed envelope alone~~ — `9b66521`
+3. ~~`space@1` and enforcement~~ — `43bb68d`
+4. ~~Apps in spaces, space-scoped capabilities, the console~~ — `a35c6a9`
+5. ~~Chat and Drive as apps, and the `group@1` migration~~ — `898e7e3`
+6. ~~Projections~~ — `8c7dd5f`
 
-1. ~~Canonical action order and re-fold~~ — **done** (`caf6f89`).
-2. **The signed envelope alone.** `space` on the action, always absent, no
-   enforcement. Ships with the mixed-version sync test. This is the only
-   change that can partition the mesh, so it travels by itself where it is
-   observable.
-3. **`space@1` and enforcement.** The model, the three tiers, the `CatchUp`
-   and `Summary` checks, direct sends for non-public spaces.
-4. **Apps in spaces.** Enable/disable, space-scoped capabilities, the space
-   switcher.
-5. **Chat and Drive as apps**, and the `group@1` migration.
-6. **Projections.**
+One mechanism was not in the original design and turned out to be the keystone
+of phase 5: **`space-member`**, a precondition declared by a model and checked
+by the store against the *space* document, the same arrangement `quorum`
+already used. Without it an app cannot actually inherit its space's
+membership — the L1 precondition DSL only reads the document's own fields — so
+every app would have gone on carrying its own access list, which was the
+problem this design exists to solve. `{"space-member": true}` means members;
+`{"space-member": "managers"}` names another list.
 
-Phase 2 is where the risk is concentrated; phases 4 and 5 are where the
-feeling of a connected suite arrives.
+## What live testing found that tests did not
+
+Two bugs, both caught by running real daemons rather than by the suite.
+
+**A restart made every protected and private document world-readable**
+(`b8442df`). `replay_doc` rebuilds entries straight from the WAL instead of
+going through `apply_action`, and it never restored a document's space.
+`may_peer_read` treats a document with no space as one written before spaces
+existed and serves it to anyone. Silent: the console still displayed the right
+tier. The two-node test showed it plainly — of six spaces on the source node,
+exactly the three created *before* a restart replicated to a non-member,
+regardless of tier, and none of the three created after it did. Replay also
+folded the WAL in arrival order rather than canonical order, so a restarted
+node could diverge from one that stayed up; both are fixed, and the regression
+test was checked against the unfixed code.
+
+**The migration found nothing.** `plan_for` read the group's document id out
+of the query projection, which carries `name`, `model` and `fields` and no id.
+The unit tests fabricated documents *with* an id, so they passed while the
+real endpoint returned "0 groups to migrate" with no error. The fixture now
+matches what a daemon actually returns, and a test pins that it has no id.
+
+Both are the same shape: a unit test agreeing with an assumption the running
+system does not share.
+
+## Verified end to end
+
+Against two live daemons, after a restart:
+
+- A non-member received exactly the public space, a second public space, and
+  the one chat document in it — three documents. The private space, both
+  protected spaces, and every document in them were withheld.
+- Removing the node from a space's `members` immediately blocked posting to a
+  chat document in that space — a document whose model says nothing about
+  membership.
+- The migration dry run named every document it would create and the one it
+  would delete; applying it produced the space, two chat documents and a
+  drive, and running it again was a no-op.
 
 ## Open questions
 
