@@ -114,8 +114,16 @@ pub struct NavItem {
 /// The console chrome a plugin asks for.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PluginUi {
-    #[serde(default)]
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub nav: Vec<NavItem>,
+}
+
+impl PluginUi {
+    /// Whether this asks for nothing, so it can be omitted from the signed
+    /// bytes entirely. See the note on [`Manifest::ui`].
+    pub fn is_empty(&self) -> bool {
+        self.nav.is_empty()
+    }
 }
 
 /// Names a plugin may not take.
@@ -236,7 +244,17 @@ pub struct Manifest {
     /// Console chrome the plugin asks for — sidebar entries. Signed with the
     /// rest, so what appears in the navigation is what the publisher vouched
     /// for and the operator approved.
-    #[serde(default)]
+    ///
+    /// `skip_serializing_if` is load-bearing, not tidiness. `message_bytes`
+    /// serializes this whole struct, so a field that always appears changes the
+    /// bytes every past signature was made over — and every package published
+    /// before the field existed stops verifying. That is exactly what happened
+    /// when this one was added: already-published packages went from "valid" to
+    /// "bad signature" in the console, with nothing wrong with them.
+    ///
+    /// So: every optional field added from here on MUST omit itself when empty.
+    /// `a_manifest_signed_before_a_field_existed_still_verifies` holds the line.
+    #[serde(default, skip_serializing_if = "PluginUi::is_empty")]
     pub ui: PluginUi,
     /// ed25519 signature over [`Manifest::message_bytes`], hex-encoded.
     #[serde(default)]
@@ -571,5 +589,74 @@ mod tests {
             view: String::new(),
         });
         assert!(m.verify().is_err());
+    }
+
+    /// Adding a field to this struct must not invalidate packages already
+    /// published and signed. `message_bytes` covers the whole struct, so any
+    /// field that always serializes changes the bytes every old signature was
+    /// made over.
+    ///
+    /// Not hypothetical: adding `ui` did exactly this, and a package that had
+    /// been installed happily showed up as "bad signature" the next time the
+    /// daemon looked at it.
+    #[test]
+    fn a_manifest_signed_before_a_field_existed_still_verifies() {
+        // A manifest as an older publisher wrote it: no `ui` key at all.
+        let k = key(1);
+        let mut older = manifest(&k);
+        older.ui = PluginUi::default();
+        older.sign(&k);
+        let wire = serde_json::to_string(&older).expect("serialize");
+        assert!(
+            !wire.contains("\"ui\""),
+            "an empty ui must not appear in the signed bytes, or old packages break: {wire}"
+        );
+
+        // Round-tripping through today's struct must still verify.
+        let back: Manifest = serde_json::from_str(&wire).expect("deserialize");
+        assert!(
+            back.verify().is_ok(),
+            "a package signed before `ui` existed must still verify"
+        );
+    }
+
+    /// The rule above, enforced structurally: a manifest that asks for nothing
+    /// optional must serialize only the keys an old publisher would have
+    /// written. A new field without `skip_serializing_if` fails here.
+    #[test]
+    fn an_empty_manifest_serializes_only_its_required_keys() {
+        let m = Manifest {
+            name: "x".into(),
+            version: "1".into(),
+            description: String::new(),
+            category: String::new(),
+            publisher: PublisherInfo::default(),
+            publisher_key: String::new(),
+            document_models: vec![],
+            processors: vec![],
+            bundle: None,
+            capabilities: Capabilities::default(),
+            ui: PluginUi::default(),
+            sig: String::new(),
+        };
+        let v: serde_json::Value = serde_json::to_value(&m).expect("serialize");
+        let keys: Vec<&str> = v.as_object().expect("object").keys().map(String::as_str).collect();
+        let expected = [
+            "capabilities",
+            "category",
+            "description",
+            "documentModels",
+            "name",
+            "processors",
+            "publisher",
+            "publisher_key",
+            "sig",
+            "version",
+        ];
+        assert_eq!(
+            keys, expected,
+            "a new optional field must omit itself when empty, or it \
+             invalidates every signature made before it existed"
+        );
     }
 }
