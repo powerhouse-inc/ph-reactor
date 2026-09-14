@@ -222,7 +222,114 @@ Mesh sync, hash verification, `models.json` persistence, ed25519 signing, TOFU
 key pinning, the auth/quorum engine, the processor runner, and the Powerhouse
 manifest format and design system.
 
+## The user interface
+
+Plugins are only real when someone can use them, so the interface is part of
+this design rather than a follow-up.
+
+### Two surfaces, one seam
+
+| Surface | Stack | Origin |
+|---|---|---|
+| Host console — daemon control panel, plugin list, install prompts | framework-free, as today | `settings.host:4002` |
+| Plugin editors — Achra, knowledge vault, … | React + `@powerhousedao/design-system` | `settings.host:4003` |
+
+They never share a page. The host renders a plugin at `#/plugins/<name>` as an
+**iframe** pointing at the asset origin, and that iframe is the entire
+security boundary.
+
+This is also why two UI stacks is not the inconsistency it appears to be: the
+host is a shell for operating a daemon, plugins are applications. They are
+separated by a boundary that has to exist anyway.
+
+### The plugin asset server
+
+A **second listener**, serving static bundle files and nothing else — no API
+routes, not one. Port is part of the browser's origin tuple, so
+`127.0.0.1:4003` is a different origin from `127.0.0.1:4002` and the
+same-origin policy does the enforcement for us.
+
+The separation is **structural, not a filter**: the asset server is a distinct
+router with no access to the command channel or the store. The console's 42
+API routes remain where they are. This is the same discipline as the narrow
+submit endpoint in the Achra design — a boundary someone can misconfigure is
+not a boundary.
+
+### The capability bridge
+
+The editor cannot reach the API directly, so every call crosses `postMessage`:
+
+```
+editor (iframe, :4003)                host console (:4002)
+  ph.query("rfp@1", {status:"open"})
+        │  postMessage {id, op:"query", model, filter}
+        ▼
+                          check: is "rfp@1" in the package's read allowlist?
+                          no  -> {id, error:"capability not granted"}
+                          yes -> GET /api/query?model=rfp  -> {id, result}
+```
+
+Writes carry the reducer kind, checked against the write allowlist, and are
+then subject to the model's own `auth`, `pre` and quorum rules exactly as any
+other action. The bridge narrows what a plugin may attempt; it never widens
+what the store permits.
+
+The host is the only component that talks to the API. A plugin holds no
+credentials and cannot construct a request the bridge did not mediate.
+
+### The editor SDK
+
+Plugin authors import a small client that wraps the bridge, so nobody
+hand-writes `postMessage` plumbing:
+
+```ts
+import { useQuery, useSubmit } from "@powerhousedao/ph-reactor-sdk";
+
+const rfps = useQuery("rfp@1", { field: "status", value: "open" });
+const submit = useSubmit();
+await submit("proposal@1", "init", { name, rfp_ref, summary, amount });
+```
+
+Deliberately shaped after `reactor-browser`'s hook vocabulary so the mental
+model transfers for anyone who has written a Powerhouse editor, even though the
+transport underneath is different.
+
+### Host console additions
+
+- **Plugins** in the sidebar: installed packages, and packages seen on the mesh
+  but not installed.
+- **Install prompt** stating the publisher, whether that key is already trusted,
+  and the requested capabilities in plain language — "read RFPs and proposals;
+  create and withdraw proposals" — not a JSON blob.
+- **Plugin routes** rendering the iframe, with the plugin's name and publisher
+  visible in the frame so a page can never impersonate the console itself.
+
+### One decision left open
+
+The host console stays framework-free. It is a daemon control panel, the
+existing policy is deliberate, and the iframe boundary means nothing is shared
+with plugin UI anyway. **Recommendation: keep it that way**; if the console
+should instead be rebuilt on React and the design system, that is a separate
+piece of work with its own justification, not a side effect of adding plugins.
+
+## Implementation sequencing
+
+Each slice is independently useful, which is what makes this safe to stage:
+
+1. **Blob transport** — chunked, content-addressed, with garbage collection.
+   Useful on its own; everything else depends on it.
+2. **Package format + trust** — manifest, signing, verification, the publisher
+   trust store and the install lifecycle. At this point packages distribute and
+   verify with no UI.
+3. **Asset server + bridge** — the second listener and capability enforcement.
+   The highest-risk slice; it is where the security tests live.
+4. **Host console plugin views** — list, install prompt, plugin routes.
+5. **Editor SDK + the first real editor** — Achra's marketplace UI, which is
+   also the proof that the whole path works end to end.
+
 ## Testing
+
+
 
 | Level | What |
 |---|---|
@@ -234,6 +341,10 @@ manifest format and design system.
 | Integration | Install offline from a peer that has the bundle, with no internet |
 | Integration | A plugin's models survive a restart (they go through `models.json`) |
 | Security | The iframe cannot reach `/api/config`, `/api/drives` or `/api/quit` — asserted, not assumed |
+| Security | The asset server exposes no API route at all — assert the route list, as `validate.sh` asserts the console has no Ingress |
+| Security | A bridge call outside the declared capabilities is refused, and refusal is logged |
+| UI | The install prompt renders the requested capabilities in plain language, not raw JSON |
+| UI | An editor renders, queries and submits through the bridge against a live reactor |
 | Security | A package signed by an untrusted key is never installed, even if its hash is valid |
 
 ## Risks
