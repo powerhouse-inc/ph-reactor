@@ -103,6 +103,11 @@ impl StatePaths {
         self.root.join("processors.json")
     }
 
+    /// Publishers this node accepts packages from (see package::trust).
+    pub fn publishers_file(&self) -> PathBuf {
+        self.root.join("publishers.json")
+    }
+
     /// Content-addressed chunk store for package bundles.
     pub fn blobs_dir(&self) -> PathBuf {
         self.root.join("blobs")

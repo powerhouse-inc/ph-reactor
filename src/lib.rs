@@ -32,6 +32,7 @@ pub mod drives;
 pub mod logrotate;
 pub mod model;
 pub mod p2p;
+pub mod package;
 pub mod paths;
 pub mod processor;
 pub mod query;
