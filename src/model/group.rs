@@ -236,10 +236,16 @@ mod tests {
 
     /// A doc whose `channels` is the default `general` plus a *private* `ops`
     /// channel whose allow-list is `private_members`.
-    fn doc_with_private_channel(members: &[&str], managers: &[&str], private_members: &[&str]) -> Doc {
+    fn doc_with_private_channel(
+        members: &[&str],
+        managers: &[&str],
+        private_members: &[&str],
+    ) -> Doc {
         let mut d = doc(members, managers);
         let mut chans = vec![general_channel()];
-        chans.push(json!({ "name": "ops", "visibility": "private", "members": arr(private_members) }));
+        chans.push(
+            json!({ "name": "ops", "visibility": "private", "members": arr(private_members) }),
+        );
         d.fields.insert("channels".into(), f(Value::Array(chans)));
         d
     }
@@ -247,7 +253,12 @@ mod tests {
     /// Map the ops a reduce produced, keyed by field, for order-independent asserts.
     fn writes(ops: &[Op]) -> std::collections::BTreeMap<String, Value> {
         ops.iter()
-            .map(|o| (o.key.as_deref().unwrap().to_string(), o.value.clone().unwrap()))
+            .map(|o| {
+                (
+                    o.key.as_deref().unwrap().to_string(),
+                    o.value.clone().unwrap(),
+                )
+            })
             .collect()
     }
 
@@ -285,7 +296,11 @@ mod tests {
         let ops = m
             .reduce(
                 &doc(&["alice"], &["alice"]),
-                &action("post", json!({ "text": "hi", "channel": "general" }), "alice"),
+                &action(
+                    "post",
+                    json!({ "text": "hi", "channel": "general" }),
+                    "alice",
+                ),
             )
             .unwrap();
         let w = writes(&ops);
@@ -305,7 +320,11 @@ mod tests {
         let ops = m
             .reduce(
                 &d,
-                &action("post", json!({ "text": "again", "channel": "general" }), "alice"),
+                &action(
+                    "post",
+                    json!({ "text": "again", "channel": "general" }),
+                    "alice",
+                ),
             )
             .unwrap();
         let w = writes(&ops);
@@ -335,7 +354,11 @@ mod tests {
         assert!(matches!(
             m.check_precondition(
                 &d,
-                &action("post", json!({ "text": "x", "channel": "general" }), "alice")
+                &action(
+                    "post",
+                    json!({ "text": "x", "channel": "general" }),
+                    "alice"
+                )
             ),
             Err(Reject::Precondition(_))
         ));
@@ -350,11 +373,11 @@ mod tests {
         // private `ops` channel's allow-list.
         let d = doc_with_private_channel(&["alice", "bob"], &["alice"], &["bob"]);
         let a = action("post", json!({ "text": "s", "channel": "ops" }), "alice");
-        assert!(m.check_precondition(&d, &a).is_ok(), "group-member gate passes");
-        assert!(matches!(
-            m.authorize(&d, &a),
-            Err(Reject::Precondition(_))
-        ));
+        assert!(
+            m.check_precondition(&d, &a).is_ok(),
+            "group-member gate passes"
+        );
+        assert!(matches!(m.authorize(&d, &a), Err(Reject::Precondition(_))));
     }
 
     #[test]
@@ -375,7 +398,11 @@ mod tests {
         assert!(m
             .authorize(
                 &d,
-                &action("post", json!({ "text": "s", "channel": "general" }), "alice")
+                &action(
+                    "post",
+                    json!({ "text": "s", "channel": "general" }),
+                    "alice"
+                )
             )
             .is_ok());
     }
@@ -450,7 +477,10 @@ mod tests {
         let m = model();
         let d = doc(&["alice", "bob"], &["alice"]); // bob: member, not manager
         assert!(matches!(
-            m.check_precondition(&d, &action("remove-channel", json!({ "channels": [] }), "bob")),
+            m.check_precondition(
+                &d,
+                &action("remove-channel", json!({ "channels": [] }), "bob")
+            ),
             Err(Reject::Precondition(_))
         ));
     }

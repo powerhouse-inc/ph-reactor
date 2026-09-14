@@ -108,10 +108,7 @@ impl Settings {
             .route("/api/groups/:name/action", post(group_action))
             .route("/api/groups/:name/activity", get(group_activity))
             .route("/api/groups/:name/channels", post(channel_add))
-            .route(
-                "/api/groups/:name/channels/:chan",
-                delete(channel_remove),
-            )
+            .route("/api/groups/:name/channels/:chan", delete(channel_remove))
             .route("/api/groups/:name/drive/folder", post(drive_folder))
             .route("/api/groups/:name/drive/doc", post(drive_doc))
             .route("/api/folders", get(folders_api).post(create_folder))
@@ -1101,7 +1098,14 @@ async fn channel_remove(
         .into_iter()
         .filter(|c| c.get("name").and_then(Value::as_str) != Some(chan.as_str()))
         .collect();
-    set_group_field(&state, &name, "channels", "remove-channel", Value::Array(next)).await
+    set_group_field(
+        &state,
+        &name,
+        "channels",
+        "remove-channel",
+        Value::Array(next),
+    )
+    .await
 }
 
 /// `POST /api/groups/:name/drive/folder` — add a folder to the drive (a
@@ -1162,7 +1166,12 @@ async fn drive_doc(
     if body.model.trim().is_empty() {
         return (StatusCode::BAD_REQUEST, "a model type is required").into_response();
     }
-    let model = match state.store.model_refs().into_iter().find(|r| r.name == body.model) {
+    let model = match state
+        .store
+        .model_refs()
+        .into_iter()
+        .find(|r| r.name == body.model)
+    {
         Some(r) => format!("{}@{}", r.name, r.version),
         None => body.model.clone(),
     };
@@ -1191,14 +1200,7 @@ async fn drive_doc(
         "model": type_name,
         "parent": body.parent,
     });
-    run_create_action(
-        &state,
-        &name,
-        "group@1",
-        "add-doc",
-        json!({ "item": item }),
-    )
-    .await
+    run_create_action(&state, &name, "group@1", "add-doc", json!({ "item": item })).await
 }
 
 /// `POST /api/groups/:name/drive` — compatibility "new file": create a `note`
@@ -1244,14 +1246,7 @@ async fn drive_add(
         "model": "note",
         "parent": Value::Null,
     });
-    run_create_action(
-        &state,
-        &name,
-        "group@1",
-        "add-doc",
-        json!({ "item": item }),
-    )
-    .await
+    run_create_action(&state, &name, "group@1", "add-doc", json!({ "item": item })).await
 }
 
 /// `DELETE /api/groups/:name/drive/:item` — remove a drive item (a folder or
@@ -1330,7 +1325,10 @@ fn init_payload_with_defaults(def: Option<&Value>, name: &str, fields: &Value) -
         .and_then(|r| r.get("payload"));
     if let Some(obj) = schema.and_then(Value::as_object) {
         for (f, t) in obj {
-            let v = fields.get(f).cloned().unwrap_or_else(|| default_value(t.as_str().unwrap_or("")));
+            let v = fields
+                .get(f)
+                .cloned()
+                .unwrap_or_else(|| default_value(t.as_str().unwrap_or("")));
             out.insert(f.clone(), v);
         }
     }

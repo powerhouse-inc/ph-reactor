@@ -362,8 +362,7 @@ impl Model for L1 {
         };
         let field = rule.get("field").and_then(Value::as_str).unwrap_or("");
         let name_key = rule.get("name").and_then(Value::as_str).unwrap_or("name");
-        let match_val = self
-            .eval_template(action, rule.get("match").unwrap_or(&Value::Null));
+        let match_val = self.eval_template(action, rule.get("match").unwrap_or(&Value::Null));
         let vis_key = rule
             .get("visibility")
             .and_then(Value::as_str)
@@ -374,7 +373,10 @@ impl Model for L1 {
                 .unwrap_or("private")
                 .to_string(),
         );
-        let allow_key = rule.get("allow").and_then(Value::as_str).unwrap_or("members");
+        let allow_key = rule
+            .get("allow")
+            .and_then(Value::as_str)
+            .unwrap_or("members");
         for entry in current_array(state, field).iter() {
             if entry.get(name_key) != Some(&match_val) {
                 continue;
@@ -389,7 +391,9 @@ impl Model for L1 {
                 .and_then(Value::as_array)
                 .cloned()
                 .unwrap_or_default();
-            let allowed = allow.iter().any(|m| m.as_str() == Some(action.origin.as_str()));
+            let allowed = allow
+                .iter()
+                .any(|m| m.as_str() == Some(action.origin.as_str()));
             if !allowed {
                 return Err(Reject::Precondition(format!(
                     "actor {} is not a member of the private channel '{}'",
