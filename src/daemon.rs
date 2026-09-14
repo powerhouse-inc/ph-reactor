@@ -761,8 +761,16 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
             }
         },
         Command::Invite { groups, reply } => {
-            let listen = match ctx.listen.clone() {
-                Some(l) => l,
+            // What the JOINER will dial. A configured external address wins
+            // over the bind address: behind a load balancer or reverse proxy
+            // the swarm reports local addresses (including loopback), and an
+            // invite carrying those tells the joiner to dial its own machine.
+            let listen_str = ctx.listen.as_ref().map(|l| l.to_string());
+            let listen = match crate::p2p::invite::pick_invite_addr(
+                &ctx.config.instance.external,
+                listen_str.as_deref(),
+            ) {
+                Some(a) => a,
                 None => {
                     let _ = reply.send(Err(
                         "the reactor has not announced its listen address yet; retry".to_string(),
@@ -770,6 +778,14 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
                     return Ok(false);
                 }
             };
+            if crate::p2p::invite::is_undialable_by_peers(&listen) {
+                // Legitimate when both reactors share a machine, so this
+                // warns rather than refusing -- but it is the likeliest
+                // explanation for an invite that "just doesn't connect".
+                tracing::warn!(
+                    "invite carries {listen}, which a remote peer cannot dial;                      set instance.external if this node is behind a proxy or load balancer"
+                );
+            }
             let groups = if groups.is_empty() {
                 vec![ctx.config.instance.name.clone()]
             } else {
@@ -781,7 +797,7 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
                 &ctx.config.instance.name,
                 &ctx.peer_id.to_base58(),
                 &signing,
-                &listen.to_string(),
+                &listen,
                 groups,
             ) {
                 Ok(token) => match token.encode() {

@@ -205,6 +205,35 @@ pub fn new_nonce() -> Result<Vec<u8>, String> {
     Ok(n.to_vec())
 }
 
+/// Chooses the multiaddr to embed in an invite: the address the *joiner*
+/// will dial.
+///
+/// Prefers a configured external address over the local bind address. Behind
+/// a load balancer or a reverse proxy those are entirely different things --
+/// the bind address is `0.0.0.0`, which the swarm reports as a set of local
+/// addresses including loopback. An invite carrying `/ip4/127.0.0.1/...`
+/// tells the joiner to dial its own machine, and the failure looks like an
+/// unreachable peer rather than a malformed invite.
+///
+/// Returns `None` when there is nothing to offer at all.
+pub fn pick_invite_addr(external: &[String], listen: Option<&str>) -> Option<String> {
+    if let Some(first) = external.iter().find(|a| !a.trim().is_empty()) {
+        return Some(first.trim().to_string());
+    }
+    listen.map(|l| l.to_string())
+}
+
+/// Whether an address is one a remote peer could never dial.
+///
+/// Used only to warn: the address still goes into the invite, because a
+/// loopback invite is legitimate when both reactors are on one machine.
+pub fn is_undialable_by_peers(addr: &str) -> bool {
+    addr.contains("/ip4/0.0.0.0/")
+        || addr.contains("/ip6/::/")
+        || addr.contains("/ip4/127.")
+        || addr.contains("/ip6/::1/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -309,5 +338,50 @@ mod tests {
         let b = new_nonce().unwrap();
         assert_eq!(a.len(), NONCE_BYTES);
         assert_ne!(a, b);
+    }
+
+    #[test]
+    fn invite_addr_prefers_an_external_address() {
+        // The whole point: behind a proxy the bind address is useless, so a
+        // configured external address must win.
+        let ext = vec![
+            "/ip4/203.0.113.9/tcp/25422".to_string(),
+            "/dns4/ws.example/tcp/443/tls/ws".to_string(),
+        ];
+        let got = pick_invite_addr(&ext, Some("/ip4/127.0.0.1/tcp/25423/ws"));
+        assert_eq!(got.as_deref(), Some("/ip4/203.0.113.9/tcp/25422"));
+    }
+
+    #[test]
+    fn invite_addr_falls_back_to_listen_when_no_external() {
+        let got = pick_invite_addr(&[], Some("/ip4/10.0.0.5/tcp/25422"));
+        assert_eq!(got.as_deref(), Some("/ip4/10.0.0.5/tcp/25422"));
+    }
+
+    #[test]
+    fn invite_addr_skips_blank_external_entries() {
+        let ext = vec![
+            "".to_string(),
+            "   ".to_string(),
+            "/ip4/198.51.100.1/tcp/25422".to_string(),
+        ];
+        let got = pick_invite_addr(&ext, Some("/ip4/127.0.0.1/tcp/1"));
+        assert_eq!(got.as_deref(), Some("/ip4/198.51.100.1/tcp/25422"));
+    }
+
+    #[test]
+    fn invite_addr_is_none_with_nothing_to_offer() {
+        assert_eq!(pick_invite_addr(&[], None), None);
+    }
+
+    #[test]
+    fn undialable_addresses_are_recognised() {
+        // These are exactly what a container reports for a 0.0.0.0 bind.
+        assert!(is_undialable_by_peers("/ip4/127.0.0.1/tcp/25423/ws"));
+        assert!(is_undialable_by_peers("/ip4/0.0.0.0/tcp/25422"));
+        assert!(is_undialable_by_peers("/ip6/::1/tcp/25422"));
+        // A real routable address is fine.
+        assert!(!is_undialable_by_peers("/ip4/46.225.34.129/tcp/25422"));
+        assert!(!is_undialable_by_peers("/dns4/ws.example/tcp/443/tls/ws"));
     }
 }
