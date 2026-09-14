@@ -338,6 +338,25 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         )
     })?;
 
+    // The plugin asset origin: a SECOND listener, serving editor bundles and
+    // nothing else. A different port is a different browser origin, which is
+    // what keeps a plugin's UI away from the unauthenticated console API.
+    // Failing to bind it is not fatal -- the reactor is fully usable without
+    // plugin UI, and refusing to start over it would be a poor trade.
+    let assets_port = config.settings.port.saturating_add(1);
+    if let Err(e) = crate::settings::assets::start(
+        &config.settings.host,
+        assets_port,
+        crate::settings::assets::AssetState {
+            paths: paths.clone(),
+            blobs: blobs.clone(),
+        },
+    )
+    .await
+    {
+        tracing::warn!("plugin assets unavailable: {e}");
+    }
+
     // The status-bar tray (headless environments continue without it).
     let tray = tray::start(snap_rx, cmd_tx).await;
     match &tray {

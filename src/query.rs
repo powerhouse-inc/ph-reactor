@@ -18,7 +18,11 @@ use serde_json::{json, Value};
 use crate::store::Store;
 
 /// A field-equality predicate for [`query_docs`].
-#[derive(Debug, Clone)]
+///
+/// Deserializable so a plugin can send one over the bridge; it is a pure
+/// predicate with no way to express anything but field equality, which is what
+/// keeps an untrusted caller from smuggling a query it was not granted.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct FieldFilter {
     pub field: String,
     pub value: Value,

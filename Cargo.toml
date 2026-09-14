@@ -81,6 +81,10 @@ quic = ["libp2p/quic"]
 [dev-dependencies]
 tempfile = "3"
 ed25519-dalek = "2"
+# Lets the asset-server security tests drive the router as a real HTTP service
+# and assert what it returns, rather than inspecting the source for route names.
+tower = { version = "0.5", features = ["util"] }
+http-body-util = "0.1"
 
 [profile.release]
 strip = "symbols"

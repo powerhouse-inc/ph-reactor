@@ -4,6 +4,8 @@
 //! mutations to the daemon's command channel, so page actions cannot
 //! race the poller or the tray menu.
 
+pub mod assets;
+
 use std::collections::BTreeMap;
 use std::str::FromStr;
 use std::sync::Arc;
@@ -91,6 +93,9 @@ impl Settings {
             .route("/api/propose", post(propose_api))
             .route("/api/cosign", post(cosign_api))
             .route("/api/submit", post(submit_api))
+            .route("/api/plugins", get(plugins_api))
+            .route("/api/plugins/:name/query", post(plugin_query))
+            .route("/api/plugins/:name/action", post(plugin_action))
             .route("/api/join", post(join_invite))
             .route("/api/ban", post(ban_peer))
             .route("/api/unban", post(unban_peer))
@@ -989,6 +994,135 @@ async fn submit_api(
         reply,
     })
     .await
+}
+
+// -- plugin bridge ----------------------------------------------------------
+//
+// Capability enforcement lives HERE, in Rust, not in the console's JavaScript.
+// The host page mediates the iframe's postMessage calls, but if that were the
+// only check then anything able to reach this origin would bypass it. Enforcing
+// server-side means the console's JS is a convenience, not the security
+// boundary.
+
+#[derive(serde::Deserialize)]
+struct PluginQueryBody {
+    /// `name@version`, matched exactly against the declared capability.
+    model: String,
+    #[serde(default)]
+    filter: Option<crate::query::FieldFilter>,
+}
+
+#[derive(serde::Deserialize)]
+struct PluginActionBody {
+    model: String,
+    kind: String,
+    #[serde(default)]
+    name: String,
+    #[serde(default)]
+    payload: Value,
+}
+
+/// Looks up an installed package. `None` means not installed.
+fn installed_package(
+    state: &Arc<Settings>,
+    name: &str,
+) -> Option<crate::package::install::InstalledPackage> {
+    crate::package::install::Installed::load(&state.paths.packages_file())
+        .get(name)
+        .cloned()
+}
+
+/// `GET /api/plugins` — what is installed, for the console's plugin list.
+async fn plugins_api(state: axum::extract::State<Arc<Settings>>) -> Response {
+    let installed = crate::package::install::Installed::load(&state.paths.packages_file());
+    let out: Vec<Value> = installed
+        .list()
+        .iter()
+        .map(|p| {
+            json!({
+                "name": p.manifest.name,
+                "version": p.manifest.version,
+                "description": p.manifest.description,
+                "publisher": p.manifest.publisher.name,
+                "publisherKey": p.manifest.publisher_key,
+                "hasEditor": p.manifest.bundle.is_some(),
+                "capabilities": p.manifest.capabilities.describe(),
+                "installedAt": p.installed_at,
+            })
+        })
+        .collect();
+    (StatusCode::OK, axum::Json(out)).into_response()
+}
+
+/// `POST /api/plugins/:name/query` — a read, gated by the declared capability.
+async fn plugin_query(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<PluginQueryBody>,
+) -> Response {
+    let Some(pkg) = installed_package(&state, &name) else {
+        return (StatusCode::NOT_FOUND, "no such package installed").into_response();
+    };
+    if !pkg.manifest.capabilities.may_read(&body.model) {
+        tracing::warn!(
+            "plugin {name} attempted to read {} without the capability",
+            body.model
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            format!("this plugin may not read {}", body.model),
+        )
+            .into_response();
+    }
+    let model = body.model.split('@').next().unwrap_or_default().to_string();
+    let docs = crate::query::query_docs(&state.store, &model, body.filter.as_ref());
+    (StatusCode::OK, axum::Json(docs)).into_response()
+}
+
+/// `POST /api/plugins/:name/action` — a write, gated by the declared capability.
+///
+/// The capability narrows what the plugin may ATTEMPT. The action then goes
+/// through the ordinary path, so the model's own `auth`, `pre` and quorum rules
+/// still decide whether it applies — a capability never widens what the store
+/// permits.
+async fn plugin_action(
+    state: axum::extract::State<Arc<Settings>>,
+    axum::extract::Path(name): axum::extract::Path<String>,
+    axum::extract::Json(body): axum::extract::Json<PluginActionBody>,
+) -> Response {
+    let Some(pkg) = installed_package(&state, &name) else {
+        return (StatusCode::NOT_FOUND, "no such package installed").into_response();
+    };
+    if !pkg.manifest.capabilities.may_write(&body.model, &body.kind) {
+        tracing::warn!(
+            "plugin {name} attempted {} on {} without the capability",
+            body.kind,
+            body.model
+        );
+        return (
+            StatusCode::FORBIDDEN,
+            format!(
+                "this plugin may not perform {} on {}",
+                body.kind, body.model
+            ),
+        )
+            .into_response();
+    }
+    // `init` creates a document; every other kind acts on an existing one.
+    if body.kind == "init" {
+        let mut payload = body.payload.clone();
+        // The reducer sets __name__ from payload.name, so make sure it is
+        // there rather than silently creating an unnamed document.
+        if payload
+            .get("name")
+            .and_then(|v| v.as_str())
+            .is_none_or(str::is_empty)
+        {
+            payload["name"] = json!(body.name);
+        }
+        return run_create_doc_model(&state, &body.name, &body.model, payload).await;
+    }
+    run_create_action(&state, &body.name, &body.model, &body.kind, body.payload).await
 }
 
 /// `GET /api/groups/:name/activity` — the group's recent signed actions.
