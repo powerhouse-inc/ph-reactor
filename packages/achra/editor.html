@@ -380,7 +380,18 @@ async function poll() {
 /* ---------- start ---------- */
 skel();
 ph.host()
-  .then((h) => { if (h && h.theme) document.documentElement.dataset.theme = h.theme; })
+  .then((h) => {
+    if (!h) return;
+    if (h.theme) document.documentElement.dataset.theme = h.theme;
+    // The operator clicked a specific sidebar entry, so open what they asked
+    // for rather than always landing on the default tab.
+    if (h.view && VIEWS[h.view]) {
+      current = h.view;
+      document.querySelectorAll(".tab").forEach((t) =>
+        t.setAttribute("aria-selected", String(t.dataset.view === h.view)));
+      VIEWS[current]();
+    }
+  })
   .catch(() => { /* an older host without a handshake still works; theme follows the OS */ });
 poll();
 setInterval(poll, 5000);

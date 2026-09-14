@@ -287,6 +287,7 @@
     <div class="nav-item" data-tab="plugins"><span class="ico">▣</span> Plugins</div>
     <div class="nav-item" data-tab="settings"><span class="ico">⚙</span> Settings</div>
     <div class="nav-item" data-tab="profile"><span class="ico">☺</span> Profile</div>
+    <div id="nav-plugins"></div>
     <div class="foot">
       <div class="row"><span>peers</span><span class="mono" id="side-peers">–</span></div>
       <div class="row"><span>docs</span><span class="mono" id="side-docs">–</span></div>
@@ -344,8 +345,8 @@ const TITLES = {
 
 function switchTab(tab) {
   state.tab = tab;
-  $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.tab === tab));
   if (location.hash !== "#" + tab) history.replaceState(null, "", "#" + tab);
+  markActiveNav();
   render();
 }
 
@@ -353,23 +354,33 @@ function switchTab(tab) {
    "#plugin/@powerhousedao/achra" opens that editor. Everything else falls back
    to the overview rather than rendering a blank panel. */
 function routeFromHash() {
-  const h = decodeURIComponent(location.hash.replace(/^#/, ""));
-  if (h.startsWith("plugin/")) return { tab: "plugins", plugin: h.slice("plugin/".length) };
-  return { tab: RENDER[h] ? h : "overview", plugin: null };
+  const raw = location.hash.replace(/^#/, "");
+  if (raw.startsWith("plugin/")) {
+    // "plugin/<name>/<view>" -- the name may itself contain an encoded slash
+    // (@scope/pkg), so split the ENCODED string and decode the parts after.
+    const rest = raw.slice("plugin/".length).split("/");
+    return {
+      tab: "plugins",
+      plugin: decodeURIComponent(rest[0] || ""),
+      view: rest[1] ? decodeURIComponent(rest[1]) : "",
+    };
+  }
+  const h = decodeURIComponent(raw);
+  return { tab: RENDER[h] ? h : "overview", plugin: null, view: "" };
 }
 
 async function applyRoute() {
   const r = routeFromHash();
   state.tab = r.tab;
-  $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.tab === r.tab));
   closeBridge();
   if (r.plugin) {
     let inst = [];
     try { inst = await get("/api/plugins"); } catch {}
-    openPlugin(r.plugin, inst);
+    openPlugin(r.plugin, inst, r.view);
   } else {
     (RENDER[r.tab] || renderOverview)();
   }
+  markActiveNav();
 }
 
 function head(tab) {
@@ -1374,7 +1385,7 @@ function installPrompt(pkg, onConfirm) {
 
     <div class="caps">
       <div class="muted" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:6px">This plugin will be able to</div>
-      <ul>${capLines}</ul>
+      <ul>${capLines}${pkg.sidebar ? `<li>${esc(pkg.sidebar)}</li>` : ""}</ul>
       <div class="dim" style="font-size:12px;margin-top:10px">
         It cannot reach anything else. Your drives, identity, configuration and
         the daemon itself are on a different origin it has no access to, and every
@@ -1403,6 +1414,7 @@ async function installPackage(pkg) {
     toast(`installed ${pkg.name}`);
   }
   renderPlugins();
+  renderPluginNav();
 }
 
 async function renderPlugins() {
@@ -1483,15 +1495,66 @@ async function renderPlugins() {
     const pkg = byDoc[b.dataset.install];
     installPrompt(pkg, () => installPackage(pkg));
   }));
-  $$("[data-open-btn]").forEach((b) => (b.onclick = () => openPlugin(b.dataset.openBtn, inst)));
+  $$("[data-open-btn]").forEach((b) => (b.onclick = () => openPlugin(b.dataset.openBtn, inst, "")));
   $$("[data-remove]").forEach((b) => (b.onclick = async () => {
-    try { await del(`/api/plugins/${encodeURIComponent(b.dataset.remove)}`); toast("removed"); renderPlugins(); }
+    try { await del(`/api/plugins/${encodeURIComponent(b.dataset.remove)}`); toast("removed"); renderPlugins(); renderPluginNav(); }
     catch (e) { toast(e.message, true); }
   }));
   $$("[data-revoke]").forEach((b) => (b.onclick = async () => {
     try { await post(`/api/publishers/${encodeURIComponent(b.dataset.revoke)}/revoke`); toast("trust withdrawn"); renderPlugins(); }
     catch (e) { toast(e.message, true); }
   }));
+}
+
+/* ---- plugin-provided sidebar entries ---- */
+/*
+ * A plugin declares these in its signed manifest and the daemon validates them
+ * before install: at most three per plugin, no control characters, and never
+ * one of the console's own names. That last rule is what stops a package
+ * shipping a second "Settings" -- these entries sit among the built-in items
+ * with nothing marking them as third-party, so the name has to be the guard.
+ */
+async function renderPluginNav() {
+  const host = $("#nav-plugins");
+  if (!host) return;
+  let inst = [];
+  try { inst = await get("/api/plugins"); } catch { host.innerHTML = ""; return; }
+
+  const items = [];
+  for (const p of inst) {
+    if (!p.hasEditor) continue;
+    const nav = Array.isArray(p.nav) && p.nav.length
+      ? p.nav
+      // A plugin that declares nothing still gets one entry under its own
+      // name, so installing something always produces somewhere to go.
+      : [{ label: p.name.replace(/^@[^/]*\//, ""), icon: "", view: "" }];
+    for (const n of nav) items.push({ plugin: p.name, ...n });
+  }
+
+  host.innerHTML = items.map((n) => `
+    <div class="nav-item" data-plugin="${esc(n.plugin)}" data-view="${esc(n.view || "")}">
+      <span class="ico">${esc(n.icon || "◈")}</span> ${esc(n.label)}
+    </div>`).join("");
+
+  $$("[data-plugin]", host).forEach((el) => (el.onclick = () => {
+    location.hash = "plugin/" + encodeURIComponent(el.dataset.plugin)
+      + (el.dataset.view ? "/" + encodeURIComponent(el.dataset.view) : "");
+  }));
+  markActiveNav();
+}
+
+/* The sidebar highlight has to understand both kinds of destination. */
+function markActiveNav() {
+  const r = routeFromHash();
+  $$(".nav-item").forEach((el) => {
+    const isPlugin = el.dataset.plugin !== undefined;
+    el.classList.toggle(
+      "active",
+      isPlugin
+        ? r.plugin === el.dataset.plugin && (r.view || "") === (el.dataset.view || "")
+        : !r.plugin && el.dataset.tab === r.tab
+    );
+  });
 }
 
 /* ---- the capability bridge ---- */
@@ -1506,9 +1569,9 @@ async function renderPlugins() {
  */
 let bridgeOff = null;
 
-function openPlugin(name, installed) {
+function openPlugin(name, installed, view) {
   const pkg = (installed || []).find((p) => p.name === name);
-  const want = "#plugin/" + encodeURIComponent(name);
+  const want = "#plugin/" + encodeURIComponent(name) + (view ? "/" + encodeURIComponent(view) : "");
   if (location.hash !== want) history.replaceState(null, "", want);
   const src = `${ASSET_ORIGIN}/plugin/${encodeURIComponent(name)}`;
 
@@ -1561,7 +1624,10 @@ function openPlugin(name, installed) {
         // Handshake: the plugin learns who it is and which theme to wear. No
         // node identity, no peer list, no configuration -- a plugin has no
         // business knowing those and does not need them to render.
-        reply({ result: { plugin: name, publisher: (pkg && pkg.publisher) || "", theme: "dark" } });
+        // `view` is which of the plugin's own screens the operator asked for,
+        // taken from the sidebar entry they clicked. It was validated at
+        // install time to be a plain identifier.
+        reply({ result: { plugin: name, publisher: (pkg && pkg.publisher) || "", theme: "dark", view: view || "" } });
       } else {
         reply({ error: `unknown operation: ${String(m.op)}` });
       }
@@ -1592,6 +1658,7 @@ function render() { closeBridge(); (RENDER[state.tab] || renderOverview)(); }
 
 $$(".nav-item").forEach((n) => (n.onclick = () => switchTab(n.dataset.tab)));
 window.addEventListener("hashchange", applyRoute);
+renderPluginNav();
 applyRoute();
 </script>
 </body>

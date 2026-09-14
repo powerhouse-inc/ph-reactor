@@ -152,6 +152,14 @@ pub fn check(
         });
     }
 
+    // Sidebar entries are console chrome, so they are checked before install
+    // rather than filtered at render time: a package that asks for something
+    // it may not have is refused whole.
+    manifest
+        .ui
+        .validate()
+        .map_err(|e| InstallError::Invalid(format!("sidebar: {e}")))?;
+
     if let Some(bundle) = &manifest.bundle {
         let missing = blobs.missing(bundle).len();
         if missing > 0 {
@@ -240,6 +248,7 @@ mod tests {
             processors: vec![],
             bundle: None,
             capabilities: Capabilities::default(),
+            ui: Default::default(),
             sig: String::new(),
         };
         m.sign(k);

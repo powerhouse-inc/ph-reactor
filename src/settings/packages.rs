@@ -92,6 +92,10 @@ pub async fn list(state: State<Arc<Settings>>) -> Response {
             "signatureOk": integrity.is_ok(),
             "signatureError": integrity.err(),
             "capabilities": m.capabilities.describe(),
+            "sidebar": m.ui.describe(),
+            "nav": m.ui.nav,
+            "navValid": m.ui.validate().is_ok(),
+            "navError": m.ui.validate().err(),
             "models": m.document_models.len(),
             "hasEditor": m.bundle.is_some(),
             "bundleChunks": chunks,
@@ -159,6 +163,7 @@ pub async fn install_pkg(
                     "publisherKey": manifest.publisher_key,
                     "publisher": manifest.publisher.name,
                     "capabilities": manifest.capabilities.describe(),
+                    "sidebar": manifest.ui.describe(),
                 })),
             )
                 .into_response();
@@ -315,6 +320,9 @@ pub struct PublishBody {
     pub processors: Vec<Value>,
     #[serde(default)]
     pub capabilities: crate::package::Capabilities,
+    /// Sidebar entries the plugin asks the console to show.
+    #[serde(default)]
+    pub ui: crate::package::PluginUi,
     /// The editor, as an HTML document. Stored as content-addressed chunks and
     /// referenced from the manifest by hash.
     #[serde(default)]
@@ -328,6 +336,12 @@ pub struct PublishBody {
 /// publishing key would imply a provenance the daemon cannot back up.
 pub async fn publish(state: State<Arc<Settings>>, body: axum::Json<PublishBody>) -> Response {
     let b = body.0;
+
+    // Refuse a bad sidebar declaration here too, so a publisher finds out at
+    // publish time rather than leaving every installer to discover it.
+    if let Err(e) = b.ui.validate() {
+        return (StatusCode::BAD_REQUEST, format!("sidebar: {e}")).into_response();
+    }
 
     // Reject a definition that will not load before anything is signed or
     // stored, so a broken package never reaches the mesh in the first place.
@@ -360,6 +374,7 @@ pub async fn publish(state: State<Arc<Settings>>, body: axum::Json<PublishBody>)
         processors: b.processors,
         bundle,
         capabilities: b.capabilities,
+        ui: b.ui,
         sig: String::new(),
     };
     manifest.sign(&key);
@@ -436,6 +451,7 @@ mod tests {
             processors: vec![],
             bundle: None,
             capabilities: Default::default(),
+            ui: Default::default(),
             sig: String::new(),
         };
         let doc = json!({

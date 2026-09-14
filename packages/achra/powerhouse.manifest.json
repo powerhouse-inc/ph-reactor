@@ -11,7 +11,7 @@
     "would be a hole in exactly the provenance the signature exists to give."
   ],
   "name": "@powerhousedao/achra",
-  "version": "1.0.0",
+  "version": "1.1.0",
   "description": "A marketplace for global coordination: objectives published, proposals signed, agreements kept.",
   "category": "Coordination",
   "publisher": {
@@ -20,6 +20,13 @@
   },
   "documentModels": ["../../models/achra.json"],
   "editor": "editor.html",
+  "ui": {
+    "$comment": "Sidebar entries. The daemon validates these at install time: at most three, no control characters, and never one of the console's own names -- they sit among the built-in items, so the name is the guard against impersonation.",
+    "nav": [
+      { "label": "Achra", "icon": "\u25c6", "view": "rfps" },
+      { "label": "My proposals", "icon": "\u25a4", "view": "proposals" }
+    ]
+  },
   "capabilities": {
     "read": ["rfp@1", "proposal@1", "agreement@1", "milestone@1"],
     "write": [

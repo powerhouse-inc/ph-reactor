@@ -1057,6 +1057,7 @@ async fn plugins_api(state: axum::extract::State<Arc<Settings>>) -> Response {
                 "publisherKey": p.manifest.publisher_key,
                 "hasEditor": p.manifest.bundle.is_some(),
                 "capabilities": p.manifest.capabilities.describe(),
+                "nav": p.manifest.ui.nav,
                 "installedAt": p.installed_at,
             })
         })
@@ -2315,6 +2316,33 @@ mod console_tests {
         assert!(
             PAGE_V2.contains("ev.source !== frame.contentWindow"),
             "the bridge must only answer its own frame"
+        );
+    }
+
+    /// A plugin-supplied label reaches the sidebar, so it must be escaped on
+    /// the way in. Validation already refuses control characters and the
+    /// console's own names; escaping is what stops the label being markup.
+    #[test]
+    fn plugin_sidebar_labels_are_escaped() {
+        // Search the whole page: `renderPluginNav` appears at its call sites
+        // too, so splitting on the name lands in the wrong place.
+        let markup = PAGE_V2
+            .lines()
+            .find(|l| l.contains("data-plugin="))
+            .expect("the nav item template");
+        for field in ["esc(n.plugin)", "esc(n.view"] {
+            assert!(
+                markup.contains(field),
+                "the nav item template must escape {field}: {markup}"
+            );
+        }
+        let label_line = PAGE_V2
+            .lines()
+            .find(|l| l.contains("esc(n.label)"))
+            .expect("the label is escaped");
+        assert!(
+            label_line.contains("esc(n.icon"),
+            "the icon is escaped alongside the label: {label_line}"
         );
     }
 

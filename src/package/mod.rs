@@ -91,6 +91,124 @@ impl Capabilities {
     }
 }
 
+
+/// One sidebar entry a plugin asks the console to show.
+///
+/// These land among the console's own navigation, so they are trusted chrome
+/// and [`PluginUi::validate`] is what keeps them honest.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct NavItem {
+    /// What the sidebar shows.
+    pub label: String,
+    /// A short glyph. Kept tiny deliberately: an icon slot wide enough for
+    /// arbitrary text is a second label, and a second label is a place to
+    /// write something misleading.
+    #[serde(default)]
+    pub icon: String,
+    /// Which of the plugin's own views to open. Passed through to the editor
+    /// in the handshake; empty means its default view.
+    #[serde(default)]
+    pub view: String,
+}
+
+/// The console chrome a plugin asks for.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PluginUi {
+    #[serde(default)]
+    pub nav: Vec<NavItem>,
+}
+
+/// Names a plugin may not take.
+///
+/// The console's own items, and the product name. Without this a package could
+/// add a second "Settings" that opens a page it controls — and because plugin
+/// entries sit among the built-ins with no separating heading, that entry would
+/// look exactly like the real one.
+const RESERVED_NAV_LABELS: &[&str] = &[
+    "home", "groups", "plugins", "settings", "profile", "reactor", "documents", "types",
+    "folders", "overview",
+];
+
+/// At most this many entries per plugin. A sidebar is a shared surface; one
+/// package should not be able to fill it.
+pub const MAX_NAV_ITEMS: usize = 3;
+
+impl PluginUi {
+    /// Checks the entries before they are ever rendered.
+    ///
+    /// Called during install, so a package with a bad declaration is refused
+    /// whole rather than installed and then partially trusted.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.nav.len() > MAX_NAV_ITEMS {
+            return Err(format!(
+                "a plugin may add at most {MAX_NAV_ITEMS} sidebar entries, this one asks for {}",
+                self.nav.len()
+            ));
+        }
+        let mut seen: Vec<String> = Vec::new();
+        for item in &self.nav {
+            let label = item.label.trim();
+            if label.is_empty() {
+                return Err("a sidebar entry needs a label".into());
+            }
+            if label.chars().count() > 24 {
+                return Err(format!("sidebar label too long (max 24): {label:?}"));
+            }
+            // Control characters and line breaks have no business in a label,
+            // and are the shape of an attempt to break out of it.
+            if label.chars().any(|c| c.is_control()) {
+                return Err(format!("sidebar label contains control characters: {label:?}"));
+            }
+            let folded = label.to_lowercase();
+            if RESERVED_NAV_LABELS.contains(&folded.as_str()) {
+                return Err(format!(
+                    "\"{label}\" is a reserved sidebar name — a plugin may not impersonate the console's own navigation"
+                ));
+            }
+            if seen.contains(&folded) {
+                return Err(format!("duplicate sidebar entry: {label:?}"));
+            }
+            seen.push(folded);
+
+            if item.icon.chars().count() > 2 {
+                return Err(format!("sidebar icon must be at most 2 characters: {:?}", item.icon));
+            }
+            if item.icon.chars().any(|c| c.is_control()) {
+                return Err("sidebar icon contains control characters".into());
+            }
+            if item.view.chars().count() > 32
+                || item
+                    .view
+                    .chars()
+                    .any(|c| !c.is_ascii_alphanumeric() && c != '-' && c != '_')
+            {
+                return Err(format!(
+                    "a view name may only be letters, digits, - and _ (max 32): {:?}",
+                    item.view
+                ));
+            }
+        }
+        Ok(())
+    }
+
+    /// A plain-language line for the install prompt.
+    ///
+    /// Adding to the console's own navigation is a grant, so the operator is
+    /// told about it in the same place they are told about data access.
+    pub fn describe(&self) -> Option<String> {
+        if self.nav.is_empty() {
+            return None;
+        }
+        let names: Vec<&str> = self.nav.iter().map(|n| n.label.as_str()).collect();
+        Some(format!(
+            "add {} item{} to your sidebar: {}",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" },
+            names.join(", ")
+        ))
+    }
+}
+
 /// A package manifest.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Manifest {
@@ -115,6 +233,11 @@ pub struct Manifest {
     pub bundle: Option<BlobRef>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Console chrome the plugin asks for — sidebar entries. Signed with the
+    /// rest, so what appears in the navigation is what the publisher vouched
+    /// for and the operator approved.
+    #[serde(default)]
+    pub ui: PluginUi,
     /// ed25519 signature over [`Manifest::message_bytes`], hex-encoded.
     #[serde(default)]
     pub sig: String,
@@ -199,6 +322,7 @@ mod tests {
                     kinds: vec!["init".into(), "withdraw".into()],
                 }],
             },
+            ui: Default::default(),
             sig: String::new(),
         };
         m.sign(k);
@@ -334,5 +458,118 @@ mod tests {
         let back: Manifest = serde_json::from_str(&wire).expect("deserialize");
         assert_eq!(back, m);
         assert!(back.verify().is_ok());
+    }
+
+    #[test]
+    fn a_reasonable_sidebar_declaration_is_accepted() {
+        let ui = PluginUi {
+            nav: vec![
+                NavItem { label: "Achra".into(), icon: "\u{25c6}".into(), view: String::new() },
+                NavItem { label: "My proposals".into(), icon: "\u{25a4}".into(), view: "proposals".into() },
+            ],
+        };
+        assert!(ui.validate().is_ok());
+        assert_eq!(
+            ui.describe().expect("describes itself"),
+            "add 2 items to your sidebar: Achra, My proposals"
+        );
+    }
+
+    /// The entries sit among the console's own navigation with no separating
+    /// heading, so a plugin that could call itself "Settings" would be
+    /// indistinguishable from the real thing. It cannot.
+    #[test]
+    fn a_plugin_may_not_impersonate_the_consoles_own_navigation() {
+        for name in [
+            "Settings", "settings", "  Settings  ", "SETTINGS", "Profile", "Groups", "Home",
+            "Plugins", "Reactor",
+        ] {
+            let ui = PluginUi {
+                nav: vec![NavItem { label: name.into(), icon: String::new(), view: String::new() }],
+            };
+            assert!(
+                ui.validate().is_err(),
+                "{name:?} must be refused as a sidebar label"
+            );
+        }
+    }
+
+    #[test]
+    fn a_sidebar_label_must_be_a_label() {
+        let bad = [
+            ("", "empty"),
+            ("   ", "whitespace only"),
+            ("Se\u{0}ttings", "a NUL"),
+            ("two\nlines", "a line break"),
+            ("an extremely long label that goes well past the limit", "too long"),
+        ];
+        for (label, why) in bad {
+            let ui = PluginUi {
+                nav: vec![NavItem { label: label.into(), icon: String::new(), view: String::new() }],
+            };
+            assert!(ui.validate().is_err(), "must reject {why}: {label:?}");
+        }
+    }
+
+    #[test]
+    fn one_plugin_cannot_fill_the_sidebar() {
+        let item = |n: usize| NavItem {
+            label: format!("Item {n}"),
+            icon: String::new(),
+            view: String::new(),
+        };
+        let ok = PluginUi { nav: (0..MAX_NAV_ITEMS).map(item).collect() };
+        assert!(ok.validate().is_ok());
+        let too_many = PluginUi { nav: (0..MAX_NAV_ITEMS + 1).map(item).collect() };
+        assert!(too_many.validate().is_err());
+    }
+
+    #[test]
+    fn duplicate_entries_are_refused() {
+        let ui = PluginUi {
+            nav: vec![
+                NavItem { label: "Achra".into(), icon: String::new(), view: String::new() },
+                NavItem { label: "achra".into(), icon: String::new(), view: "x".into() },
+            ],
+        };
+        assert!(ui.validate().is_err(), "two entries that read the same are one too many");
+    }
+
+    /// A view name reaches a URL fragment and the handshake, so it is kept to
+    /// a conservative alphabet rather than trusted to be harmless.
+    #[test]
+    fn a_view_name_is_a_plain_identifier() {
+        for view in ["../admin", "a b", "x<script>", "'", &"v".repeat(33)] {
+            let ui = PluginUi {
+                nav: vec![NavItem { label: "Achra".into(), icon: String::new(), view: view.into() }],
+            };
+            assert!(ui.validate().is_err(), "must reject view {view:?}");
+        }
+        for view in ["", "proposals", "my-work", "tab_2"] {
+            let ui = PluginUi {
+                nav: vec![NavItem { label: "Achra".into(), icon: String::new(), view: view.into() }],
+            };
+            assert!(ui.validate().is_ok(), "must accept view {view:?}");
+        }
+    }
+
+    #[test]
+    fn a_plugin_asking_for_no_sidebar_says_nothing() {
+        assert!(PluginUi::default().describe().is_none());
+        assert!(PluginUi::default().validate().is_ok());
+    }
+
+    /// The sidebar declaration is covered by the signature, like everything
+    /// else: a publisher vouches for what appears in the navigation.
+    #[test]
+    fn tampering_with_the_sidebar_breaks_the_signature() {
+        let k = key(1);
+        let mut m = manifest(&k);
+        m.ui.nav.push(NavItem {
+            label: "Free Money".into(),
+            icon: "$".into(),
+            view: String::new(),
+        });
+        assert!(m.verify().is_err());
     }
 }

@@ -60,6 +60,7 @@ print(json.dumps({
     "document_models": models,
     "processors": man.get("processors", []),
     "capabilities": man.get("capabilities", {"read": [], "write": []}),
+    "ui": man.get("ui", {"nav": []}),
     "editor": editor,
 }))
 PY

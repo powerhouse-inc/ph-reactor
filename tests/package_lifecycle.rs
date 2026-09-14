@@ -65,6 +65,7 @@ fn achra_manifest(blobs: &BlobStore) -> Manifest {
                 kinds: vec!["init".into()],
             }],
         },
+        ui: Default::default(),
         sig: String::new(),
     };
     m.sign(&k);

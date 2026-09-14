@@ -307,6 +307,7 @@ mod tests {
             processors: vec![],
             bundle: Some(blob),
             capabilities: Default::default(),
+            ui: Default::default(),
             sig: String::new(),
         };
         let key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
