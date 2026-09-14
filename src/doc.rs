@@ -656,19 +656,25 @@ mod tests {
             let mut c = VecClock::default();
             c.tick(&origins[i]);
             ops.push(make_op(
-                id, &keys[i], &origins[i],
+                id,
+                &keys[i],
+                &origins[i],
                 Some(&format!("f{i:02}")),
                 Some(serde_json::json!(i)),
-                1, c,
+                1,
+                c,
             ));
             // (b) the same field "counter", concurrently, with distinct ts.
             let mut c2 = VecClock::default();
             c2.tick(&origins[i]);
             ops.push(make_op(
-                id, &keys[i], &origins[i],
+                id,
+                &keys[i],
+                &origins[i],
                 Some("counter"),
                 Some(serde_json::json!(i)),
-                (2 * i) as u64, c2,
+                (2 * i) as u64,
+                c2,
             ));
         }
 
@@ -697,7 +703,11 @@ mod tests {
 
         let mut baseline: Option<(Doc, VecClock)> = None;
         for perm in &perms {
-            let mut doc = Doc { id, name: "group".into(), fields: Default::default() };
+            let mut doc = Doc {
+                id,
+                name: "group".into(),
+                fields: Default::default(),
+            };
             let mut rclock = VecClock::default();
             let mut deleted = false;
             for op in perm {
@@ -745,7 +755,11 @@ mod tests {
         // origin(2) = "peer-02" sorts above origin(1) = "peer-01", so B wins.
         assert!(b > a);
         for order in [vec![&op_a, &op_b], vec![&op_b, &op_a]] {
-            let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+            let mut doc = Doc {
+                id,
+                name: "n".into(),
+                fields: Default::default(),
+            };
             let mut rclock = VecClock::default();
             let mut deleted = false;
             for op in order {

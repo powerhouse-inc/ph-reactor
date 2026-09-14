@@ -1630,10 +1630,22 @@ mod tests {
         let remote_origin = "remote-peer";
         s.register_peer_key(remote_origin, remote_key.verifying_key().to_bytes())
             .unwrap();
-        let id = s.doc_ids().into_iter().find(|id| s.doc_name(*id) == "fed").unwrap();
+        let id = s
+            .doc_ids()
+            .into_iter()
+            .find(|id| s.doc_name(*id) == "fed")
+            .unwrap();
         let mut clock = s.summary()[&id].clone();
         clock.tick(remote_origin);
-        let action = make_set_action(id, remote_origin, &remote_key, clock, "rf", &"rv".into(), 2_000_000);
+        let action = make_set_action(
+            id,
+            remote_origin,
+            &remote_key,
+            clock,
+            "rf",
+            &"rv".into(),
+            2_000_000,
+        );
         s.apply_remote_action(&action).unwrap();
         assert!(
             rx.try_recv().is_err(),

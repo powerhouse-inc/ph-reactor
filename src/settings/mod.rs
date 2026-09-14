@@ -1468,10 +1468,7 @@ struct LlmTestBody {
 /// The settings API is loopback-only, so this blocks the SSRF/exfil path
 /// without a token.
 fn llm_base_url_ok(base: &str) -> Result<(), String> {
-    let after_scheme = base
-        .split_once("://")
-        .map(|(_, r)| r)
-        .unwrap_or(base);
+    let after_scheme = base.split_once("://").map(|(_, r)| r).unwrap_or(base);
     let hostport = after_scheme.split(['/', '?', '#']).next().unwrap_or("");
     let host = if let Some(s) = hostport.strip_prefix('[') {
         s.split(']').next().unwrap_or("")
@@ -1480,9 +1477,7 @@ fn llm_base_url_ok(base: &str) -> Result<(), String> {
     };
     if let Ok(std::net::IpAddr::V4(v4)) = host.parse::<std::net::IpAddr>() {
         if v4.to_bits() >> 16 == 169 * 256 + 254 {
-            return Err(
-                "refusing LLM request to a link-local (cloud metadata) address".into(),
-            );
+            return Err("refusing LLM request to a link-local (cloud metadata) address".into());
         }
     }
     Ok(())
