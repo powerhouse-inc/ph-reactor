@@ -1,0 +1,9 @@
+# The image copies the prebuilt binary from dist/, so the build context only
+# needs to stay small. Source dirs are deliberately NOT excluded: `views` is a
+# cargo workspace member, and excluding it would silently break the build if
+# this ever becomes a from-source Dockerfile.
+target/
+.git/
+.github/
+docs/
+snap/

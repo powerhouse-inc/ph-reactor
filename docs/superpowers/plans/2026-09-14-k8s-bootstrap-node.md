@@ -233,10 +233,20 @@ docker image inspect ph-reactor:dev --format '{{.Config.User}} {{.Size}}'
 ```
 Expected: `65532:65532` and a size under 40 MB.
 
+**Implementation notes (amended during execution — the committed scripts are authoritative):**
+
+1. **No host musl toolchain is required.** The dev machine had no `musl-gcc` and no passwordless sudo, so `build-image.sh` falls back to compiling inside a `ph-reactor-builder:1.83-alpine` image (Alpine is natively musl, so this is not cross-compilation). CI still uses the host path via `musl-tools`.
+2. **Build caches live inside the bind-mounted repo** (`.build-cache/`), not in separate `-v` mounts. A mount whose host path does not exist yet is created by the Docker daemon as **root**, which the unprivileged build container then cannot write to — this cost one failed build.
+3. **The static-link assertion tests the property, not one spelling.** A musl release build reports `static-pie linked`, not `statically linked`; the original `grep 'statically linked'` rejected a perfectly good binary. The check now fails only on `dynamically linked` or an undeterminable result.
+4. **`smoke-image.sh` tears down as root in a container** and preserves the test's exit status. The daemon creates `run/`, `docs/` and `logs/` as uid 65532, which the host user cannot unlink, and the trap's failure was masking a PASS as `exit=1`.
+5. **`.dockerignore` does not exclude source directories.** `views` is a cargo workspace member; excluding it would silently break the build if this ever becomes a from-source Dockerfile.
+
+Verified result: `PASS: peer=12D3KooW… listen=/ip4/0.0.0.0/tcp/25422`, image `user=65532:65532`, size 36.6 MB.
+
 - [ ] **Step 9: Commit**
 
 ```bash
-git add Dockerfile .dockerignore scripts/build-image.sh scripts/smoke-image.sh
+git add Dockerfile .dockerignore .gitignore scripts/build-image.sh scripts/smoke-image.sh
 git commit -m "build: container image for running ph-reactor headless
 
 Wraps the same static musl binary the release workflow already ships, so
