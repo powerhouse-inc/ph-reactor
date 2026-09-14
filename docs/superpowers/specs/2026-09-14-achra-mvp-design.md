@@ -257,7 +257,23 @@ Both were cheap and both could have invalidated the design:
 Neither is exotic, but the entire browser half of the design depends on them, so
 they come first and their result is reported before anything is built on top.
 
-## BLOCKING GAP found while implementing: runtime models are not durable
+## RESOLVED 2026-09-14 in 1.6.0 — runtime models are now durable
+
+Registrations persist to `<state>/models.json` and are loaded **before** the
+replay (`Store::open_with_models`). Verified on the live cluster: the log
+reports `restored 4 runtime-registered model(s)`, and after deleting the pod
+every document came back with full state — including `rfp-index-archive` and
+`prop-index-acme`, which had previously replayed as empty shells. That confirms
+the original diagnosis: the action logs were always intact on the PVC, and only
+the read model could not be rebuilt.
+
+The realistic models moved through the same path; they were added after
+`open()` and carried the same latent bug.
+
+The gap as originally found is kept below, because the failure mode is worth
+understanding and `tests/model_durability.rs` pins both directions.
+
+### The gap as found: runtime models were not durable
 
 The design asserts that "domain models are data, not code" and treats runtime
 registration as free. Registration *is* free. **Durability is not.**
@@ -279,8 +295,8 @@ The data is not lost — the action log is durable on the PVC — but the read
 model cannot be rebuilt, and there is no hook to register a model *before*
 replay.
 
-**This blocks the MVP.** A marketplace whose documents empty themselves on
-every deploy is not usable by a pilot organization, and every reactor restart
+**This blocked the MVP** (fixed in 1.6.0, above). A marketplace whose documents
+empty themselves on every deploy is not usable by a pilot organization, and every reactor restart
 would require an operator to re-POST the definitions.
 
 Proposed fix, as its own bounded change before further Achra work: persist
@@ -289,8 +305,8 @@ registered definitions into the state directory (alongside `config.json` and
 replay. Built-in models are unaffected, which is why `group` survived and is
 the reason this went unnoticed until a domain model was deployed.
 
-Until it is fixed, the Achra models must be re-registered after every restart,
-and documents created before re-registration will not render.
+Before the fix, the Achra models had to be re-registered after every restart,
+and documents created beforehand would not render until they were.
 
 ## Testing
 
