@@ -1715,6 +1715,13 @@ async fn register_model(
         Ok(m) => {
             let name = crate::model::Model::ref_(&m).name.clone();
             state.store.add_model(Arc::new(m));
+            // Persist it, or the next restart replays this model's documents
+            // with no definition to reduce them and they come back empty.
+            if let Err(e) =
+                crate::model::persist::save(&state.paths.models_file(), &body.definition)
+            {
+                tracing::warn!("model '{name}' registered but not persisted: {e}");
+            }
             (
                 StatusCode::CREATED,
                 axum::Json(json!({ "ok": true, "name": name })),

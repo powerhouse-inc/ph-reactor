@@ -29,6 +29,7 @@ use crate::model::open::Open;
 pub mod group;
 pub mod l1;
 pub mod open;
+pub mod persist;
 pub mod realistic;
 
 /// Why a model rejected an action or a state.

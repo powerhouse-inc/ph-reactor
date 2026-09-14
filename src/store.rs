@@ -233,7 +233,33 @@ struct Inner {
 impl Store {
     /// Open (or create) a store rooted at `docs_dir`. Replays snapshots +
     /// action logs and rebuilds the name index.
+    /// Opens a store, registering `extra` models **before** the replay.
+    ///
+    /// Ordering is the whole point. `replay()` rebuilds each document by
+    /// reducing its action log through the model that wrote it; a model
+    /// registered afterwards is too late, and its documents are left as empty
+    /// shells. Built-in models avoid this because they are seeded here; every
+    /// other model — the realistic set, and anything registered at runtime —
+    /// has to come in through this door.
+    pub fn open_with_models(
+        docs_dir: &Path,
+        key: &SigningKey,
+        origin: &str,
+        extra: Vec<Arc<dyn Model>>,
+    ) -> Result<Arc<Self>, String> {
+        Self::open_inner(docs_dir, key, origin, extra)
+    }
+
     pub fn open(docs_dir: &Path, key: &SigningKey, origin: &str) -> Result<Arc<Self>, String> {
+        Self::open_inner(docs_dir, key, origin, Vec::new())
+    }
+
+    fn open_inner(
+        docs_dir: &Path,
+        key: &SigningKey,
+        origin: &str,
+        extra: Vec<Arc<dyn Model>>,
+    ) -> Result<Arc<Self>, String> {
         std::fs::create_dir_all(docs_dir).map_err(|e| e.to_string())?;
         let mut inner = Inner {
             docs_dir: docs_dir.to_path_buf(),
@@ -252,6 +278,10 @@ impl Store {
         inner
             .known_keys
             .insert(inner.origin.clone(), key.verifying_key().to_bytes());
+        // Before the replay, never after.
+        for m in extra {
+            inner.models.insert(m);
+        }
         inner.replay();
         Ok(Arc::new(Store {
             inner: Mutex::new(inner),

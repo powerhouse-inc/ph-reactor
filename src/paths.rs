@@ -103,6 +103,18 @@ impl StatePaths {
         self.root.join("processors.json")
     }
 
+    /// Model definitions registered at runtime.
+    ///
+    /// These MUST be loaded before the store replays its action logs. A
+    /// document's read model is rebuilt by reducing its actions through the
+    /// model that wrote them; without the definition the actions cannot be
+    /// reduced and the document comes back empty — no name, no fields. Only
+    /// built-in models survived a restart before this file existed, because
+    /// `Store::open` seeds those itself.
+    pub fn models_file(&self) -> PathBuf {
+        self.root.join("models.json")
+    }
+
     pub fn daemon_pidfile(&self) -> PathBuf {
         self.run_dir.join("ph-reactor.pid")
     }

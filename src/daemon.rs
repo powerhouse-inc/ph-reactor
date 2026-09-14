@@ -185,12 +185,33 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
     // the realistic models so the console can create docs under them. The
     // built-in `open@1` + `group@1` come from `Store::open`.
     let store = {
-        let store = Store::open(&paths.docs_dir, &signing, &peer_id.to_base58())
-            .map_err(anyhow::Error::msg)?;
+        // Everything that is not built in must be registered BEFORE the
+        // replay: the store rebuilds each document by reducing its action log
+        // through the model that wrote it, so a model registered afterwards
+        // leaves its documents as empty shells. That applies to the realistic
+        // set and to anything registered at runtime.
+        let mut seed: Vec<Arc<dyn crate::model::Model>> = Vec::new();
         for m in crate::model::realistic::realistic_models() {
-            store.add_model(Arc::new(m));
+            seed.push(Arc::new(m));
         }
-        store
+        let mut restored = 0usize;
+        for def in crate::model::persist::load_all(&paths.models_file()) {
+            match crate::model::l1::L1::from_def(def.clone()) {
+                Ok(m) => {
+                    seed.push(Arc::new(m));
+                    restored += 1;
+                }
+                Err(e) => tracing::error!(
+                    "a persisted model definition is invalid ({e}); its documents \
+                     will replay empty until it is re-registered"
+                ),
+            }
+        }
+        if restored > 0 {
+            tracing::info!("restored {restored} runtime-registered model(s)");
+        }
+        Store::open_with_models(&paths.docs_dir, &signing, &peer_id.to_base58(), seed)
+            .map_err(anyhow::Error::msg)?
     };
     tracing::info!(
         "store ready ({} live docs, peer {})",
@@ -1904,10 +1925,17 @@ fn open_local_store(paths: &StatePaths) -> Result<Arc<Store>> {
         })?;
     let signing = p2p::signing_key(&kp).map_err(anyhow::Error::msg)?;
     let origin = p2p::peer_id_of(&kp).to_base58();
-    let store = Store::open(&paths.docs_dir, &signing, &origin).map_err(anyhow::Error::msg)?;
+    let mut seed: Vec<Arc<dyn crate::model::Model>> = Vec::new();
     for m in crate::model::realistic::realistic_models() {
-        store.add_model(Arc::new(m));
+        seed.push(Arc::new(m));
     }
+    for def in crate::model::persist::load_all(&paths.models_file()) {
+        if let Ok(m) = crate::model::l1::L1::from_def(def) {
+            seed.push(Arc::new(m));
+        }
+    }
+    let store = Store::open_with_models(&paths.docs_dir, &signing, &origin, seed)
+        .map_err(anyhow::Error::msg)?;
     Ok(store)
 }
 
