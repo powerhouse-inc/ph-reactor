@@ -5,6 +5,7 @@
 //! race the poller or the tray menu.
 
 pub mod assets;
+pub mod inbox;
 pub mod migrate;
 pub mod packages;
 pub mod spaces;
@@ -142,6 +143,7 @@ impl Settings {
                 put(processor_update_api).delete(processor_remove_api),
             )
             .route("/api/processors/:name/fires", get(processor_fires_api))
+            .route("/api/inbox", get(inbox::list))
             .route("/api/spaces", get(spaces::list).post(spaces::create))
             .route("/api/migrate/groups", post(migrate::groups))
             .route("/api/spaces/:name/action", post(spaces::action))
@@ -1107,6 +1109,7 @@ async fn plugins_api(state: axum::extract::State<Arc<Settings>>) -> Response {
                 "hasEditor": p.manifest.bundle.is_some(),
                 "capabilities": p.manifest.capabilities.describe(),
                 "publishes": p.manifest.projections.iter().map(crate::package::Projection::describe).collect::<Vec<_>>(),
+                "interrupts": p.manifest.attention.iter().map(crate::package::Attention::describe).collect::<Vec<_>>(),
                 "nav": p.manifest.ui.nav,
                 "installedAt": p.installed_at,
             })

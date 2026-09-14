@@ -116,6 +116,7 @@ pub async fn list(state: State<Arc<Settings>>) -> Response {
             // Shown beside the capabilities: what this app will publish, and
             // where. A capability says what it may read; this says what leaves.
             "publishes": m.projections.iter().map(crate::package::Projection::describe).collect::<Vec<_>>(),
+            "interrupts": m.attention.iter().map(crate::package::Attention::describe).collect::<Vec<_>>(),
             "sidebar": m.ui.describe(),
             "nav": m.ui.nav,
             "navValid": m.ui.validate().is_ok(),
@@ -189,6 +190,7 @@ pub async fn install_pkg(
                     "publisher": manifest.publisher.name,
                     "capabilities": manifest.capabilities.describe(),
                     "publishes": manifest.projections.iter().map(crate::package::Projection::describe).collect::<Vec<_>>(),
+                    "interrupts": manifest.attention.iter().map(crate::package::Attention::describe).collect::<Vec<_>>(),
                     "sidebar": manifest.ui.describe(),
                 })),
             )
@@ -466,6 +468,7 @@ pub async fn publish(state: State<Arc<Settings>>, body: axum::Json<PublishBody>)
         ui: b.ui,
         sig: String::new(),
         projections: Vec::new(),
+        attention: Vec::new(),
     };
     manifest.sign(&key);
 
@@ -588,6 +591,7 @@ mod tests {
             ui: Default::default(),
             sig: String::new(),
             projections: Vec::new(),
+            attention: Vec::new(),
         };
         let doc = json!({
             "name": "pkg-achra-1.0.0",

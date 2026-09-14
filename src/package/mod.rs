@@ -125,6 +125,74 @@ impl Projection {
     }
 }
 
+/// Something this app can put in your inbox.
+///
+/// The Inbox answers "what needs me" across every space, and only the app
+/// knows what that means: that `status: submitted` puts the *approvers* on the
+/// hook, not the submitter. A generic rule over document state would be
+/// inventing meaning the app owns.
+///
+/// Declared rather than asked for at render time, for two more reasons.
+/// Something that can interrupt you is a permission, so it belongs in the
+/// install prompt beside "this app will publish payment records publicly".
+/// And an app that hangs must not hang the landing page -- polling each
+/// plugin's iframe for its own inbox would mean booting every installed app to
+/// draw one screen.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Attention {
+    /// Model name to match.
+    pub model: String,
+    /// Field/value pairs that must all match for the rule to fire.
+    #[serde(default)]
+    pub when: serde_json::Map<String, Value>,
+    /// The document field naming who is on the hook. The row appears only for
+    /// a node listed there.
+    pub needs: String,
+    /// What the row says.
+    pub label: String,
+}
+
+impl Attention {
+    /// A plain-language line for the install prompt.
+    pub fn describe(&self) -> String {
+        let cond = if self.when.is_empty() {
+            String::new()
+        } else {
+            let pairs: Vec<String> = self
+                .when
+                .iter()
+                .map(|(k, v)| format!("{k} is {}", v.as_str().unwrap_or(&v.to_string())))
+                .collect();
+            format!(" whose {}", pairs.join(" and "))
+        };
+        format!(
+            "put a {}{} in your inbox when you are named in '{}'",
+            self.model, cond, self.needs
+        )
+    }
+
+    /// A rule that names nobody would put a row in *everyone's* inbox, which
+    /// is how an inbox stops being read.
+    pub fn validate(&self) -> Result<(), String> {
+        if self.model.trim().is_empty() {
+            return Err("an attention rule needs a model".into());
+        }
+        if self.needs.trim().is_empty() {
+            return Err(format!(
+                "the attention rule for {} names no field saying who it needs",
+                self.model
+            ));
+        }
+        if self.label.trim().is_empty() {
+            return Err(format!(
+                "the attention rule for {} has nothing to say",
+                self.model
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Capabilities {
     pub fn may_read(&self, model: &str) -> bool {
         self.read.iter().any(|m| m == model)
@@ -313,6 +381,13 @@ pub struct Manifest {
     /// verifying.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub projections: Vec<Projection>,
+    /// What this app may put in your inbox.
+    ///
+    /// Skipped when empty for the same load-bearing reason as `ui` and
+    /// `projections`: a field that always serializes changes the bytes every
+    /// past signature was made over.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub attention: Vec<Attention>,
     /// Console chrome the plugin asks for — sidebar entries. Signed with the
     /// rest, so what appears in the navigation is what the publisher vouched
     /// for and the operator approved.
@@ -415,6 +490,7 @@ mod tests {
             ui: Default::default(),
             sig: String::new(),
             projections: Vec::new(),
+            attention: Vec::new(),
         };
         m.sign(k);
         m
@@ -712,6 +788,7 @@ mod tests {
             ui: PluginUi::default(),
             sig: String::new(),
             projections: Vec::new(),
+            attention: Vec::new(),
         };
         let v: serde_json::Value = serde_json::to_value(&m).expect("serialize");
         let keys: Vec<&str> = v.as_object().expect("object").keys().map(String::as_str).collect();
@@ -756,6 +833,7 @@ mod tests {
             projections: Vec::new(),
             ui: PluginUi::default(),
             sig: String::new(),
+            attention: Vec::new(),
         };
         m.sign(&k);
         assert!(m.verify().is_ok(), "a manifest with no projections verifies");
@@ -782,5 +860,69 @@ mod tests {
         );
         with.sign(&k);
         assert!(with.verify().is_ok());
+    }
+
+    /// Same trap as `ui` and `projections`, one field later.
+    #[test]
+    fn attention_is_skipped_when_empty_so_old_signatures_survive() {
+        let k = SigningKey::from_bytes(&[7u8; 32]);
+        let mut m = Manifest {
+            name: "acme".into(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            category: String::new(),
+            publisher: PublisherInfo::default(),
+            publisher_key: hex::encode(k.verifying_key().to_bytes()),
+            document_models: Vec::new(),
+            processors: Vec::new(),
+            bundle: None,
+            capabilities: Capabilities::default(),
+            projections: Vec::new(),
+            attention: Vec::new(),
+            ui: PluginUi::default(),
+            sig: String::new(),
+        };
+        m.sign(&k);
+        assert!(m.verify().is_ok());
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("attention"),
+            "an empty rule list must not enter the signed bytes: {json}"
+        );
+    }
+
+    fn rule() -> Attention {
+        Attention {
+            model: "proposal".into(),
+            when: serde_json::json!({ "status": "submitted" })
+                .as_object()
+                .unwrap()
+                .clone(),
+            needs: "approvers".into(),
+            label: "Proposal awaiting your review".into(),
+        }
+    }
+
+    /// The operator has to be able to read what an app is asking for. An app
+    /// that can interrupt you is exercising a permission.
+    #[test]
+    fn an_attention_rule_describes_itself() {
+        let d = rule().describe();
+        assert!(d.contains("proposal"), "{d}");
+        assert!(d.contains("status is submitted"), "{d}");
+        assert!(d.contains("approvers"), "{d}");
+    }
+
+    /// A rule naming nobody would put a row in everyone's inbox, which is how
+    /// an inbox stops being read.
+    #[test]
+    fn a_rule_that_needs_nobody_is_refused() {
+        assert!(rule().validate().is_ok());
+        let mut r = rule();
+        r.needs = "  ".into();
+        assert!(r.validate().is_err());
+        let mut r = rule();
+        r.label = String::new();
+        assert!(r.validate().is_err());
     }
 }

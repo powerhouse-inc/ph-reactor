@@ -251,6 +251,7 @@ mod tests {
             ui: Default::default(),
             sig: String::new(),
             projections: Vec::new(),
+            attention: Vec::new(),
         };
         m.sign(k);
         m
