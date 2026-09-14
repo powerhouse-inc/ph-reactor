@@ -72,7 +72,9 @@ pub async fn run(state_dir: Option<&Path>, daemonize: bool) -> Result<()> {
         !daemonize,
         "daemonized start is handled before the runtime begins"
     );
-    run_inner(state_dir).await
+    // Foreground: also emit to stdout. This is what makes `kubectl logs`
+    // (and a plain terminal run) show anything at all.
+    run_inner(state_dir, true).await
 }
 
 /// The daemonized start. The parent's CLI tokio runtime is still alive
@@ -97,7 +99,7 @@ pub fn run_daemonized(state_dir: Option<&Path>) -> Result<i32> {
                 .enable_all()
                 .build()
                 .context("starting the daemon runtime")?;
-            match rt.block_on(run_inner(state_dir)) {
+            match rt.block_on(run_inner(state_dir, false)) {
                 Ok(()) => Ok(0),
                 Err(err) => {
                     // A daemonized child has no terminal: the fatal
@@ -146,13 +148,13 @@ pub fn run_daemonized(state_dir: Option<&Path>) -> Result<i32> {
 
 /// The daemon proper: store, p2p engine, settings server, tray, and the
 /// status/command loop. Runs on a fresh runtime in both modes.
-async fn run_inner(state_dir: Option<&Path>) -> Result<()> {
+async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
     let paths = StatePaths::resolve(state_dir);
     paths
         .ensure_dirs()
         .with_context(|| format!("creating {}", paths.root.display()))?;
     let config = config::load(&paths)?;
-    init_logging(&paths, &config, false)?;
+    init_logging(&paths, &config, to_stdout)?;
 
     let lock = acquire_lock(&paths)?;
     let pid = std::process::id();
@@ -2057,9 +2059,17 @@ impl tracing_subscriber::fmt::MakeWriter<'_> for DaemonLogWriter {
     }
 }
 
-/// File appender (rotated) plus, when running in the foreground,
-/// stderr.
-fn init_logging(paths: &StatePaths, config: &ReactorConfig, to_stderr: bool) -> Result<()> {
+/// File appender (rotated) plus, when running in the foreground, stdout.
+///
+/// The stdout layer is what makes the daemon observable under a process
+/// supervisor that captures stdio -- `kubectl logs`, systemd, or a plain
+/// terminal. Without it the only record is `logs/reactor.log` inside the
+/// state dir, which in a container means no log shipping at all.
+///
+/// stdout rather than stderr on purpose: log collectors record which stream
+/// a line arrived on, and emitting routine info lines on stderr makes them
+/// read as errors downstream.
+fn init_logging(paths: &StatePaths, config: &ReactorConfig, to_stdout: bool) -> Result<()> {
     let level = match config.log_level.as_str() {
         "verbose" => "debug",
         "debug" => "debug",
@@ -2079,13 +2089,13 @@ fn init_logging(paths: &StatePaths, config: &ReactorConfig, to_stderr: bool) -> 
         })
         .with_ansi(false)
         .with_target(false);
-    if to_stderr {
+    if to_stdout {
         tracing_subscriber::registry()
             .with(filter)
             .with(file_layer)
             .with(
                 tracing_subscriber::fmt::layer()
-                    .with_writer(io::stderr)
+                    .with_writer(io::stdout)
                     .with_ansi(false),
             )
             .init();

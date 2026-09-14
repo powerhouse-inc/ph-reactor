@@ -63,6 +63,14 @@ case "$PEER" in 12D3Koo*) ;; *) echo "FAIL: peer_id not an ed25519 peer id: $PEE
 [ "$(stat -c '%a' "$STATE/key")" = "600" ] || { echo "FAIL: key mode $(stat -c '%a' "$STATE/key"), want 600" >&2; exit 1; }
 [ "$(stat -c '%s' "$STATE/key")" = "32" ] || { echo "FAIL: key size $(stat -c '%s' "$STATE/key"), want 32" >&2; exit 1; }
 
+# Logs must reach the container's stdio, not only the state dir's log file.
+# Without this the workload is invisible to `kubectl logs` and to any log
+# shipper, and the distroless image has no shell to go read the file with.
+LOGLINES="$(docker logs "$NAME" 2>&1 | wc -l)"
+[ "$LOGLINES" -gt 0 ] || { echo "FAIL: docker logs is empty -- the daemon is not logging to stdio" >&2; exit 1; }
+docker logs "$NAME" 2>/dev/null | grep -q 'store ready' \
+  || { echo "FAIL: expected startup lines on stdout; got:" >&2; docker logs "$NAME" >&2; exit 1; }
+
 # The tray must be absent-but-fatal-free: the daemon is still serving.
 if docker logs "$NAME" 2>&1 | grep -qi 'panic'; then
   echo "FAIL: panic in logs" >&2
@@ -70,4 +78,4 @@ if docker logs "$NAME" 2>&1 | grep -qi 'panic'; then
   exit 1
 fi
 
-echo "PASS: peer=$PEER listen=$LISTEN"
+echo "PASS: peer=$PEER listen=$LISTEN loglines=$LOGLINES"
