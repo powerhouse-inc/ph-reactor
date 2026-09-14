@@ -29,6 +29,7 @@ use crate::model::open::Open;
 pub mod group;
 pub mod l1;
 pub mod open;
+pub mod package;
 pub mod persist;
 pub mod realistic;
 
@@ -152,10 +153,16 @@ impl ModelRegistry {
         r
     }
 
-    /// A registry seeded with all built-in models (`open@1` + `group@1`).
+    /// A registry seeded with all built-in models (`open@1`, `group@1`,
+    /// `package@1`).
+    ///
+    /// `package@1` is built in rather than shipped as a definition because of
+    /// the obvious circularity: packages are how definitions are distributed,
+    /// so the model that carries them cannot itself arrive in one.
     pub fn seeded_with_builtins() -> Self {
         let mut r = Self::seeded_with_open();
         r.insert(Arc::new(group::group()));
+        r.insert(Arc::new(package::package()));
         r
     }
 

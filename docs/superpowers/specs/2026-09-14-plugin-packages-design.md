@@ -357,3 +357,52 @@ Each slice is independently useful, which is what makes this safe to stage:
 | Chunk store grows without bound | Garbage-collect chunks not referenced by an installed package |
 | Divergence from Powerhouse's format as it evolves | Adopt their manifest verbatim and add fields rather than fork it; feed the signature work upstream |
 | Plugin UI expects Powerhouse document-model semantics | Documented non-goal: editors are written against ph-reactor's API, using the design system for presentation only |
+
+## As built — where reality differed from the design
+
+The design held. Five things it did not anticipate, each found by running the
+thing rather than by reading it, and each now covered by a test:
+
+**`package@1` is a built-in model, not a shipped definition.** The design said
+"packages are documents" without naming what carries them. It cannot be a
+distributed definition, because packages are how definitions are distributed —
+so the carrier is built into the binary alongside `open@1` and `group@1`.
+
+**A sandboxed iframe needs `allow-forms`.** Without it Chrome blocks the submit
+*event*, not merely the navigation, so an editor whose form calls
+`preventDefault()` and posts over the bridge silently does nothing — no
+exception, no request, no clue. Granting it changes nothing about isolation,
+because the bundle's own CSP sets `form-action 'none'`, so the browser still
+refuses to send a form anywhere. `allow-same-origin` stays absent, and a test
+asserts all three facts together.
+
+**Garbage collection has two roots, not one.** Collecting by "what is installed"
+deleted the chunks of a package *this node had published*, leaving it
+advertising a bundle it could no longer serve. The second root is every bundle
+named by a `package@1` document this node carries: an offer is a promise to
+serve.
+
+**The bridge identifies its caller by window, not by origin.** A sandboxed frame
+reports origin `"null"`, which is not addressable as a `postMessage` target and
+is not unique to any one frame. `ev.source === frame.contentWindow` is the check
+that means something, and the reply necessarily goes to `"*"` — safe, because
+`postMessage` delivers to that window and no other.
+
+**A published version is immutable, so publishing over one is a conflict.** The
+signature covers the content and peers may already hold it, so republishing the
+same `name@version` is refused with that reason rather than with the store's
+internal duplicate-document error.
+
+### What shipped
+
+| Piece | Where |
+|---|---|
+| Built-in `package@1` model | `src/model/package.rs` |
+| Package API: publish, list, install, uninstall, trust | `src/settings/packages.rs` |
+| Isolated asset origin (console port + 1) | `src/settings/assets.rs` |
+| Capability-checked bridge endpoints | `src/settings/mod.rs` |
+| Editor SDK (`useQuery` / `useSubmit`) | `packages/sdk/ph-reactor-sdk.js` |
+| The Achra marketplace editor | `packages/achra/` |
+| Build and publish a package | `scripts/publish-package.sh` |
+| Console: plugin list, install prompt, plugin routes, bridge | `console/v2.html` |
+| End-to-end lifecycle tests | `tests/package_lifecycle.rs` |

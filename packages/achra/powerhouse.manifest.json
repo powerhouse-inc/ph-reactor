@@ -1,0 +1,29 @@
+{
+  "$comment": [
+    "The Powerhouse package manifest, as ph-reactor consumes it. Fields the",
+    "daemon adds itself are absent here on purpose: publisher_key is the",
+    "identity of the node that signs the package, sig is made over the whole",
+    "thing, and bundle is the content hash of the built editor. None of the",
+    "three can be asserted by the author -- they are facts about the publish.",
+    "",
+    "documentModels is a list of FILES here; the publish script inlines their",
+    "definitions, because a manifest that referenced a model fetched elsewhere",
+    "would be a hole in exactly the provenance the signature exists to give."
+  ],
+  "name": "@powerhousedao/achra",
+  "version": "1.0.0",
+  "description": "A marketplace for global coordination: objectives published, proposals signed, agreements kept.",
+  "category": "Coordination",
+  "publisher": {
+    "name": "Powerhouse",
+    "url": "https://powerhouse.inc/"
+  },
+  "documentModels": ["../../models/achra.json"],
+  "editor": "editor.html",
+  "capabilities": {
+    "read": ["rfp@1", "proposal@1", "agreement@1", "milestone@1"],
+    "write": [
+      { "model": "proposal@1", "kinds": ["init", "withdraw"] }
+    ]
+  }
+}

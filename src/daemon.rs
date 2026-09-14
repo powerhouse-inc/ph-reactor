@@ -328,6 +328,7 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         store.clone(),
         paths.clone(),
         processor_handle,
+        blobs.clone(),
     )
     .start(&config.settings.host, config.settings.port)
     .await
@@ -741,6 +742,11 @@ fn execute_command(ctx: &mut Ctx, cmd: Command) -> Result<bool> {
                 .eng_cmd_tx
                 .send(EngineCommand::Resync { name: name.clone() });
             ctx.last_event = Some(format!("re-syncing drive '{name}'"));
+        }
+        Command::FetchBlob { blob } => {
+            let _ = ctx
+                .eng_cmd_tx
+                .send(crate::p2p::EngineCommand::FetchBlob { blob });
         }
         Command::SetConfig { key, value } => {
             let before = ctx.config.process_fingerprint();

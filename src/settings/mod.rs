@@ -5,6 +5,7 @@
 //! race the poller or the tray menu.
 
 pub mod assets;
+pub mod packages;
 
 use std::collections::BTreeMap;
 use std::str::FromStr;
@@ -40,6 +41,8 @@ pub struct Settings {
     paths: StatePaths,
     /// The user-configurable processor engine (subscriptions + reactions).
     processor_handle: crate::processor::ProcessorHandle,
+    /// Content-addressed chunks: plugin editor bundles live here.
+    blobs: Arc<crate::blob::BlobStore>,
 }
 
 pub struct SettingsHandle {
@@ -60,6 +63,7 @@ impl Settings {
         store: Arc<Store>,
         paths: StatePaths,
         processor_handle: crate::processor::ProcessorHandle,
+        blobs: Arc<crate::blob::BlobStore>,
     ) -> Self {
         Self {
             cmd_tx,
@@ -67,6 +71,7 @@ impl Settings {
             store,
             paths,
             processor_handle,
+            blobs,
         }
     }
 
@@ -94,6 +99,11 @@ impl Settings {
             .route("/api/cosign", post(cosign_api))
             .route("/api/submit", post(submit_api))
             .route("/api/plugins", get(plugins_api))
+            .route("/api/plugins/:name", delete(packages::uninstall))
+            .route("/api/packages", get(packages::list).post(packages::publish))
+            .route("/api/packages/:doc/install", post(packages::install_pkg))
+            .route("/api/publishers", get(packages::publishers))
+            .route("/api/publishers/:key/revoke", post(packages::revoke_publisher))
             .route("/api/plugins/:name/query", post(plugin_query))
             .route("/api/plugins/:name/action", post(plugin_action))
             .route("/api/join", post(join_invite))
@@ -2261,6 +2271,63 @@ async fn page_v2() -> Html<&'static str> {
 
 const PAGE: &str = include_str!("console.html");
 const PAGE_V2: &str = include_str!("../../console/v2.html");
+
+#[cfg(test)]
+mod console_tests {
+    use super::PAGE_V2;
+
+    /// The plugin iframe needs BOTH sandbox tokens, for reasons that are easy
+    /// to get wrong in opposite directions.
+    ///
+    /// `allow-same-origin` must stay absent: granting it would put the editor
+    /// on the console's origin and hand it the whole unauthenticated API.
+    ///
+    /// `allow-forms` must stay present: without it Chrome blocks the submit
+    /// EVENT, not merely the navigation, so an editor whose form only calls
+    /// preventDefault and posts over the bridge silently does nothing. That
+    /// failure is invisible -- no exception, no request, just a form that never
+    /// fires -- which is exactly how it was found.
+    #[test]
+    fn the_plugin_iframe_sandbox_is_exactly_right() {
+        let line = PAGE_V2
+            .lines()
+            .find(|l| l.contains("sandbox="))
+            .expect("the plugin iframe declares a sandbox");
+        assert!(
+            line.contains("allow-scripts"),
+            "an editor without scripts is not an editor: {line}"
+        );
+        assert!(
+            line.contains("allow-forms"),
+            "without allow-forms the submit event never fires: {line}"
+        );
+        assert!(
+            !line.contains("allow-same-origin"),
+            "allow-same-origin would put the plugin on the console's origin: {line}"
+        );
+    }
+
+    /// The bridge must identify its caller by window, not by trusting whatever
+    /// arrives. A sandboxed frame reports origin "null", so the source check is
+    /// the one doing the work.
+    #[test]
+    fn the_bridge_checks_the_message_source() {
+        assert!(
+            PAGE_V2.contains("ev.source !== frame.contentWindow"),
+            "the bridge must only answer its own frame"
+        );
+    }
+
+    /// The asset origin is derived, never hardcoded, and is always one port up
+    /// from the console -- which is what makes it a different origin.
+    #[test]
+    fn the_asset_origin_is_the_console_port_plus_one() {
+        assert!(
+            PAGE_V2.contains("Number(location.port || 80) + 1"),
+            "the console must address the asset server at port + 1"
+        );
+    }
+}
 
 #[cfg(test)]
 mod tests {

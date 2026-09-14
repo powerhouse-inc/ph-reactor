@@ -198,6 +198,58 @@
   .switch input:checked + .track::after { left: 20px; background: var(--cyan); box-shadow: 0 0 8px var(--cyan); }
   .doc-name { font-family: var(--mono); color: var(--cyan); }
   .link { color: var(--cyan); cursor: pointer; text-decoration: none; }
+
+  /* ---- plugins ---- */
+  .plug-card { display: grid; grid-template-columns: 44px 1fr auto; gap: 14px; align-items: start; }
+  .plug-ico {
+    width: 44px; height: 44px; border-radius: 12px; display: grid; place-items: center;
+    font-size: 19px; font-weight: 800; color: #04121a;
+    background: linear-gradient(135deg, var(--cyan), var(--violet));
+    box-shadow: var(--glow-cyan);
+  }
+  .plug-ico.untrusted { background: linear-gradient(135deg, var(--amber), var(--red)); box-shadow: none; }
+  .plug-title { font-size: 15px; font-weight: 700; letter-spacing: -0.01em; }
+  .plug-by { font-size: 12px; color: var(--muted); margin-top: 2px; }
+  .plug-desc { font-size: 13px; color: var(--muted); margin-top: 8px; }
+  .plug-actions { display: flex; flex-direction: column; gap: 7px; align-items: stretch; }
+  .caps { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
+  .caps li { font-size: 12.5px; color: var(--text); margin: 4px 0; list-style: none; display: flex; gap: 8px; }
+  .caps li::before { content: "▸"; color: var(--violet); }
+  .caps ul { margin: 0; padding: 0; }
+  .keyline { font-family: var(--mono); font-size: 11px; color: var(--dim); word-break: break-all; }
+
+  .scrim {
+    position: fixed; inset: 0; background: rgba(4,6,12,0.72); backdrop-filter: blur(4px);
+    display: grid; place-items: center; z-index: 60; animation: fadein 0.16s ease;
+  }
+  @keyframes fadein { from { opacity: 0; } to { opacity: 1; } }
+  .sheet {
+    width: min(560px, calc(100vw - 40px)); max-height: 86vh; overflow-y: auto;
+    background: linear-gradient(180deg, var(--bg-2), var(--bg));
+    border: 1px solid var(--line-2); border-radius: 16px; padding: 22px;
+    box-shadow: 0 24px 70px rgba(0,0,0,0.6), var(--glow-violet);
+  }
+  .sheet h2 { margin: 0 0 4px; font-size: 18px; letter-spacing: -0.01em; }
+  .sheet .lead { color: var(--muted); font-size: 13px; margin-bottom: 16px; }
+  .warn {
+    border: 1px solid rgba(255,196,107,0.35); background: rgba(255,196,107,0.07);
+    border-radius: 11px; padding: 12px 14px; font-size: 13px; color: var(--amber); margin: 14px 0;
+  }
+  .warn.red { border-color: rgba(255,107,129,0.4); background: rgba(255,107,129,0.07); color: var(--red); }
+  .sheet-actions { display: flex; gap: 10px; justify-content: flex-end; margin-top: 18px; }
+
+  /* ---- plugin host frame ---- */
+  .frame-wrap { display: flex; flex-direction: column; height: calc(100vh - 116px); }
+  .frame-chrome {
+    display: flex; align-items: center; gap: 10px; padding: 8px 12px;
+    background: var(--panel); border: 1px solid var(--line); border-bottom: none;
+    border-radius: 12px 12px 0 0; font-size: 12px; color: var(--muted);
+  }
+  .frame-chrome .sep { flex: 1; }
+  .frame-wrap iframe {
+    flex: 1; width: 100%; border: 1px solid var(--line); border-radius: 0 0 12px 12px;
+    background: #fff; display: block;
+  }
   .link:hover { text-decoration: underline; }
   /* group-space sub-tab bar */
   .subtabs { display: flex; gap: 4px; border-bottom: 1px solid var(--line); margin: 14px 0 4px; }
@@ -232,6 +284,7 @@
     </div>
     <div class="nav-item active" data-tab="overview"><span class="ico">◈</span> Home</div>
     <div class="nav-item" data-tab="groups"><span class="ico">⬡</span> Groups</div>
+    <div class="nav-item" data-tab="plugins"><span class="ico">▣</span> Plugins</div>
     <div class="nav-item" data-tab="settings"><span class="ico">⚙</span> Settings</div>
     <div class="nav-item" data-tab="profile"><span class="ico">☺</span> Profile</div>
     <div class="foot">
@@ -280,6 +333,7 @@ const state = { tab: "overview", fireCursor: {}, lastFire: {} };
 const TITLES = {
   overview: ["Home", "peers, live activity, and your subscriptions"],
   groups: ["Groups", "shared spaces — channels and a folder drive, signed and synced over the mesh"],
+  plugins: ["Plugins", "applications published to the mesh — verified, sandboxed, installed by your decision"],
   settings: ["Settings", "drive, identity, and LLM configuration"],
   profile: ["Profile", "this node's identity on the mesh"],
   // kept for deep-links / back-compat; no longer sidebar items:
@@ -291,7 +345,31 @@ const TITLES = {
 function switchTab(tab) {
   state.tab = tab;
   $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.tab === tab));
+  if (location.hash !== "#" + tab) history.replaceState(null, "", "#" + tab);
   render();
+}
+
+/* The location hash names the view, so a plugin can be linked to directly --
+   "#plugin/@powerhousedao/achra" opens that editor. Everything else falls back
+   to the overview rather than rendering a blank panel. */
+function routeFromHash() {
+  const h = decodeURIComponent(location.hash.replace(/^#/, ""));
+  if (h.startsWith("plugin/")) return { tab: "plugins", plugin: h.slice("plugin/".length) };
+  return { tab: RENDER[h] ? h : "overview", plugin: null };
+}
+
+async function applyRoute() {
+  const r = routeFromHash();
+  state.tab = r.tab;
+  $$(".nav-item").forEach((n) => n.classList.toggle("active", n.dataset.tab === r.tab));
+  closeBridge();
+  if (r.plugin) {
+    let inst = [];
+    try { inst = await get("/api/plugins"); } catch {}
+    openPlugin(r.plugin, inst);
+  } else {
+    (RENDER[r.tab] || renderOverview)();
+  }
 }
 
 function head(tab) {
@@ -1246,6 +1324,259 @@ async function renderSettings() {
   };
 }
 
+/* ============================ PLUGINS ============================ */
+/*
+ * Editors run on a different origin -- the asset server, one port up -- so the
+ * browser's same-origin policy, not our own discipline, is what keeps a plugin
+ * away from this console's API. Everything a plugin wants has to cross a
+ * postMessage seam that this file mediates.
+ *
+ * The checks below are a convenience for the plugin, not the security boundary:
+ * the daemon re-checks every call against the package's declared capabilities
+ * before it touches anything, so bypassing this code gains nothing.
+ */
+const ASSET_ORIGIN = location.protocol + "//" + location.hostname + ":" + (Number(location.port || 80) + 1);
+
+const initials = (n) => (String(n).replace(/^@[^/]*\//, "").replace(/[^a-z0-9]/gi, "").slice(0, 2) || "??").toUpperCase();
+const shortKey = (k) => (k ? k.slice(0, 8) + "…" + k.slice(-8) : "—");
+
+function sheet(html) {
+  const scrim = document.createElement("div");
+  scrim.className = "scrim";
+  scrim.innerHTML = `<div class="sheet" role="dialog" aria-modal="true">${html}</div>`;
+  document.body.appendChild(scrim);
+  const close = () => scrim.remove();
+  scrim.onclick = (e) => { if (e.target === scrim) close(); };
+  const esckey = (e) => { if (e.key === "Escape") { close(); document.removeEventListener("keydown", esckey); } };
+  document.addEventListener("keydown", esckey);
+  return { el: scrim, close };
+}
+
+/* The install prompt. The operator is being asked one question -- do you accept
+ * this publisher -- so the prompt leads with the key and says, in words, what
+ * saying yes allows. A JSON blob is not a decision anyone can make. */
+function installPrompt(pkg, onConfirm) {
+  const capLines = (pkg.capabilities || []).map((c) => `<li>${esc(c)}</li>`).join("");
+  const firstTime = !pkg.trusted;
+  const { el, close } = sheet(`
+    <h2>Install ${esc(pkg.name)}</h2>
+    <div class="lead">version ${esc(pkg.version)} · ${esc(pkg.models)} document model${pkg.models === 1 ? "" : "s"}${pkg.hasEditor ? " · includes an editor" : ""}</div>
+
+    <div class="kv"><span class="k">publisher</span><span class="v">${esc(pkg.publisher || "unnamed")}</span></div>
+    <div class="kv"><span class="k">signing key</span><span class="v keyline">${esc(pkg.publisherKey)}</span></div>
+    <div class="kv"><span class="k">signature</span><span class="v">${pkg.signatureOk ? '<span class="badge b-green"><span class="dot"></span>valid</span>' : '<span class="badge b-red"><span class="dot"></span>INVALID</span>'}</span></div>
+
+    ${firstTime ? `<div class="warn">
+      You have not installed from this key before. The publisher name above is
+      just a label — anyone can type “${esc(pkg.publisher || "Powerhouse")}”. The key is the identity,
+      and approving it here pins it for future installs.
+    </div>` : `<div class="kv"><span class="k">trust</span><span class="v"><span class="badge b-green"><span class="dot"></span>key already approved</span></span></div>`}
+
+    <div class="caps">
+      <div class="muted" style="font-size:11px;letter-spacing:0.08em;text-transform:uppercase;margin-bottom:6px">This plugin will be able to</div>
+      <ul>${capLines}</ul>
+      <div class="dim" style="font-size:12px;margin-top:10px">
+        It cannot reach anything else. Your drives, identity, configuration and
+        the daemon itself are on a different origin it has no access to, and every
+        write it makes still passes the document model's own rules.
+      </div>
+    </div>
+
+    <div class="sheet-actions">
+      <button class="btn ghost" id="px-cancel">Cancel</button>
+      <button class="btn primary" id="px-ok"${pkg.signatureOk ? "" : " disabled"}>${firstTime ? "Trust publisher & install" : "Install"}</button>
+    </div>
+  `);
+  $("#px-cancel", el).onclick = close;
+  $("#px-ok", el).onclick = async () => {
+    $("#px-ok", el).disabled = true;
+    try { await onConfirm(); close(); }
+    catch (e) { toast(e.message, true); $("#px-ok", el).disabled = false; }
+  };
+}
+
+async function installPackage(pkg) {
+  const res = await post(`/api/packages/${encodeURIComponent(pkg.doc)}/install`, { trust_publisher: true });
+  if (res && res.status === "fetching") {
+    toast(`fetching editor — ${res.missing} of ${res.chunks ?? "?"} chunks still to arrive`);
+  } else {
+    toast(`installed ${pkg.name}`);
+  }
+  renderPlugins();
+}
+
+async function renderPlugins() {
+  // `.view` is display:none in this stylesheet and every other renderer mounts
+  // with replaceChildren, so follow that rather than leave the panel hidden.
+  const wrap = document.createElement("div");
+  wrap.innerHTML = head("plugins") + `<div id="plug-body"><div class="empty">loading…</div></div>`;
+  $("#content").replaceChildren(wrap);
+
+  let avail = [], inst = [], pubs = [];
+  try { [avail, inst, pubs] = await Promise.all([get("/api/packages"), get("/api/plugins"), get("/api/publishers")]); }
+  catch (e) { $("#plug-body").innerHTML = `<div class="card"><div class="empty">${esc(e.message)}</div></div>`; return; }
+
+  const installedNames = new Set(inst.map((p) => p.name));
+  const offers = avail.filter((p) => p.name && !installedNames.has(p.name));
+
+  const installedCards = inst.map((p) => `
+    <div class="card plug-card" data-open="${esc(p.name)}">
+      <div class="plug-ico">${esc(initials(p.name))}</div>
+      <div>
+        <div class="plug-title">${esc(p.name)}</div>
+        <div class="plug-by">${esc(p.publisher || "unnamed publisher")} · v${esc(p.version)}</div>
+        ${p.description ? `<div class="plug-desc">${esc(p.description)}</div>` : ""}
+        <div class="caps"><ul>${(p.capabilities || []).map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>
+      </div>
+      <div class="plug-actions">
+        ${p.hasEditor ? `<button class="btn primary sm" data-open-btn="${esc(p.name)}">Open</button>` : `<span class="badge b-dim">no editor</span>`}
+        <button class="btn ghost sm" data-remove="${esc(p.name)}">Remove</button>
+      </div>
+    </div>`).join("");
+
+  const offerCards = offers.map((p) => {
+    const bad = !p.signatureOk;
+    const withdrawn = p.status === "withdrawn";
+    return `
+    <div class="card plug-card">
+      <div class="plug-ico${p.trusted && !bad ? "" : " untrusted"}">${esc(initials(p.name))}</div>
+      <div>
+        <div class="plug-title">${esc(p.name)} <span class="muted" style="font-weight:400">v${esc(p.version)}</span></div>
+        <div class="plug-by">${esc(p.publisher || "unnamed publisher")}
+          ${p.trusted ? '<span class="badge b-green" style="margin-left:6px"><span class="dot"></span>trusted key</span>'
+                      : '<span class="badge b-amber" style="margin-left:6px"><span class="dot"></span>new publisher</span>'}
+          ${bad ? '<span class="badge b-red" style="margin-left:6px"><span class="dot"></span>bad signature</span>' : ""}
+          ${withdrawn ? '<span class="badge b-red" style="margin-left:6px"><span class="dot"></span>withdrawn</span>' : ""}
+        </div>
+        ${p.description ? `<div class="plug-desc">${esc(p.description)}</div>` : ""}
+        <div class="keyline" style="margin-top:8px">${esc(p.publisherKey || "")}</div>
+        ${p.bundleMissing > 0 ? `<div class="plug-desc">editor: ${p.bundleMissing} of ${p.bundleChunks} chunks still arriving from peers</div>` : ""}
+      </div>
+      <div class="plug-actions">
+        <button class="btn ${bad || withdrawn ? "ghost" : "primary"} sm" data-install="${esc(p.doc)}"${bad ? " disabled" : ""}>Review & install</button>
+      </div>
+    </div>`;
+  }).join("");
+
+  const pubRows = pubs.map((p) => `
+    <div class="kv"><span class="k">${esc(p.name || "unnamed")}<div class="keyline">${esc(p.key)}</div></span>
+    <span class="v"><button class="btn ghost sm" data-revoke="${esc(p.key)}">Revoke</button></span></div>`).join("");
+
+  $("#plug-body").innerHTML = `
+    <div class="grid" style="gap:18px">
+      <div>
+        <h3 class="muted" style="font-size:11px;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 10px">Installed</h3>
+        ${installedCards || `<div class="card"><div class="empty"><div class="big">▣</div>Nothing installed yet.<br>Packages published to a drive you're on show up below.</div></div>`}
+      </div>
+      <div>
+        <h3 class="muted" style="font-size:11px;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 10px">Available on the mesh</h3>
+        ${offerCards || `<div class="card"><div class="empty">No packages offered on the drives you're connected to.</div></div>`}
+      </div>
+      ${pubs.length ? `<div>
+        <h3 class="muted" style="font-size:11px;letter-spacing:0.12em;text-transform:uppercase;margin:0 0 10px">Trusted publishers</h3>
+        <div class="card">${pubRows}</div>
+      </div>` : ""}
+    </div>`;
+
+  const byDoc = Object.fromEntries(avail.map((p) => [p.doc, p]));
+  $$("[data-install]").forEach((b) => (b.onclick = () => {
+    const pkg = byDoc[b.dataset.install];
+    installPrompt(pkg, () => installPackage(pkg));
+  }));
+  $$("[data-open-btn]").forEach((b) => (b.onclick = () => openPlugin(b.dataset.openBtn, inst)));
+  $$("[data-remove]").forEach((b) => (b.onclick = async () => {
+    try { await del(`/api/plugins/${encodeURIComponent(b.dataset.remove)}`); toast("removed"); renderPlugins(); }
+    catch (e) { toast(e.message, true); }
+  }));
+  $$("[data-revoke]").forEach((b) => (b.onclick = async () => {
+    try { await post(`/api/publishers/${encodeURIComponent(b.dataset.revoke)}/revoke`); toast("trust withdrawn"); renderPlugins(); }
+    catch (e) { toast(e.message, true); }
+  }));
+}
+
+/* ---- the capability bridge ---- */
+/*
+ * One listener, torn down when the frame closes, answering only messages whose
+ * source IS this frame's window. That check -- not the origin string -- is what
+ * identifies the caller here, because the frame is sandboxed into an opaque
+ * origin and therefore reports origin "null". "null" is not addressable as a
+ * postMessage target, so replies necessarily go to "*"; they are safe to,
+ * because postMessage delivers to the target window only, and the target window
+ * is the one we just verified.
+ */
+let bridgeOff = null;
+
+function openPlugin(name, installed) {
+  const pkg = (installed || []).find((p) => p.name === name);
+  const want = "#plugin/" + encodeURIComponent(name);
+  if (location.hash !== want) history.replaceState(null, "", want);
+  const src = `${ASSET_ORIGIN}/plugin/${encodeURIComponent(name)}`;
+
+  const wrap = document.createElement("div");
+  wrap.innerHTML = `
+    <div class="content-head">
+      <div><h1>${esc(name)}</h1><div class="sub">${esc((pkg && pkg.description) || "plugin")}</div></div>
+      <button class="btn ghost sm" id="plug-back">← All plugins</button>
+    </div>
+    <div class="frame-wrap">
+      <div class="frame-chrome">
+        <span class="badge b-violet"><span class="dot"></span>sandboxed</span>
+        <span class="mono">${esc(src)}</span>
+        <span class="sep"></span>
+        <span>published by <b style="color:var(--text)">${esc((pkg && pkg.publisher) || "unknown")}</b></span>
+      </div>
+      <iframe id="plug-frame" src="${esc(src)}"
+              sandbox="allow-scripts allow-forms"
+              referrerpolicy="no-referrer"
+              title="${esc(name)}"></iframe>
+    </div>`;
+  $("#content").replaceChildren(wrap);
+  $("#plug-back").onclick = () => { closeBridge(); switchTab("plugins"); };
+
+  const frame = $("#plug-frame");
+
+  // The sandbox attribute is belt to the port separation's braces: without
+  // allow-same-origin the frame gets an opaque origin, so even a console
+  // misconfigured onto the asset port would still not share an origin with it.
+  //
+  // allow-forms is needed for an unexpected reason. A sandboxed frame without
+  // it has the submit EVENT blocked, not just the navigation -- so a form that
+  // only ever calls preventDefault() and posts over the bridge silently never
+  // fires, which is exactly what happened the first time this ran. Granting it
+  // costs nothing: the bundle's own CSP sets form-action 'none', so the browser
+  // still refuses to send a form anywhere.
+  const onMessage = async (ev) => {
+    if (ev.source !== frame.contentWindow) return;
+    if (ev.origin !== "null" && ev.origin !== ASSET_ORIGIN) return;
+    const m = ev.data;
+    if (!m || typeof m.id !== "number") return;
+
+    const reply = (out) => { try { frame.contentWindow.postMessage({ id: m.id, ...out }, "*"); } catch {} };
+    try {
+      if (m.op === "query") {
+        reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/query`, { model: m.model, filter: m.filter ?? null }) });
+      } else if (m.op === "action") {
+        reply({ result: await post(`/api/plugins/${encodeURIComponent(name)}/action`, { model: m.model, kind: m.kind, name: m.name, payload: m.payload ?? {} }) });
+      } else if (m.op === "host") {
+        // Handshake: the plugin learns who it is and which theme to wear. No
+        // node identity, no peer list, no configuration -- a plugin has no
+        // business knowing those and does not need them to render.
+        reply({ result: { plugin: name, publisher: (pkg && pkg.publisher) || "", theme: "dark" } });
+      } else {
+        reply({ error: `unknown operation: ${String(m.op)}` });
+      }
+    } catch (e) {
+      reply({ error: e.message || String(e) });
+    }
+  };
+
+  closeBridge();
+  window.addEventListener("message", onMessage);
+  bridgeOff = () => window.removeEventListener("message", onMessage);
+}
+
+function closeBridge() { if (bridgeOff) { bridgeOff(); bridgeOff = null; } }
+
 /* ============================ DISPATCH ============================ */
 const RENDER = {
   overview: renderOverview,
@@ -1253,13 +1584,15 @@ const RENDER = {
   types: renderTypes,
   folders: renderFolders,
   groups: renderGroups,
+  plugins: renderPlugins,
   settings: renderSettings,
   profile: renderProfile,
 };
-function render() { $$(".view").forEach((v) => v.remove()); (RENDER[state.tab] || renderOverview)(); }
+function render() { closeBridge(); (RENDER[state.tab] || renderOverview)(); }
 
 $$(".nav-item").forEach((n) => (n.onclick = () => switchTab(n.dataset.tab)));
-render();
+window.addEventListener("hashchange", applyRoute);
+applyRoute();
 </script>
 </body>
 </html>

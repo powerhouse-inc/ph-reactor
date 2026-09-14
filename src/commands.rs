@@ -101,6 +101,10 @@ pub enum Command {
         peer: String,
         reply: tokio::sync::oneshot::Sender<std::result::Result<(), String>>,
     },
+    /// Ask connected peers for a blob's missing chunks. Fire-and-forget: the
+    /// chunks arrive asynchronously and are verified on the way in, so there is
+    /// nothing meaningful to await here.
+    FetchBlob { blob: crate::blob::BlobRef },
     /// Update a dotted config key (validated by `config::set`).
     SetConfig { key: String, value: Value },
     /// Stop the daemon.

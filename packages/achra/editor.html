@@ -1,0 +1,387 @@
+<!--
+  Achra — a marketplace for global coordination.
+
+  Shipped as a ph-reactor plugin: one self-contained HTML document, delivered to
+  each node as content-addressed chunks and served from an origin that has no
+  API of its own. Everything it reads or writes crosses the capability bridge,
+  and the package declares up front exactly which models that covers.
+
+  The SDK is inlined at build time, in place of the script tag below.
+  See scripts/publish-package.sh.
+-->
+<meta charset="utf-8">
+<title>Achra</title>
+<style>
+  :root {
+    --bg: #fbfbfd; --raise: #ffffff; --ink: #15171c; --muted: #6b7280; --faint: #9aa3af;
+    --line: #e6e8ec; --line-2: #d3d7de;
+    --accent: #15171c; --accent-ink: #ffffff;
+    --ok: #0d7a4a; --ok-bg: #e7f6ee;
+    --warn: #8a5a0b; --warn-bg: #fdf2dd;
+    --bad: #b4232a; --bad-bg: #fdeaea;
+    --shadow: 0 1px 2px rgba(16,18,22,.05), 0 10px 28px rgba(16,18,22,.05);
+    --r: 12px;
+  }
+  :root[data-theme="dark"], :root:not([data-theme="light"]) {
+    /* The console frames this on a dark shell and says so in the handshake, so
+       the dark palette is the one that usually renders. */
+  }
+  @media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) { --dm: 1; } }
+  :root[data-theme="dark"] {
+    --bg: #0b0e14; --raise: #141821; --ink: #e9edf5; --muted: #9aa3b8; --faint: #6b7489;
+    --line: #222836; --line-2: #2f3646;
+    --accent: #38e1ff; --accent-ink: #04121a;
+    --ok: #43e0a0; --ok-bg: rgba(67,224,160,.10);
+    --warn: #ffc46b; --warn-bg: rgba(255,196,107,.10);
+    --bad: #ff6b81; --bad-bg: rgba(255,107,129,.10);
+    --shadow: 0 1px 2px rgba(0,0,0,.4), 0 10px 28px rgba(0,0,0,.35);
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--ink);
+    font: 14px/1.55 ui-sans-serif, -apple-system, "Inter", "Segoe UI", Roboto, sans-serif;
+    -webkit-font-smoothing: antialiased;
+  }
+  .wrap { max-width: 1000px; margin: 0 auto; padding: 26px 20px 72px; }
+
+  header { display: flex; align-items: center; gap: 12px; margin-bottom: 2px; }
+  .mark {
+    width: 26px; height: 26px; border-radius: 8px; flex: none;
+    background: linear-gradient(135deg, var(--accent), color-mix(in srgb, var(--accent) 45%, #a78bfa));
+  }
+  h1 { font-size: 19px; font-weight: 650; letter-spacing: -.015em; margin: 0; }
+  .tagline { color: var(--muted); font-size: 13px; margin: 0 0 20px 38px; }
+
+  .stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; margin-bottom: 22px; }
+  .stat { background: var(--raise); border: 1px solid var(--line); border-radius: var(--r); padding: 13px 15px; }
+  .stat .n { font-size: 21px; font-weight: 680; letter-spacing: -.02em; font-variant-numeric: tabular-nums; }
+  .stat .l { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: .08em; margin-top: 2px; }
+
+  nav { display: flex; gap: 7px; margin-bottom: 18px; flex-wrap: wrap; }
+  .tab {
+    border: 1px solid var(--line); background: var(--raise); color: var(--muted);
+    padding: 7px 14px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 13px;
+    font-weight: 500; transition: .15s;
+  }
+  .tab:hover { color: var(--ink); border-color: var(--line-2); }
+  .tab[aria-selected="true"] { background: var(--accent); color: var(--accent-ink); border-color: var(--accent); font-weight: 600; }
+
+  .grid { display: grid; gap: 11px; }
+  .card {
+    background: var(--raise); border: 1px solid var(--line); border-radius: var(--r);
+    padding: 16px 18px; box-shadow: var(--shadow);
+  }
+  .card.act { cursor: pointer; transition: border-color .15s, transform .15s; }
+  .card.act:hover { border-color: var(--line-2); transform: translateY(-1px); }
+  .card h3 { margin: 0 0 3px; font-size: 15px; font-weight: 620; letter-spacing: -.008em; }
+  .card p { margin: 0; color: var(--muted); font-size: 13px; }
+  .row { display: flex; justify-content: space-between; align-items: flex-start; gap: 14px; }
+  .meta { display: flex; gap: 18px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin-top: 12px; }
+  .meta b { color: var(--ink); font-weight: 600; font-variant-numeric: tabular-nums; }
+
+  .pill { display: inline-block; padding: 2px 9px; border-radius: 999px; font-size: 11px;
+          font-weight: 650; letter-spacing: .04em; text-transform: uppercase; white-space: nowrap; }
+  .p-ok { background: var(--ok-bg); color: var(--ok); }
+  .p-warn { background: var(--warn-bg); color: var(--warn); }
+  .p-bad { background: var(--bad-bg); color: var(--bad); }
+  .p-dim { background: color-mix(in srgb, var(--muted) 12%, transparent); color: var(--muted); }
+
+  form { display: grid; gap: 12px; margin-top: 15px; }
+  label { display: grid; gap: 5px; font-size: 12px; color: var(--muted); font-weight: 500; }
+  input, textarea, select {
+    font: inherit; padding: 9px 11px; border: 1px solid var(--line); border-radius: 9px;
+    background: var(--bg); color: var(--ink); width: 100%;
+  }
+  input:focus, textarea:focus, select:focus { outline: 2px solid var(--accent); outline-offset: -1px; }
+  textarea { min-height: 82px; resize: vertical; }
+  .two { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }
+  button.go {
+    font: inherit; font-weight: 620; padding: 9px 17px; border-radius: 9px; cursor: pointer;
+    border: 1px solid var(--accent); background: var(--accent); color: var(--accent-ink); justify-self: start;
+  }
+  button.go.quiet { background: transparent; color: var(--muted); border-color: var(--line); }
+  button.go:disabled { opacity: .5; cursor: progress; }
+
+  .empty { color: var(--muted); text-align: center; padding: 48px 16px; }
+  .empty .big { font-size: 30px; opacity: .3; margin-bottom: 8px; }
+  .note { margin-top: 13px; padding: 11px 13px; border-radius: 9px; font-size: 13px; border: 1px solid var(--line); }
+  .note.bad { border-color: var(--bad); color: var(--bad); background: var(--bad-bg); }
+  .note.good { border-color: var(--ok); color: var(--ok); background: var(--ok-bg); }
+  .skel { height: 92px; border-radius: var(--r); background: var(--raise); border: 1px solid var(--line);
+          opacity: .55; animation: pulse 1.5s ease-in-out infinite; }
+  @keyframes pulse { 50% { opacity: .25; } }
+  @media (prefers-reduced-motion: reduce) { .skel { animation: none; } .card.act:hover { transform: none; } }
+  @media (max-width: 620px) { .stats { grid-template-columns: 1fr 1fr; } .two { grid-template-columns: 1fr; } }
+
+  footer { margin-top: 34px; padding-top: 14px; border-top: 1px solid var(--line);
+           color: var(--faint); font-size: 12px; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--ok); display: inline-block; }
+  .dot.off { background: var(--bad); }
+</style>
+
+<div class="wrap">
+  <header><div class="mark"></div><h1>Achra</h1></header>
+  <p class="tagline">A marketplace for global coordination — objectives published, proposals signed, agreements kept.</p>
+
+  <div class="stats" id="stats"></div>
+
+  <nav role="tablist">
+    <button class="tab" role="tab" data-view="rfps" aria-selected="true">Open objectives</button>
+    <button class="tab" role="tab" data-view="proposals" aria-selected="false">Proposals</button>
+    <button class="tab" role="tab" data-view="agreements" aria-selected="false">Agreements</button>
+    <button class="tab" role="tab" data-view="milestones" aria-selected="false">Milestones</button>
+  </nav>
+
+  <div id="view" class="grid"></div>
+
+  <footer>
+    <span class="dot off" id="dot"></span><span id="conn">connecting to the reactor…</span>
+    <span style="flex:1"></span>
+    <span>sandboxed plugin · reads and writes only what it declared</span>
+  </footer>
+</div>
+
+<script type="module">
+<!--#include ph-reactor-sdk.js-->
+
+const ph = createClient();
+
+/* ---------- helpers ---------- */
+const $ = (s, r = document) => r.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) =>
+  ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const f = (d, k) => d?.fields?.[k];
+const one = (d, k) => { const v = f(d, k); return Array.isArray(v) ? (v[0] ?? "") : (v ?? ""); };
+
+const money = (n, ccy) => {
+  const v = Number(n || 0);
+  try { return new Intl.NumberFormat(undefined, { style: "currency", currency: ccy || "USD", maximumFractionDigits: 0 }).format(v); }
+  catch { return `${v.toLocaleString()} ${ccy || ""}`.trim(); }
+};
+const compact = (n) => {
+  try { return new Intl.NumberFormat(undefined, { notation: "compact", maximumFractionDigits: 1 }).format(Number(n || 0)); }
+  catch { return String(n || 0); }
+};
+const deadline = (iso) => {
+  const d = new Date(iso);
+  if (isNaN(d)) return esc(iso || "no deadline");
+  const days = Math.ceil((d - Date.now()) / 86400000);
+  if (days < 0) return `closed ${-days}d ago`;
+  if (days === 0) return "closes today";
+  if (days === 1) return "1 day left";
+  return `${days} days left`;
+};
+const statusPill = (s) => {
+  const cls = { open: "p-ok", submitted: "p-ok", active: "p-ok", accepted: "p-ok", complete: "p-dim",
+                awarded: "p-warn", pending: "p-warn", cancelled: "p-bad", withdrawn: "p-bad",
+                declined: "p-bad", rejected: "p-bad", terminated: "p-bad" }[s] || "p-dim";
+  return `<span class="pill ${cls}">${esc(s || "—")}</span>`;
+};
+
+const view = $("#view");
+const skel = (n = 3) => { view.innerHTML = Array.from({ length: n }, () => '<div class="skel"></div>').join(""); };
+const empty = (t, h) => { view.innerHTML = `<div class="empty"><div class="big">◇</div><strong>${esc(t)}</strong><div>${esc(h)}</div></div>`; };
+const fail = (e) => { view.innerHTML = `<div class="note bad">${esc(e.message || e)}</div>`; };
+
+/* ---------- shared state ----------
+   One poll per model, shared by every view, so switching tabs is instant and
+   the daemon is asked four times per cycle rather than once per rendered card. */
+const data = { rfp: [], proposal: [], agreement: [], milestone: [] };
+let current = "rfps";
+
+function refreshStats() {
+  const open = data.rfp.filter((r) => f(r, "status") === "open");
+  const pot = open.reduce((a, r) => a + Number(f(r, "budget") || 0), 0);
+  const live = data.agreement.filter((a) => f(a, "status") === "active").length;
+  $("#stats").innerHTML = [
+    [open.length, "open objectives"],
+    [compact(pot), "budget available"],
+    [data.proposal.length, "proposals"],
+    [live, "active agreements"],
+  ].map(([n, l]) => `<div class="stat"><div class="n">${esc(n)}</div><div class="l">${esc(l)}</div></div>`).join("");
+}
+
+/* ---------- views ---------- */
+function showRfps() {
+  const open = data.rfp.filter((r) => f(r, "status") === "open");
+  const rest = data.rfp.filter((r) => f(r, "status") !== "open");
+  if (!data.rfp.length) return empty("No objectives yet", "When an organization publishes an RFP to a drive you're on, it appears here.");
+
+  view.innerHTML = [...open, ...rest].map((r) => `
+    <article class="card">
+      <div class="row">
+        <div style="min-width:0">
+          <h3>${esc(f(r, "title") || r.name)}</h3>
+          <p>${esc(f(r, "brief"))}</p>
+        </div>
+        ${statusPill(f(r, "status"))}
+      </div>
+      <div class="meta">
+        <span>budget <b>${esc(money(f(r, "budget"), f(r, "currency")))}</b></span>
+        <span><b>${esc(deadline(f(r, "deadline")))}</b></span>
+        <span>proposals <b>${data.proposal.filter((p) => f(p, "rfp_ref") === r.name).length}</b></span>
+        <span>ref <b>${esc(r.name)}</b></span>
+      </div>
+      ${f(r, "status") === "open"
+        ? `<div style="margin-top:13px"><button class="go" data-propose="${esc(r.name)}">Submit a proposal</button></div>`
+        : f(r, "winner") ? `<div class="meta"><span>awarded to <b>${esc(String(f(r, "winner")).slice(0, 16))}…</b> for <b>${esc(money(f(r, "award_amount")))}</b></span></div>` : ""}
+      <div data-form="${esc(r.name)}"></div>
+    </article>`).join("");
+
+  view.querySelectorAll("[data-propose]").forEach((b) => (b.onclick = () => proposeForm(b.dataset.propose, b)));
+}
+
+function proposeForm(rfpName, btn) {
+  const slot = view.querySelector(`[data-form="${CSS.escape(rfpName)}"]`);
+  if (slot.firstChild) { slot.innerHTML = ""; btn.textContent = "Submit a proposal"; return; }
+  btn.textContent = "Cancel";
+  const rfp = data.rfp.find((r) => r.name === rfpName);
+  slot.innerHTML = `
+    <form>
+      <label>What you will deliver
+        <textarea name="summary" required placeholder="Scope, approach, and how it gets verified."></textarea></label>
+      <div class="two">
+        <label>Your price
+          <input name="amount" type="number" min="0" step="1" required
+                 placeholder="${esc(f(rfp, "budget") || 0)}"></label>
+        <label>Reference
+          <input value="${esc(rfpName)}" disabled></label>
+      </div>
+      <button class="go" type="submit">Sign &amp; submit</button>
+    </form>
+    <div class="out"></div>`;
+
+  slot.querySelector("form").addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const b = ev.target.querySelector("button");
+    const out = slot.querySelector(".out");
+    const d = Object.fromEntries(new FormData(ev.target));
+    const name = `prop-${rfpName}-${Date.now().toString(36)}`;
+    b.disabled = true; out.innerHTML = "";
+    try {
+      await ph.submit("proposal@1", "init", name, {
+        name, rfp_ref: rfpName, summary: d.summary, amount: Number(d.amount),
+      });
+      out.innerHTML = `<div class="note good">Signed and submitted as <b>${esc(name)}</b>. It is on its way to the other members of this drive.</div>`;
+      ev.target.remove();
+      btn.textContent = "Submitted ✓"; btn.disabled = true;
+      poll();
+    } catch (e) {
+      out.innerHTML = `<div class="note bad">${esc(e.message)}</div>`;
+      b.disabled = false;
+    }
+  });
+}
+
+function showProposals() {
+  if (!data.proposal.length) return empty("No proposals yet", "Open an objective and submit one.");
+  view.innerHTML = data.proposal.map((p) => `
+    <article class="card">
+      <div class="row">
+        <div style="min-width:0">
+          <h3>${esc(f(p, "summary") || p.name)}</h3>
+          <p>against <b>${esc(f(p, "rfp_ref"))}</b></p>
+        </div>
+        ${statusPill(f(p, "status"))}
+      </div>
+      <div class="meta">
+        <span>price <b>${esc(money(f(p, "amount")))}</b></span>
+        <span>by <b>${esc(String(one(p, "submitter")).slice(0, 16) || "—")}…</b></span>
+        <span>ref <b>${esc(p.name)}</b></span>
+      </div>
+      ${f(p, "status") === "submitted"
+        ? `<div style="margin-top:12px"><button class="go quiet" data-withdraw="${esc(p.name)}">Withdraw</button></div>` : ""}
+    </article>`).join("");
+
+  view.querySelectorAll("[data-withdraw]").forEach((b) => (b.onclick = async () => {
+    b.disabled = true;
+    try { await ph.submit("proposal@1", "withdraw", b.dataset.withdraw, {}); poll(); }
+    catch (e) { b.insertAdjacentHTML("afterend", `<div class="note bad">${esc(e.message)}</div>`); b.disabled = false; }
+  }));
+}
+
+function showAgreements() {
+  if (!data.agreement.length) return empty("No agreements", "An agreement is created when an objective is awarded.");
+  view.innerHTML = data.agreement.map((a) => {
+    const ms = data.milestone.filter((m) => f(m, "agreement_ref") === a.name);
+    const done = ms.filter((m) => f(m, "status") === "accepted");
+    const paid = done.reduce((s, m) => s + Number(f(m, "amount") || 0), 0);
+    const total = Number(f(a, "total") || 0);
+    const pct = total ? Math.min(100, Math.round((paid / total) * 100)) : 0;
+    return `
+    <article class="card">
+      <div class="row">
+        <div style="min-width:0">
+          <h3>${esc(a.name)}</h3>
+          <p>for <b>${esc(f(a, "rfp_ref"))}</b> · proposal <b>${esc(f(a, "proposal_ref"))}</b></p>
+        </div>
+        ${statusPill(f(a, "status"))}
+      </div>
+      <div class="meta">
+        <span>value <b>${esc(money(total))}</b></span>
+        <span>milestones <b>${done.length}/${ms.length}</b></span>
+        <span>released <b>${esc(money(paid))}</b> (${pct}%)</span>
+      </div>
+      <div style="margin-top:12px;height:5px;border-radius:5px;background:var(--line);overflow:hidden">
+        <div style="height:100%;width:${pct}%;background:var(--ok)"></div>
+      </div>
+    </article>`;
+  }).join("");
+}
+
+function showMilestones() {
+  if (!data.milestone.length) return empty("No milestones", "Milestones are tracked against an agreement.");
+  view.innerHTML = data.milestone.map((m) => `
+    <article class="card">
+      <div class="row">
+        <div style="min-width:0">
+          <h3>${esc(f(m, "title") || m.name)}</h3>
+          <p>under <b>${esc(f(m, "agreement_ref"))}</b></p>
+        </div>
+        ${statusPill(f(m, "status"))}
+      </div>
+      <div class="meta">
+        <span>amount <b>${esc(money(f(m, "amount")))}</b></span>
+        ${f(m, "evidence") ? `<span>evidence <b>${esc(String(f(m, "evidence")).slice(0, 48))}</b></span>` : ""}
+      </div>
+    </article>`).join("");
+}
+
+const VIEWS = { rfps: showRfps, proposals: showProposals, agreements: showAgreements, milestones: showMilestones };
+
+document.querySelectorAll(".tab").forEach((t) => (t.onclick = () => {
+  document.querySelectorAll(".tab").forEach((o) => o.setAttribute("aria-selected", String(o === t)));
+  current = t.dataset.view;
+  VIEWS[current]();
+}));
+
+/* ---------- the one poll ---------- */
+let everFailed = false;
+async function poll() {
+  try {
+    const [rfp, proposal, agreement, milestone] = await Promise.all([
+      ph.query("rfp@1"), ph.query("proposal@1"), ph.query("agreement@1"), ph.query("milestone@1"),
+    ]);
+    Object.assign(data, { rfp, proposal, agreement, milestone });
+    refreshStats();
+    // Re-render only if nothing is half-typed: clobbering a form someone is
+    // filling in because a poll came back would be its own kind of bug.
+    if (!view.querySelector("form")) VIEWS[current]();
+    $("#dot").classList.remove("off");
+    $("#conn").textContent = `connected · ${rfp.length} objective${rfp.length === 1 ? "" : "s"}, ${proposal.length} proposal${proposal.length === 1 ? "" : "s"}`;
+    everFailed = false;
+  } catch (e) {
+    $("#dot").classList.add("off");
+    $("#conn").textContent = `not connected: ${e.message}`;
+    if (!everFailed) { everFailed = true; fail(e); }
+  }
+}
+
+/* ---------- start ---------- */
+skel();
+ph.host()
+  .then((h) => { if (h && h.theme) document.documentElement.dataset.theme = h.theme; })
+  .catch(() => { /* an older host without a handshake still works; theme follows the OS */ });
+poll();
+setInterval(poll, 5000);
+</script>
