@@ -257,6 +257,41 @@ Both were cheap and both could have invalidated the design:
 Neither is exotic, but the entire browser half of the design depends on them, so
 they come first and their result is reported before anything is built on top.
 
+## BLOCKING GAP found while implementing: runtime models are not durable
+
+The design asserts that "domain models are data, not code" and treats runtime
+registration as free. Registration *is* free. **Durability is not.**
+
+Registered model definitions live in memory only. On restart the store replays
+each document's action log, and without the model it cannot reduce those
+actions — so every document under a runtime-registered model comes back as an
+**empty shell**: no name, no fields.
+
+Observed directly on 2026-09-14, immediately after rolling the cluster to 1.5.0:
+
+| Node | Models | Result |
+|---|---|---|
+| cluster (restarted) | lost | 3 Achra documents replayed with no name and no fields |
+| laptop (not restarted) | retained | the same 2 documents fully intact |
+| `powerhouse` group | built-in `group` model | intact on both |
+
+The data is not lost — the action log is durable on the PVC — but the read
+model cannot be rebuilt, and there is no hook to register a model *before*
+replay.
+
+**This blocks the MVP.** A marketplace whose documents empty themselves on
+every deploy is not usable by a pilot organization, and every reactor restart
+would require an operator to re-POST the definitions.
+
+Proposed fix, as its own bounded change before further Achra work: persist
+registered definitions into the state directory (alongside `config.json` and
+`processors.json`, which already follow this pattern) and load them before
+replay. Built-in models are unaffected, which is why `group` survived and is
+the reason this went unnoticed until a domain model was deployed.
+
+Until it is fixed, the Achra models must be re-registered after every restart,
+and documents created before re-registration will not render.
+
 ## Testing
 
 | Level | What |
