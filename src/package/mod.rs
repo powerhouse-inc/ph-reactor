@@ -19,6 +19,7 @@
 //!
 //! See docs/superpowers/specs/2026-09-14-plugin-packages-design.md.
 
+pub mod install;
 pub mod trust;
 
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};

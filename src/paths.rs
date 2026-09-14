@@ -103,6 +103,11 @@ impl StatePaths {
         self.root.join("processors.json")
     }
 
+    /// Packages installed on this node (see package::install).
+    pub fn packages_file(&self) -> PathBuf {
+        self.root.join("packages.json")
+    }
+
     /// Publishers this node accepts packages from (see package::trust).
     pub fn publishers_file(&self) -> PathBuf {
         self.root.join("publishers.json")
