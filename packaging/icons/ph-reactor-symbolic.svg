@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" width="114" height="114" viewBox="0 0 114 114">
+  <!-- The Powerhouse logomark: the square glyph from the full lockup, with the
+       "Powerhouse" wordmark removed. Monochrome and theme-aware on purpose -
+       a tray icon has to read on both a light and a dark panel.
+
+       Recolouring: KDE rewrites the .ColorScheme-Text rule with the active
+       scheme colour; GNOME recolours symbolic icons directly. currentColor
+       satisfies both, and the literal below is the fallback when neither does.
+  -->
+  <style id="current-color-scheme" type="text/css">.ColorScheme-Text { color: #232629; }</style>
+  <path class="ColorScheme-Text" fill="currentColor" fill-rule="evenodd" clip-rule="evenodd"
+        d="M71.2919 0L24.3415 38.8772C17.4548 44.5798 16.9539 54.9659 23.26 61.3047L39.5028 77.6318C44.2684 82.4221 45.2996 89.7834 42.0335 95.6988L31.929 114H15.2C6.80527 114 0 107.195 0 98.8V15.2C0 6.80527 6.80527 0 15.2 0H71.2919ZM80.111 0L71.3412 15.9758C68.1078 21.866 69.1255 29.1804 73.8441 33.9641L91.0751 51.4331C97.3674 57.8124 96.8044 68.2227 89.8607 73.8861L40.6782 114H98.8C107.195 114 114 107.195 114 98.8V15.2C114 6.80527 107.195 0 98.8 0H80.111Z"/>
+</svg>
