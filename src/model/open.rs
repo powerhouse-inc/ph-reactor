@@ -110,6 +110,7 @@ mod tests {
             cosig: Vec::new(),
             prev_hash: None,
             sig: [0; 64],
+            space: None,
         };
         if let Some(v) = value {
             a.payload["value"] = v;

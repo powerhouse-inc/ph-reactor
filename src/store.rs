@@ -59,6 +59,10 @@ pub struct DocState {
     /// The model that governs this doc's field map (open@1 by default).
     #[serde(default = "default_model_ref")]
     pub model: ModelRef,
+    /// The space this doc belongs to. Absent in snapshots written before
+    /// spaces existed, which is exactly what "no space" means.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<DocId>,
 }
 
 fn default_model_ref() -> ModelRef {
@@ -173,6 +177,9 @@ struct Entry {
     log: Vec<Action>,
     /// The model that wrote the doc (open@1 until an action sets it).
     model: ModelRef,
+    /// The space this document belongs to, taken from its first action and
+    /// immutable after. `None` for documents written before spaces existed.
+    space: Option<DocId>,
 }
 
 impl Entry {
@@ -187,6 +194,7 @@ impl Entry {
             deleted: false,
             log: Vec::new(),
             model: open_ref(),
+            space: None,
         }
     }
 }
@@ -544,6 +552,7 @@ impl Store {
             deleted: e.deleted,
             log_hash: e.log.last().map(|a| a.hash()),
             model: e.model.clone(),
+            space: e.space,
         })
     }
 
@@ -602,6 +611,7 @@ impl Store {
             deleted: entry.deleted,
             log_hash: entry.log.last().map(|a| a.hash()),
             model: entry.model.clone(),
+            space: entry.space,
         });
         let missing: Vec<Action> = entry
             .log
@@ -652,6 +662,7 @@ impl Store {
                 deleted: b.deleted,
                 log: Vec::new(),
                 model: b.model.clone(),
+                space: b.space,
             },
             None => Entry::new(id),
         };
@@ -913,6 +924,7 @@ impl Inner {
                 deleted: state.deleted,
                 log: Vec::new(),
                 model: state.model.clone(),
+                space: state.space,
             },
             None => Entry::new(id),
         };
@@ -998,6 +1010,8 @@ impl Inner {
             .entries
             .get(&id)
             .and_then(|e| e.log.last().map(|a| a.hash()));
+        // A document's space is decided by its first action and never moves.
+        let space = self.entries.get(&id).and_then(|e| e.space);
         let mut action = Action {
             doc_id: id,
             model: self.canonical_model_ref(model),
@@ -1009,6 +1023,7 @@ impl Inner {
             cosig: Vec::new(),
             sig: [0; 64],
             prev_hash,
+            space,
         };
         action.sign(&self.key);
         Ok(action)
@@ -1086,6 +1101,15 @@ impl Inner {
                 return self.reject(action, &r.describe());
             }
         }
+        // 3d. Space binding. A document's space is decided by its first action
+        //     and never moves. An action naming a different space is a document
+        //     being dragged out of a protected space into a public one, which
+        //     is the move putting `space` under the signature exists to stop.
+        if let Some(entry) = self.entries.get(&action.doc_id) {
+            if !entry.log.is_empty() && entry.space != action.space {
+                return self.reject(action, "space mismatch: a document cannot change space");
+            }
+        }
         // 4. Precondition + reduce + per-field merge (one entries borrow).
         //
         // `append`/`remove` reduce to a *whole-array* write, and a field
@@ -1111,6 +1135,9 @@ impl Inner {
                 self.quarantined += 1;
                 warn!("action quarantined (precondition): {}", r.describe());
                 return Err(r.describe());
+            }
+            if entry.log.is_empty() {
+                entry.space = action.space;
             }
             let (a, d) = apply_ops_to_entry(entry, model.as_ref(), action);
             entry.model = action.model.clone();
@@ -1215,6 +1242,7 @@ impl Inner {
                 deleted: entry.deleted,
                 log_hash: entry.log.last().map(|a| a.hash()),
                 model: entry.model.clone(),
+                space: entry.space,
             },
             ts,
             action_kind,
@@ -1290,10 +1318,16 @@ impl Inner {
                 deleted: b.deleted,
                 log: Vec::new(),
                 model: b.model.clone(),
+                space: b.space,
             },
             None => Entry::new(doc_id),
         };
         lift_name(&mut fresh.doc);
+        // The space comes from the canonically-first action, so a re-fold that
+        // reorders the log can also settle which space the document is in.
+        if fresh.space.is_none() {
+            fresh.space = log.first().and_then(|a| a.space);
+        }
         for (a, model) in log.iter().zip(models.iter()) {
             if model.check_precondition(&fresh.doc, a).is_err()
                 || model.authorize(&fresh.doc, a).is_err()
@@ -1323,6 +1357,7 @@ impl Inner {
             deleted: entry.deleted,
             log_hash: entry.log.last().map(|a| a.hash()),
             model: open_ref(),
+            space: entry.space,
         };
         let snap_path = self.docs_dir.join(format!("{}.snap", id));
         let json = serde_json::to_vec_pretty(&state).map_err(|e| e.to_string())?;
@@ -1537,6 +1572,7 @@ mod tests {
             cosig: vec![],
             sig: [0; 64],
             prev_hash: None,
+            space: None,
         };
         a.sign(key);
         a
@@ -1572,6 +1608,7 @@ mod tests {
                 .collect(),
             sig: [0; 64],
             prev_hash: None,
+            space: None,
         };
         let mb = a.message_bytes();
         a.sig = key.sign(&mb).to_bytes();
@@ -2468,6 +2505,60 @@ mod tests {
                 .iter()
                 .map(|a| a.problems.clone())
                 .collect::<Vec<_>>()
+        );
+    }
+
+    /// A document's space is fixed by its first action. An action naming a
+    /// different one is a document being dragged out of a protected space
+    /// into a public one, and must not apply.
+    #[test]
+    fn a_document_cannot_change_space() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_store(dir.path());
+        let k = identity(1);
+        s.register_peer_key("alice", k.verifying_key().to_bytes())
+            .unwrap();
+
+        let id = DocId::new();
+        let home = DocId::new();
+        let elsewhere = DocId::new();
+
+        let mut init = make_group_action(
+            id,
+            "init",
+            serde_json::json!({ "name": "core", "members": ["alice"], "managers": ["alice"] }),
+            "alice",
+            &k,
+            &[],
+            clock1("alice", 1),
+            1000,
+        );
+        init.space = Some(home);
+        let mb = init.message_bytes();
+        init.sig = k.sign(&mb).to_bytes();
+        s.apply_remote_action(&init).unwrap();
+
+        let mut moved = make_group_action(
+            id,
+            "post",
+            serde_json::json!({ "text": "hi", "channel": "general" }),
+            "alice",
+            &k,
+            &[],
+            clock1("alice", 2),
+            2000,
+        );
+        moved.space = Some(elsewhere);
+        let mb = moved.message_bytes();
+        moved.sig = k.sign(&mb).to_bytes();
+
+        let err = match s.apply_remote_action(&moved) {
+            Err(e) => e,
+            Ok(_) => panic!("a document must not be able to change space"),
+        };
+        assert!(
+            err.contains("space"),
+            "the rejection names the reason: {err}"
         );
     }
 }

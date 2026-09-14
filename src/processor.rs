@@ -476,6 +476,7 @@ mod tests {
                 deleted: false,
                 log_hash: None,
                 model: ModelRef::new(model, "1"),
+                space: None,
             },
             ts: 1,
             action_kind: kind.map(String::from),

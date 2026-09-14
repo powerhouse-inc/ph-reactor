@@ -147,6 +147,7 @@ mod tests {
             cosig: Vec::new(),
             prev_hash: None,
             sig: [0u8; 64],
+            space: None,
         };
         a.sign(k);
         a

@@ -69,6 +69,19 @@ pub struct Action {
     /// first). Chains the log so it is tamper-evident.
     #[serde(default)]
     pub prev_hash: Option<Hash32>,
+    /// The space this document belongs to — the unit of access. Set on the
+    /// document's first action and immutable after.
+    ///
+    /// It lives on the *signed action*, not in the field map, deliberately. As
+    /// an ordinary field it would merge last-writer-wins like any other, and a
+    /// concurrent write could move a document out of a protected space into a
+    /// public one. Here the binding is as strong as the signature over it.
+    ///
+    /// `None` means "no space" — every document written before spaces existed.
+    /// Both encodings below are chosen so those actions are untouched: see
+    /// [`Action::message_bytes`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub space: Option<DocId>,
     /// ed25519 signature over [`Action::message_bytes`] by `origin`.
     #[serde(serialize_with = "sig_ser", deserialize_with = "sig_de")]
     pub sig: [u8; 64],
@@ -80,7 +93,15 @@ pub struct Action {
 ///
 /// `doc_id(16) || 0x01 name 0x01 version [0x01 hash | 0x00]
 ///  || 0x01 kind || 0x01 payload || ts(8) || 0x01 clock
-///  || 0x01 origin || [0x01 prev_hash | 0x00]`
+///  || 0x01 origin || [0x01 prev_hash | 0x00] || [0x01 space | <nothing>]`
+///
+/// The space suffix is absent — not a `0x00` marker — when there is no space.
+/// A marker byte would have changed the message for every action ever signed,
+/// so every historical signature would have failed to verify and the mesh
+/// would have partitioned along version lines, each side certain the other was
+/// forging. Appending nothing keeps those bytes exactly as they were. The
+/// suffix is unambiguous regardless: it is fixed-width, and stripping it from
+/// an action that carries a space makes that action's signature fail.
 impl Action {
     pub fn message_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(128);
@@ -131,6 +152,14 @@ impl Action {
                 out.extend_from_slice(&h.as_bytes());
             }
             None => out.push(0x00),
+        }
+
+        // Appended only when present (see the doc comment above): an action
+        // with no space must produce the byte string it produced before this
+        // field existed.
+        if let Some(space) = &self.space {
+            out.push(0x01);
+            out.extend_from_slice(&space.as_bytes());
         }
         out
     }
@@ -203,6 +232,7 @@ mod tests {
             cosig: Vec::new(),
             prev_hash: None,
             sig: [0; 64],
+            space: None,
         };
         a.sign(key);
         a
@@ -256,6 +286,84 @@ mod tests {
         assert!(!a.verify_cosig(0, &k.verifying_key()));
         assert!(!a.verify_cosig(1, &cosigner.verifying_key()));
     }
+
+    /// A node running 1.9.0 — which has no `space` field at all — must be able
+    /// to hand this node an action and have it verify, and vice versa.
+    ///
+    /// This is the wire fixture for that. It is the JSON a pre-spaces node
+    /// emits: no `space` key, and a signature made over bytes that end at
+    /// `prev_hash`. If anyone changes `message_bytes` in a way that touches
+    /// spaceless actions, this test fails here rather than in production as a
+    /// silent mesh partition where each side is certain the other is forging.
+    #[test]
+    fn an_action_from_a_pre_spaces_node_still_verifies() {
+        const FROM_1_9_0: &str = r#"{"doc_id":"00000000-0000-0000-0000-000000000001","model":{"name":"invoice","version":"1.0.0","hash":null},"kind":"add-line","payload":{"id":"L1","qty":2},"ts":42,"clock":{"12D3KooWQbz":3},"origin":"12D3KooWQbz","cosig":[],"prev_hash":null,"sig":"429a48c7f4a5e48919ee46565ff1688cb76fd70b8417ed5774515631c552175ebc5c299a75f4fe1628f7015b5217f7b9ad5a067397a4a510f361cc6eb03f2c04"}"#;
+        let a: Action = serde_json::from_str(FROM_1_9_0).expect("1.9.0 JSON parses");
+        assert_eq!(a.space, None, "a pre-spaces action has no space");
+        assert!(
+            a.verify(&key(7).verifying_key()),
+            "a signature made before `space` existed must still check out"
+        );
+    }
+
+    /// The other half: an action with no space must serialize back to JSON
+    /// with no `space` key, so a 1.9.0 node can still parse what we send.
+    #[test]
+    fn a_spaceless_action_serializes_without_the_key() {
+        let a = sample_action(&key(7));
+        let json = serde_json::to_string(&a).unwrap();
+        assert!(
+            !json.contains("space"),
+            "1.9.0 must be able to read this: {json}"
+        );
+    }
+
+    /// `space` is appended to the signed bytes only when present — not as a
+    /// `0x00` marker — so the byte string for a spaceless action is exactly
+    /// what it was before the field existed.
+    #[test]
+    fn the_space_suffix_is_absent_rather_than_empty() {
+        let k = key(7);
+        let without = sample_action(&k);
+        let mut with = sample_action(&k);
+        let id = DocId::parse("00000000-0000-0000-0000-0000000000ff").unwrap();
+        with.space = Some(id);
+
+        let mut expected = without.message_bytes();
+        expected.push(0x01);
+        expected.extend_from_slice(&id.as_bytes());
+        assert_eq!(
+            with.message_bytes(),
+            expected,
+            "a space appends a marker plus 16 bytes and nothing else"
+        );
+    }
+
+    /// Moving a signed action into a space, or out of one, must break it.
+    #[test]
+    fn changing_the_space_invalidates_the_signature() {
+        let k = key(7);
+        let id = DocId::parse("00000000-0000-0000-0000-0000000000ff").unwrap();
+
+        let mut a = sample_action(&k);
+        a.sign(&k);
+        assert!(a.verify(&k.verifying_key()));
+        a.space = Some(id);
+        assert!(
+            !a.verify(&k.verifying_key()),
+            "dragging a spaceless document into a space must not verify"
+        );
+
+        let mut b = sample_action(&k);
+        b.space = Some(id);
+        b.sign(&k);
+        assert!(b.verify(&k.verifying_key()));
+        b.space = None;
+        assert!(
+            !b.verify(&k.verifying_key()),
+            "stripping the space off a signed action must not verify"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -289,6 +397,7 @@ mod wire_format_tests {
             cosig: Vec::new(),
             prev_hash: None,
             sig: [0u8; 64],
+            space: None,
         };
         let hex = hex::encode(a.message_bytes());
         assert_eq!(hex, GOLDEN, "the canonical signing form changed");

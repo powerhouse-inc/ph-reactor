@@ -540,6 +540,7 @@ mod tests {
             cosig: Vec::new(),
             prev_hash: None,
             sig: [0; 64],
+            space: None,
         }
     }
 
