@@ -1,11 +1,13 @@
 # ph-reactor
 
-A single-process Rust daemon that runs a local Powerhouse **reactor** in
-the background on Linux: an event-sourced document vault with
-**libp2p-based drive sync**, a status-bar **tray icon**, and a loopback **console** for configuring the remote drives to
-keep in sync (e.g. the `powerhouse-knowledge` vault on another machine).
+A single-process Rust daemon that runs a native Powerhouse **reactor** in the
+background on Linux: an **event-sourced document vault** with **libp2p drive
+sync**, a **status-bar tray icon**, a loopback **console**, and a **group
+shared space** (channels and a folder drive) that syncs across a mesh of
+reactors.
 
-No Node, no npm, no child processes: the daemon *is* the reactor.
+No Node, no npm, no child processes: the daemon *is* the reactor. Its only
+external side effect is opening the settings page in a browser via `xdg-open`.
 
 - **Store**: event-sourced docs (per-field last-writer-wins with vector
   clocks, ed25519-signed ops), durable as per-doc WAL + snapshots under
@@ -15,10 +17,16 @@ No Node, no npm, no child processes: the daemon *is* the reactor.
   (`/ph-reactor/sync/1.0.0`) for the hello handshake, per-doc catch-up,
   and periodic summary reconciliation. A "drive" is a remote **peer**
   addressed by multiaddr, not a URL.
+- **Group shared space**: a `group` document carries public/private
+  **channels** and a Google-Drive-like **folder drive**. Posts to a private
+  channel are gated by a model-declared `auth` block that the store runs on
+  its single apply path (after the signature check, before reduce).
 - **Tray**: an `org.kde.StatusNotifierItem` over D-Bus (zbus) with a
   `DBusMenu` — no GTK dependency; headless-safe (no session bus → the
   daemon runs without a tray).
-- **Console**: a client-side-routed control panel (Overview / Documents / Types / Folders / Groups / Settings) with a JSON API — loopback by default, bindable to Tailscale or other hosts.
+- **Console**: a client-side-routed control panel with a four-item sidebar
+  (Home / Groups / Settings / Profile) and a JSON API — loopback by default,
+  bindable to Tailscale or other hosts.
 
 ## Install
 
@@ -63,9 +71,10 @@ for the whole instance) under `~/.ph/reactor/` and starts listening on
 ### Syncing a knowledge vault
 
 The native reactor is self-contained (no Node, no switchboard process). A
-"knowledge vault" is therefore a **group of reactors** that share a set of
-drives, not a switchboard URL. To join one (e.g. the `powerhouse-knowledge`
-vault):
+"knowledge vault" is a **group of reactors** that share a set of drives —
+and, through the group shared space, a shared set of **channels** for
+discussion and a shared **folder drive** for documents. To join one (e.g. the
+`powerhouse-knowledge` vault):
 
 ```sh
 # on the vault host, once:
@@ -76,8 +85,10 @@ ph-reactor join <invite-string>   # pins the inviter (TOFU) + adds the shared dr
 ```
 
 For a single peer instead of a group, `ph-reactor drive add <multiaddr>`
-works too. The vault's document model packages are fetched from the registry
-on first sync and installed into the local store automatically.
+works too. The reactor ships with built-in document models (note, task,
+project, …); new models are drafted from a text description by the LLM or
+registered as JSON from the console — nothing is fetched or installed from a
+package registry.
 
 ## CLI
 
@@ -165,6 +176,23 @@ Three paths move ops between peers:
 vault mirror picks it up on the next reconcile without waiting for a
 reconnect.
 
+## Performance
+
+The store feeds the sync layer an outbound channel of **local** actions and
+publishes them **immediately** on apply — no poll-interval wait — while
+remote actions are never re-gossipped (origin gate). That drops two-node
+document convergence from ~5 s to ~22 ms (**~231×**) in the `multiproc_bench`
+test.
+
+Convergence is a property of the op set, not the delivery order. The
+per-field last-writer-wins merge is commutative and idempotent, so
+`fifty_concurrent_origins_converge_regardless_of_order` (in `src/doc.rs`)
+asserts an identical final document across ten application orders of fifty
+origins' concurrent ops (100 each — distinct fields plus a shared counter)
+with no divergence. Same-field writes resolve by design (last-writer-wins on
+`(ts, origin)`); concurrent channel appends never collide (each takes its
+own position).
+
 ## Tray
 
 The tray icon is a classic `org.kde.StatusNotifierItem` (D-Bus session
@@ -198,37 +226,43 @@ tray; everything else works.
 auth, so the bind address is the security boundary) serves the **reactor
 console** — a client-side-routed control panel (hash routing, no framework,
 no build step; the HTML/JS/CSS is embedded in the binary). The original
-console is still available at `/console`. The v2 views:
+console is still available at `/console`. The sidebar has four tabs:
 
-- **Overview** — reactor health, peer and document counts, a live
-  **activity feed** of processor fires, and a one-click **reference
-  processor** (an `invoice` whose `status → accepted` runs a command).
-- **Documents** — browse every document (filter by model and
-  `field=value`), open one to read and edit its fields (a plain field `set`
-  or a model action), and create a new document under a model.
-- **Types** — the registered document models. **Draft a new one from a
-  text description via the LLM**, review the generated JSON definition,
-  register it as an interpreter, and create documents under it.
-- **Folders** — named membership containers over peers (create, add
-  members).
-- **Groups** — signed membership documents enforcing the **two-person
-  quorum** (a change needs two distinct members; one node cannot satisfy it
-  by itself). Create groups, manage members and managers, and read each
-  group's signed activity; quorum failures surface as friendly errors.
-- **Processors** — user-configurable **subscriptions on document changes**:
-  a `ProcessorSpec` picks the models and an optional `field=value`, and a
-  reaction (`run` / `log` / `emit` / `create-doc`). List, edit, remove, and
-  watch each processor's **fire history**.
-- **Settings** — the full config grouped by concern, including the LLM
-  (OpenAI-compatible) endpoint with a **Test connection** button, and a
+- **Home** — reactor health (peer and document counts, a live "live"
+  indicator), a **live activity feed** of processor fires, and
+  **subscriptions**: a `ProcessorSpec` picks the models and an optional
+  `field=value`, with a reaction (`run` / `log` / `emit` / `create-doc`).
+  New ones are drafted from a one-line description by the LLM (or written
+  by hand), then activated; each processor's **fire history** is
+  browsable. Home also reaches **Documents** (browse every document, filter
+  by model and `field=value`, edit a field or run a model action, create
+  new), **Types** (the registered document models, with each model's
+  `enums`), and **Folders** (named membership containers over peers).
+- **Groups** — the **group shared space**. A group is a signed membership
+  document (a two-person **quorum** for membership changes) that carries
+  public/private **channels** and a **folder drive**. Open a group for its
+  sub-tabs: **Overview** (invite string, members, managers), **Channels**
+  (create public/private channels, a composer, and per-channel message
+  history — a post to a private channel is auth-gated by the model's `auth`
+  block), and **Drive** (a folder tree with a breadcrumb; add folders or
+  typed documents). Edits use a per-field editor whose widgets are derived
+  from the model definition (text / number / checkbox / dropdown from
+  `enums` / add-remove list / JSON) and which dispatches the model's real
+  `set-*` reducers, so edits sync over the mesh.
+- **Settings** — the full config grouped by concern (instance, p2p, drives,
+  and the LLM endpoint with a **Test connection** button), plus a
   pause/resume toggle for the whole sync engine.
+- **Profile** — this node's identity: peer id, listen address, and
+  configuration.
 
 A theme switch (system / light / dark) persists to `localStorage`. The
-console talks to the JSON API on the same server. The routes:
+console talks to the JSON API on the same server:
 
 ```
+  GET     /                                the v2 console
+  GET     /console                         the original console
   GET     /api/status                      reactor, drives, settings snapshot
-  GET     /api/overview                    peer count, live document count
+  GET     /api/overview                    peer count (never zero), live doc count
   GET     /api/config                      the config document
   POST    /api/config                      set / replace / pause / resume
   GET     /api/docs[?model=&field=&value=] list documents
@@ -236,17 +270,25 @@ console talks to the JSON API on the same server. The routes:
   POST    /api/docs                        create a document
   POST    /api/docs/action                 a field set or a model action
   GET     /api/query[?model=&filter=]      the read-model query API
-  GET     /api/models                      registered document models
-  POST    /api/models|/api/models/register register a model definition
+  GET     /api/models                      registered models (fields, enums, reducers)
+  POST    /api/models | /api/models/register register a model definition
   POST    /api/llm/draft-type              LLM: text -> model definition
+  POST    /api/llm/draft-processor         LLM: text -> a processor (subscription) spec
   POST    /api/llm/test                    LLM: connectivity check
   GET     /api/folders                     list folders
   POST    /api/folders                     create a folder
   POST    /api/folders/<name>/action       add / remove a folder member
   GET     /api/groups                      list groups
   POST    /api/groups                      create a group
-  POST    /api/groups/<name>/action        a signed group action (quorum-checked)
+  GET     /api/groups/<name>               a group: channels, drive, members, managers
+  POST    /api/groups/<name>/action        a signed group action (post, member/manager change)
   GET     /api/groups/<name>/activity      a group's signed actions
+  POST    /api/groups/<name>/channels      add a channel (public or private, with members)
+  DELETE  /api/groups/<name>/channels/<chan> remove a channel
+  GET     /api/groups/<name>/drive         the drive tree (folders + docs)
+  POST    /api/groups/<name>/drive/folder  add a folder
+  POST    /api/groups/<name>/drive/doc     add a typed document
+  DELETE  /api/groups/<name>/drive/<doc>   remove a drive item
   GET     /api/processors                  list processors
   POST    /api/processors                  create a processor
   PUT     /api/processors/<name>           update a processor
@@ -271,33 +313,40 @@ console talks to the JSON API on the same server. The routes:
 {
   "schemaVersion": 2,
   "instance": { "name": "reactor", "listen": "/ip4/0.0.0.0/tcp/4201" },
-  "p2p": { "mdns": true, "tokenEnv": null },
+  "p2p": { "mdns": true, "tokenEnv": null, "dht": true, "relay": false, "bootstraps": [] },
   "drives": [
     {
       "name": "Vault",
       "addr": "/ip4/10.0.0.2/tcp/4201/p2p/12D3Koo…",
       "tokenEnv": "PH_REACTOR_DRIVE_TOKEN",
-      "availableOffline": true,
-      "paused": false
+      "paused": false,
+      "availableOffline": true
     }
   ],
   "settings": { "host": "127.0.0.1", "port": 4002 },
+  "llm": { "baseUrl": "https://api.openai.com/v1", "apiKeyEnv": "LLM_API_KEY", "model": "gpt-4o-mini" },
   "logLevel": "info"
 }
 ```
 
-- `instance.listen` — the p2p listen multiaddr (the remote side of a
-  `drive add` is the *peer's* listen address, optionally with its
-  `/p2p/<peer-id>`).
+- `instance.name` / `instance.listen` — the instance name (shown in
+  handshakes) and the p2p listen multiaddr (the remote side of a `drive add`
+  is the *peer's* listen address, optionally with its `/p2p/<peer-id>`).
 - `p2p.mdns` — advertise/discover peers on the local segment.
+- `p2p.dht` — the Kademlia DHT (peer routing, provider records, bootstrap
+  discovery); `p2p.relay` — the circuit relay for NAT traversal;
+  `p2p.bootstraps` — seed multiaddrs for a node that knows no one yet.
 - `p2p.tokenEnv` — env var name of a global token gate: inbound hellos
   from peers without a drive entry are rejected unless their token
   matches.
 - `drives[].tokenEnv` — per-drive shared token (env var *name* only; the
-  value is never stored in the file). A drive reported as
-  `requires-auth` starts syncing once the token matches on both sides.
-- `paused`: paused drives stop syncing but keep their local mirror;
-  resume re-dials and re-catches-up.
+  value is never stored in the file). A drive reported as `requires-auth`
+  starts syncing once the token matches on both sides.
+- `drives[].paused` — paused drives stop syncing but keep their local
+  mirror; resume re-dials and re-catches-up.
+- `llm.baseUrl` / `llm.apiKeyEnv` / `llm.model` — the OpenAI-compatible
+  endpoint behind **Draft a type** and **Generate a subscription**; the key
+  is read from the named env var at call time and never written to disk.
 - `settings.host` / `settings.port` — the console bind address and port
   (default `127.0.0.1:4002`). Set `host` to `0.0.0.0` or your Tailscale IP
   to open the console to the network — there is no auth, so treat the bind
@@ -362,8 +411,11 @@ autostart (the `.desktop` file carries `X-GNOME-Autostart-Enabled=true`).
   applies an op only after verifying the signature against a key
   registered through a completed hello on an authenticated channel.
   Unverified ops go to quarantine and are never applied.
-- Tokens (global gate and per-drive) live only in environment
-  variables; config stores names, never values.
+- The LLM endpoint is validated server-side: `/api/llm/test` refuses
+  link-local `169.254.0.0/16` (the cloud metadata range) before any
+  request, closing an SSRF / credential-exfiltration path.
+- Tokens (global gate and per-drive) and the LLM API key live only in
+  environment variables; config stores names, never values.
 - The settings server binds `127.0.0.1` only. The p2p listener binds
   the configured address (all interfaces by default) — that is what
   makes remote sync possible; use the token gates for private drives.
@@ -382,7 +434,7 @@ ph-reactor/
     store.rs         the event-sourced store (ops, vector clocks, WAL/snapshots)
     config.rs        config load / validate / hot-reload
     processor.rs     processors: user subscriptions on doc changes + fire feed
-    doc.rs           document model and op application
+    doc.rs           document model and op application (incl. the 50-peer convergence test)
     action.rs        actions (field sets, model actions)
     p2p/             the libp2p swarm (mod.rs: behaviours; codec.rs; invite.rs)
     settings/        the axum settings server + the embedded consoles
@@ -418,11 +470,13 @@ Run a throwaway instance against a scratch state dir (console on
 
 Decisions are recorded under `docs/superpowers/` as a **spec -> plan ->
 SDD (per-task brief/report) -> evidence** trail; new features follow the
-same shape. The daemon's design and plan:
+same shape. These are dated, point-in-time records of each workstream —
+this README is the current source of truth. The daemon's design and plan:
 
 - Design: `docs/superpowers/specs/2026-09-12-native-reactor-design.md`
 - Plan:   `docs/superpowers/plans/2026-09-12-native-reactor.md`
 - The console redesign: `docs/superpowers/specs/2026-09-13-console-v2-design.md`
+- The group shared space: `docs/superpowers/specs/2026-09-14-group-shared-space-design.md`
 
 ### Contributing
 

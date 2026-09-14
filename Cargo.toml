@@ -3,7 +3,7 @@ name = "ph-reactor"
 version = "1.0.0"
 edition = "2021"
 rust-version = "1.83"
-description = "Native event-sourced document store and libp2p drive sync, running as a status-bar background daemon"
+description = "Native Rust event-sourced document store and libp2p drive sync, with a status-bar tray, a web console, and a synced group shared space"
 license = "SEE LICENSE IN LICENSE"
 
 [workspace]

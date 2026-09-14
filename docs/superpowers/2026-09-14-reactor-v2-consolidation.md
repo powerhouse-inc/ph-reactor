@@ -93,8 +93,8 @@ improvements:
 ## Result
 
 All seven requested improvements are implemented, merged, and verified
-end-to-end on `feat/reactor-v2`. The daemon's core (status-bar tray,
-remote-drive sync, auto-installed document-model packages, switchboard
-hosting) is unchanged and intact; the new group shared space, the
-multi-process convergence speedup, and the closed LLM-SSRF path are live.
+end-to-end on `feat/reactor-v2`. The daemon's core (the event-sourced
+store, libp2p drive sync, status-bar tray, and loopback console) is
+unchanged and intact; the new group shared space, the multi-process
+convergence speedup, and the closed LLM-SSRF path are live.
 Ready to merge to `main`.
