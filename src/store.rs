@@ -218,6 +218,10 @@ struct Inner {
     ts_hint: u64,
     /// Local actions awaiting delivery to the sync layer.
     outbound: Vec<Action>,
+    /// The sync layer's outbound feed (set by [`Store::connect_outbound`]):
+    /// each applied local action is sent here immediately, so the sync
+    /// layer publishes without waiting for a poll interval.
+    outbound_feed: Option<mpsc::UnboundedSender<Action>>,
     /// Actions quarantined for failing verification.
     quarantined: u64,
     /// The models this peer knows how to reduce (open@1 by default).
@@ -240,6 +244,7 @@ impl Store {
             names: BTreeMap::new(),
             ts_hint: 0,
             outbound: Vec::new(),
+            outbound_feed: None,
             quarantined: 0,
             models: ModelRegistry::seeded_with_builtins(),
             subscribers: Vec::new(),
@@ -517,6 +522,18 @@ impl Store {
     pub fn drain_outbound(&self) -> Vec<Action> {
         let mut inner = self.inner.lock();
         std::mem::take(&mut inner.outbound)
+    }
+
+    /// Connect the sync layer's outbound feed: every applied local action
+    /// is sent to the returned receiver as soon as it is applied (the
+    /// store's lock is held when it is sent, so ordering matches the log).
+    /// The sync layer publishes from this feed immediately and keeps
+    /// [`drain_outbound`] as a backstop for actions applied before the
+    /// feed was connected.
+    pub fn connect_outbound(&self) -> mpsc::UnboundedReceiver<Action> {
+        let (tx, rx) = mpsc::unbounded_channel();
+        self.inner.lock().outbound_feed = Some(tx);
+        rx
     }
 
     /// Catch-up reply: the current state plus the actions the requester's
@@ -981,7 +998,19 @@ impl Inner {
             warn!("WAL write failed for {}: {e}", action.doc_id);
         }
         if applied_any {
-            self.outbound.push(action.clone());
+            // Only local actions are re-published: the origin gossips its
+            // own actions, and the mesh's dedupe + catch-up carry remote
+            // ones. Re-gossipping remote actions would amplify traffic
+            // (every peer re-sending what it received).
+            if action.origin == self.origin {
+                self.outbound.push(action.clone());
+                if let Some(tx) = &self.outbound_feed {
+                    // Immediate delivery to the sync layer: publishing
+                    // does not wait for its poll interval. The queue above
+                    // stays the backstop (drained on the sync layer's tick).
+                    let _ = tx.send(action.clone());
+                }
+            }
             self.ts_hint = self.ts_hint.max(action.ts);
         }
         // 6. Snapshot when the live log grows past the threshold.
@@ -1554,6 +1583,40 @@ mod tests {
         assert!(!actions.is_empty());
         assert!(actions.iter().all(|a| a.origin == s.origin()));
         assert!(s.drain_outbound().is_empty());
+    }
+
+    #[test]
+    fn outbound_feed_delivers_local_actions_immediately_not_remote() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_store(dir.path());
+        let mut rx = s.connect_outbound();
+
+        // A local action arrives on the feed as soon as it is applied.
+        s.create_doc("fed", BM::new()).unwrap();
+        let a1 = rx.try_recv().expect("create action on feed");
+        assert_eq!(a1.origin, s.origin());
+        s.update_field("fed", "x", 1i64.into()).unwrap();
+        let a2 = rx.try_recv().expect("update action on feed");
+        assert_eq!(a2.origin, s.origin());
+        assert_ne!(a1.hash(), a2.hash());
+
+        // A remote action does not enter the feed (not re-gossiped).
+        let remote_key = identity(7);
+        let remote_origin = "remote-peer";
+        s.register_peer_key(remote_origin, remote_key.verifying_key().to_bytes())
+            .unwrap();
+        let id = s.doc_ids().into_iter().find(|id| s.doc_name(*id) == "fed").unwrap();
+        let mut clock = s.summary()[&id].clone();
+        clock.tick(remote_origin);
+        let action = make_set_action(id, remote_origin, &remote_key, clock, "rf", &"rv".into(), 2_000_000);
+        s.apply_remote_action(&action).unwrap();
+        assert!(
+            rx.try_recv().is_err(),
+            "remote actions must not enter the outbound feed"
+        );
+        // ...but the periodic drain still carries exactly the local set.
+        let drained = s.drain_outbound();
+        assert_eq!(drained.len(), 2);
     }
 
     #[test]
