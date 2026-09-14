@@ -18,7 +18,7 @@
 - **Console port: `4002`**, bound `0.0.0.0` *inside the pod only*. Never an Ingress, never a LoadBalancer.
 - **PROXY protocol must be OFF** on the p2p Service. Do not copy `load-balancer.hetzner.cloud/uses-proxyprotocol` from the Traefik LB — a PROXY header corrupts the libp2p Noise handshake.
 - **Namespace:** `ph-reactor`.
-- **Image:** `cr.vetra.io/powerhouse-inc/ph-reactor`.
+- **Image:** `cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor`.
 - **OpenBao path:** `powerhouse/shared/ph-reactor-bootstrap`, property `key` = base64 of the 32 raw identity bytes.
 - **StorageClass:** `hcloud-volumes`, 10Gi, ReadWriteOnce.
 - **DNS name:** `reactor.vetra.io`.
@@ -40,7 +40,7 @@
 
 **Interfaces:**
 - Consumes: nothing.
-- Produces: a local image tagged `ph-reactor:dev` whose entrypoint is `/usr/local/bin/ph-reactor` running in the foreground, state dir `/var/lib/ph-reactor`, serving `GET /api/status` on port 4002 and listening for libp2p on 25422. Later tasks reference the image path `cr.vetra.io/powerhouse-inc/ph-reactor`.
+- Produces: a local image tagged `ph-reactor:dev` whose entrypoint is `/usr/local/bin/ph-reactor` running in the foreground, state dir `/var/lib/ph-reactor`, serving `GET /api/status` on port 4002 and listening for libp2p on 25422. Later tasks reference the image path `cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor`.
 
 - [ ] **Step 1: Write the failing smoke test**
 
@@ -274,7 +274,7 @@ Co-Authored-By: Claude Opus 5 (1M context) <noreply@anthropic.com>"
 
 **Interfaces:**
 - Consumes: the `Dockerfile` and `scripts/build-image.sh` from Task 1.
-- Produces: images at `cr.vetra.io/powerhouse-inc/ph-reactor:<version>` and `:sha-<short>` on every `ph-reactor-v*` tag. Task 5's StatefulSet pins one of these tags.
+- Produces: images at `cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:<version>` and `:sha-<short>` on every `ph-reactor-v*` tag. Task 5's StatefulSet pins one of these tags.
 
 **Prerequisite (human action, cannot be automated from here):** add repository secrets `HARBOR_USERNAME` and `HARBOR_PASSWORD` in GitHub. The values are the same robot account already in OpenBao — read them with:
 
@@ -354,8 +354,8 @@ jobs:
           context: .
           push: true
           tags: |
-            cr.vetra.io/powerhouse-inc/ph-reactor:${{ steps.tags.outputs.version }}
-            cr.vetra.io/powerhouse-inc/ph-reactor:${{ steps.tags.outputs.sha }}
+            cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:${{ steps.tags.outputs.version }}
+            cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:${{ steps.tags.outputs.sha }}
           cache-from: type=gha
           cache-to: type=gha,mode=max
 ```
@@ -813,7 +813,7 @@ spec:
               readOnly: true
       containers:
         - name: ph-reactor
-          image: cr.vetra.io/powerhouse-inc/ph-reactor:0.0.0-dev
+          image: cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:0.0.0-dev
           imagePullPolicy: IfNotPresent
           args: ["run"]
           ports:
@@ -1291,7 +1291,7 @@ export BAO_ADDR=https://openbao.vetra.io
 HUSER="$(bao kv get -mount=kv -format=json powerhouse/shared/harbor-credentials | jq -r '.data.data.username')"
 HPASS="$(bao kv get -mount=kv -format=json powerhouse/shared/harbor-credentials | jq -r '.data.data.password')"
 echo "$HPASS" | docker login cr.vetra.io -u "$HUSER" --password-stdin
-docker manifest inspect cr.vetra.io/powerhouse-inc/ph-reactor:<version> >/dev/null && echo "PASS image present"
+docker manifest inspect cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:<version> >/dev/null && echo "PASS image present"
 ```
 Expected: `PASS image present`
 
@@ -1300,7 +1300,7 @@ If the image is absent, push the `ph-reactor-v<semver>` tag in the `ph-reactor` 
 - [ ] **Step 2: Pin the real image tag**
 
 Modify `infrastructure/ph-reactor/03-statefulset.yaml`: replace
-`image: cr.vetra.io/powerhouse-inc/ph-reactor:0.0.0-dev`
+`image: cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:0.0.0-dev`
 with the version tag confirmed in Step 1. Do not use `latest`.
 
 - [ ] **Step 3: Commit and push both repos**

@@ -227,7 +227,7 @@ after the signature check.
   the headless path the README already documents.
 - `.github/workflows/image.yml` — on the existing `ph-reactor-v*` tag
   trigger, build and push
-  `cr.vetra.io/powerhouse-inc/ph-reactor:{<version>,sha-<short>}`.
+  `cr.vetra.io/powerhouse-inc-powerhouse/ph-reactor:{<version>,sha-<short>}`.
 
 **`powerhouse-k8s-hosting` repo**
 
