@@ -18,13 +18,40 @@ use crate::store::DocState;
 
 use serde_json::Value;
 
-/// Protocol version. Bumped for incompatible changes; mismatched majors
+/// Protocol version. Bumped for incompatible changes; mismatched versions
 /// are rejected in the hello handshake.
-pub const PROTOCOL_VERSION: u32 = 2;
+///
+/// **3: documents carry a space.** A pre-spaces node drops the unknown
+/// `space` field when it deserializes an action, recomputes `message_bytes`
+/// without it, and the signature no longer matches -- so it quarantines a
+/// perfectly good action as **"bad signature"**, which reads as forgery, and
+/// retries forever. Measured against a real 1.9.0 binary: 112 quarantines in
+/// a few seconds, with no indication anywhere that the cause was a version
+/// difference.
+///
+/// Two nodes that cannot agree on what the signed bytes are do not have a
+/// slightly degraded connection, they have no connection -- and saying so in
+/// the handshake turns an alarming, unbounded signature-failure storm into
+/// one clear refusal naming both versions. Spaceless actions still verify
+/// identically across the change (see `Action::message_bytes` and the golden
+/// vector); this bump is about the pairs that cannot work, not the bytes that
+/// can.
+pub const PROTOCOL_VERSION: u32 = 3;
 /// Stream protocol id.
-pub const SYNC_PROTOCOL: &str = "/ph-reactor/sync/2.0.0";
+/// Stream protocol id. Moves with [`PROTOCOL_VERSION`]: libp2p will not open
+/// a stream a peer does not advertise, so an old and a new node simply do not
+/// negotiate this protocol rather than negotiating it and then disagreeing.
+pub const SYNC_PROTOCOL: &str = "/ph-reactor/sync/3.0.0";
 /// Gossipsub topic for op fan-out.
-pub const GOSSIPSUB_TOPIC: &str = "ph-reactor/docs/2.0.0";
+///
+/// This has to move with the protocol version too, and for a reason the hello
+/// handshake does not cover: **gossip never passes through the handshake.**
+/// Bumping only `PROTOCOL_VERSION` left old and new nodes refusing to sync
+/// while still sharing a gossip mesh, so actions carrying a space kept
+/// arriving at pre-spaces nodes and kept being quarantined as "bad signature"
+/// -- measured, after the version gate was already in place. A version gate
+/// on one of two transports is not a version gate.
+pub const GOSSIPSUB_TOPIC: &str = "ph-reactor/docs/3.0.0";
 /// Maximum framed message size.
 pub const MAX_MSG_BYTES: u32 = 1 << 20;
 /// Max actions per catch-up response (keeps frames bounded; `more` signals
