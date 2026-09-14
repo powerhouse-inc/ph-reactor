@@ -656,7 +656,18 @@ impl Store {
             None => Entry::new(id),
         };
         lift_name(&mut scratch.doc);
-        let mut expected_prev = base.as_ref().and_then(|b| b.log_hash);
+        // Every action hash seen so far, seeded with the snapshot's log hash
+        // when the log was truncated. Concurrent writers make the log a DAG
+        // rather than a line — two actions may legitimately chain to the same
+        // parent — so what must hold is not "this action follows the previous
+        // one" but "this action's prev_hash names an action that really
+        // precedes it". Dropping an action from the log still orphans
+        // everything that pointed at it, which is what the chain is for.
+        let mut seen: Vec<Hash32> = base
+            .as_ref()
+            .and_then(|b| b.log_hash)
+            .into_iter()
+            .collect();
 
         let mut report = VerifyReport {
             name: name.to_string(),
@@ -680,17 +691,16 @@ impl Store {
                 report.model = Some(action.model.clone());
             }
 
-            // Hash chain.
-            match (action.prev_hash, expected_prev) {
-                (Some(got), Some(want)) if got != want => {
+            // Hash chain (see `seen` above).
+            match action.prev_hash {
+                Some(got) if !seen.contains(&got) => {
                     problems.push(format!(
-                        "hash chain broken: prev_hash {got} != expected {want}"
+                        "hash chain broken: prev_hash {got} names no earlier action"
                     ));
                 }
-                (Some(_), None) => {
-                    problems.push("action carries a prev_hash but the chain starts here".into());
+                None if !seen.is_empty() => {
+                    problems.push("chain gap: missing prev_hash".into());
                 }
-                (None, Some(_)) => problems.push("chain gap: missing prev_hash".into()),
                 _ => {}
             }
 
@@ -740,7 +750,7 @@ impl Store {
                 apply_ops_to_entry(&mut scratch, m.as_ref(), action);
             }
 
-            expected_prev = Some(action.hash());
+            seen.push(action.hash());
             let ok = problems.is_empty();
             if !ok {
                 report.ok = false;
@@ -1077,6 +1087,21 @@ impl Inner {
             }
         }
         // 4. Precondition + reduce + per-field merge (one entries borrow).
+        //
+        // `append`/`remove` reduce to a *whole-array* write, and a field
+        // merges last-writer-wins, so the fold depends on the order actions
+        // are applied in. Two nodes that received the same two concurrent
+        // actions in opposite orders ended up with different arrays — and
+        // stayed that way: a member removed on one node was still a member on
+        // the other, permanently. An action that arrives out of canonical
+        // order therefore triggers a re-fold of the whole live log. In the
+        // common case — actions arriving in order — this costs one compare.
+        let out_of_order = self
+            .entries
+            .get(&action.doc_id)
+            .and_then(|e| e.log.last())
+            .map(|last| canon_key(action) < canon_key(last))
+            .unwrap_or(false);
         let (applied_any, deleted) = {
             let entry = self
                 .entries
@@ -1092,6 +1117,9 @@ impl Inner {
             entry.log.push(action.clone());
             (a, d)
         };
+        if out_of_order {
+            self.refold(action.doc_id)?;
+        }
         // 5. Durability: append the action to the WAL (the field map is
         //    derived from the log on replay).
         if let Err(e) = persist_action(&self.docs_dir, action) {
@@ -1221,6 +1249,70 @@ impl Inner {
     }
 
     /// Snapshot the doc (full state + log hash) and truncate the log.
+    /// Rebuild a document from its snapshot base by folding every action in
+    /// the live log in canonical order.
+    ///
+    /// Called when an action arrives out of order. Preconditions and the
+    /// model's `auth` rule are re-checked at each action's *canonical*
+    /// position, not at the position it happened to arrive in, so whether an
+    /// action counts is also a function of the action set: an action that
+    /// canonically precedes the one that authorized it does not apply. The
+    /// log keeps every accepted action either way — a later arrival can move
+    /// the canonical order and make it count on the next fold.
+    fn refold(&mut self, doc_id: DocId) -> Result<(), String> {
+        let snap_path = self.docs_dir.join(format!("{doc_id}.snap"));
+        let base: Option<DocState> = std::fs::read_to_string(&snap_path)
+            .ok()
+            .and_then(|raw| serde_json::from_str(&raw).ok());
+
+        let Some(entry) = self.entries.get(&doc_id) else {
+            return Ok(());
+        };
+        let clock = entry.clock.clone();
+        let mut log = entry.log.clone();
+        log.sort_by_key(canon_key);
+
+        // Resolve every model up front: the fold below borrows the entry
+        // mutably and cannot also borrow the registry.
+        let mut models = Vec::with_capacity(log.len());
+        for a in &log {
+            models.push(
+                self.models
+                    .find(&a.model)
+                    .ok_or_else(|| format!("model {} unavailable for re-fold", a.model.name))?,
+            );
+        }
+
+        let mut fresh = match &base {
+            Some(b) => Entry {
+                doc: b.doc.clone(),
+                clock: b.clock.clone(),
+                deleted: b.deleted,
+                log: Vec::new(),
+                model: b.model.clone(),
+            },
+            None => Entry::new(doc_id),
+        };
+        lift_name(&mut fresh.doc);
+        for (a, model) in log.iter().zip(models.iter()) {
+            if model.check_precondition(&fresh.doc, a).is_err()
+                || model.authorize(&fresh.doc, a).is_err()
+            {
+                continue;
+            }
+            apply_ops_to_entry(&mut fresh, model.as_ref(), a);
+            fresh.model = a.model.clone();
+        }
+        // A vector clock is a per-origin maximum — order-independent — so the
+        // clock the entry already carries is correct as it stands.
+        fresh.clock = clock;
+        fresh.log = log;
+        if let Some(slot) = self.entries.get_mut(&doc_id) {
+            *slot = fresh;
+        }
+        Ok(())
+    }
+
     fn snapshot(&mut self, id: &DocId) -> Result<(), String> {
         let Some(entry) = self.entries.get_mut(id) else {
             return Ok(());
@@ -1325,6 +1417,17 @@ impl Inner {
 /// the entry (the per-field LWW merge in [`apply_op`]). Stamps the reduced
 /// ops with the action's identity so the field map carries correct
 /// provenance. Returns `(any_applied, deleted)`.
+/// The canonical position of an action in its document's log.
+///
+/// Folded state must be a function of the *set* of actions a node holds, not
+/// of the order they arrived in. `(ts, origin, hash)` is a total order every
+/// node computes identically from the action itself, so every node folds the
+/// same log the same way. The hash breaks ties between two origins that used
+/// the same timestamp.
+fn canon_key(a: &Action) -> (u64, String, Hash32) {
+    (a.ts, a.origin.clone(), a.hash())
+}
+
 fn apply_ops_to_entry(entry: &mut Entry, model: &dyn Model, action: &Action) -> (bool, bool) {
     let mut ops = match model.reduce(&entry.doc, action) {
         Ok(o) => o,
@@ -2116,6 +2219,255 @@ mod tests {
                 .any(|a| a.problems.iter().any(|p| p.contains("chain"))),
             "the chain break is named: {:?}",
             report.actions
+        );
+    }
+
+    /// Two members post at the same time, each on their own node, then the
+    /// nodes exchange the actions. Both messages must survive and both nodes
+    /// must agree.
+    ///
+    /// They do not today: `append` reduces to a *whole-array* write, and the
+    /// field merges last-writer-wins, so the node that applies the later-`ts`
+    /// action last keeps only its own array. The nodes diverge permanently.
+    #[test]
+    fn concurrent_posts_converge_and_keep_both_messages() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = open_store(dir_a.path());
+        let b = open_store(dir_b.path());
+
+        let k_alice = identity(1);
+        let k_bob = identity(2);
+        for s in [&a, &b] {
+            s.register_peer_key("alice", k_alice.verifying_key().to_bytes())
+                .unwrap();
+            s.register_peer_key("bob", k_bob.verifying_key().to_bytes())
+                .unwrap();
+        }
+
+        let id = DocId::new();
+        let init = make_group_action(
+            id,
+            "init",
+            serde_json::json!({
+                "name": "core",
+                "members": ["alice", "bob"],
+                "managers": ["alice"],
+            }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 1),
+            1000,
+        );
+        a.apply_remote_action(&init).unwrap();
+        b.apply_remote_action(&init).unwrap();
+
+        // Alice's clock knows only her own work; Bob's knows the init plus
+        // his own. Neither dominates the other: these are concurrent.
+        let from_alice = make_group_action(
+            id,
+            "post",
+            serde_json::json!({ "text": "from alice", "channel": "general" }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 2),
+            2000,
+        );
+        let mut bob_clock = clock1("alice", 1);
+        bob_clock.tick("bob");
+        let from_bob = make_group_action(
+            id,
+            "post",
+            serde_json::json!({ "text": "from bob", "channel": "general" }),
+            "bob",
+            &k_bob,
+            &[],
+            bob_clock,
+            2001,
+        );
+
+        // Each node sees its own author first, then the other's.
+        a.apply_remote_action(&from_alice).unwrap();
+        b.apply_remote_action(&from_bob).unwrap();
+        a.apply_remote_action(&from_bob).unwrap();
+        b.apply_remote_action(&from_alice).unwrap();
+
+        let texts = |s: &Arc<Store>| -> Vec<String> {
+            s.get("core")
+                .unwrap()
+                .fields
+                .get("msg_text")
+                .and_then(|f| f.value.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        let (ta, tb) = (texts(&a), texts(&b));
+        assert_eq!(ta, tb, "the two nodes must converge: {ta:?} vs {tb:?}");
+        assert_eq!(ta.len(), 2, "neither message may be lost: {ta:?}");
+    }
+
+    /// A manager removes Bob while another manager concurrently adds Dave.
+    /// Both intents must survive. Today one whole-array write wins outright,
+    /// so Bob is silently restored to `members`.
+    #[test]
+    fn a_concurrent_add_must_not_resurrect_a_removed_member() {
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let a = open_store(dir_a.path());
+        let b = open_store(dir_b.path());
+
+        let k_alice = identity(1);
+        let k_carol = identity(3);
+        for s in [&a, &b] {
+            s.register_peer_key("alice", k_alice.verifying_key().to_bytes())
+                .unwrap();
+            s.register_peer_key("carol", k_carol.verifying_key().to_bytes())
+                .unwrap();
+        }
+
+        let id = DocId::new();
+        let init = make_group_action(
+            id,
+            "init",
+            serde_json::json!({
+                "name": "core",
+                "members": ["alice", "bob", "carol"],
+                "managers": ["alice", "carol"],
+            }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 1),
+            1000,
+        );
+        a.apply_remote_action(&init).unwrap();
+        b.apply_remote_action(&init).unwrap();
+
+        let remove_bob = make_group_action(
+            id,
+            "remove-member",
+            serde_json::json!({ "member": "bob" }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 2),
+            2000,
+        );
+        let mut carol_clock = clock1("alice", 1);
+        carol_clock.tick("carol");
+        let add_dave = make_group_action(
+            id,
+            "add-member",
+            serde_json::json!({ "member": "dave" }),
+            "carol",
+            &k_carol,
+            &[],
+            carol_clock,
+            2001,
+        );
+
+        a.apply_remote_action(&remove_bob).unwrap();
+        b.apply_remote_action(&add_dave).unwrap();
+        a.apply_remote_action(&add_dave).unwrap();
+        b.apply_remote_action(&remove_bob).unwrap();
+
+        let members = |s: &Arc<Store>| -> Vec<String> {
+            s.get("core")
+                .unwrap()
+                .fields
+                .get("members")
+                .and_then(|f| f.value.as_array().cloned())
+                .unwrap_or_default()
+                .iter()
+                .filter_map(|v| v.as_str().map(str::to_string))
+                .collect()
+        };
+        let (ma, mb) = (members(&a), members(&b));
+        assert_eq!(ma, mb, "the two nodes must converge: {ma:?} vs {mb:?}");
+        assert!(!ma.contains(&"bob".to_string()), "bob was removed: {ma:?}");
+        assert!(ma.contains(&"dave".to_string()), "dave was added: {ma:?}");
+    }
+
+    /// Concurrent writers make the action log a DAG: two actions legitimately
+    /// carry the same `prev_hash`. `doc verify` walked the log as a straight
+    /// line, so any document that ever took a concurrent write reported
+    /// "hash chain broken" — the store's own audit calling honest data
+    /// tampered.
+    #[test]
+    fn a_document_with_concurrent_actions_still_verifies() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = open_store(dir.path());
+        let k_alice = identity(1);
+        let k_bob = identity(2);
+        s.register_peer_key("alice", k_alice.verifying_key().to_bytes())
+            .unwrap();
+        s.register_peer_key("bob", k_bob.verifying_key().to_bytes())
+            .unwrap();
+
+        let id = DocId::new();
+        let init = make_group_action(
+            id,
+            "init",
+            serde_json::json!({
+                "name": "core",
+                "members": ["alice", "bob"],
+                "managers": ["alice"],
+            }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 1),
+            1000,
+        );
+        s.apply_remote_action(&init).unwrap();
+
+        // Both posts chain to the init action: neither saw the other.
+        let mut from_alice = make_group_action(
+            id,
+            "post",
+            serde_json::json!({ "text": "a", "channel": "general" }),
+            "alice",
+            &k_alice,
+            &[],
+            clock1("alice", 2),
+            2000,
+        );
+        from_alice.prev_hash = Some(init.hash());
+        let mb = from_alice.message_bytes();
+        from_alice.sig = k_alice.sign(&mb).to_bytes();
+
+        let mut bob_clock = clock1("alice", 1);
+        bob_clock.tick("bob");
+        let mut from_bob = make_group_action(
+            id,
+            "post",
+            serde_json::json!({ "text": "b", "channel": "general" }),
+            "bob",
+            &k_bob,
+            &[],
+            bob_clock,
+            2001,
+        );
+        from_bob.prev_hash = Some(init.hash());
+        let mb = from_bob.message_bytes();
+        from_bob.sig = k_bob.sign(&mb).to_bytes();
+
+        s.apply_remote_action(&from_alice).unwrap();
+        s.apply_remote_action(&from_bob).unwrap();
+
+        let report = s.verify("core").unwrap();
+        assert!(
+            report.ok,
+            "two actions sharing a parent is a DAG, not a broken chain: {:?}",
+            report
+                .actions
+                .iter()
+                .map(|a| a.problems.clone())
+                .collect::<Vec<_>>()
         );
     }
 }
