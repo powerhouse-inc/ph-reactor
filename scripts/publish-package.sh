@@ -66,6 +66,10 @@ print(json.dumps({
     "processors": man.get("processors", []),
     "capabilities": man.get("capabilities", {"read": [], "write": []}),
     "ui": man.get("ui", {"nav": []}),
+    # Declared, signed, and shown at install: what this app publishes into
+    # another space, and what it may put in your inbox.
+    "projections": man.get("projections", []),
+    "attention": man.get("attention", []),
     "group": group or None,
     "editor": editor,
 }))

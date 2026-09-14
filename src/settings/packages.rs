@@ -402,6 +402,12 @@ pub struct PublishBody {
     /// Sidebar entries the plugin asks the console to show.
     #[serde(default)]
     pub ui: crate::package::PluginUi,
+    /// Records this app publishes from one space into another.
+    #[serde(default)]
+    pub projections: Vec<crate::package::Projection>,
+    /// What this app may put in your inbox.
+    #[serde(default)]
+    pub attention: Vec<crate::package::Attention>,
     /// Publish into a group's drive, so the package is organizationally that
     /// group's rather than a loose document.
     ///
@@ -450,6 +456,17 @@ pub async fn publish(state: State<Arc<Settings>>, body: axum::Json<PublishBody>)
         None => None,
     };
 
+    for p in &b.projections {
+        if let Err(e) = p.validate() {
+            return (StatusCode::BAD_REQUEST, format!("projection: {e}")).into_response();
+        }
+    }
+    for a in &b.attention {
+        if let Err(e) = a.validate() {
+            return (StatusCode::BAD_REQUEST, format!("attention rule: {e}")).into_response();
+        }
+    }
+
     let key = state.store.key();
     let mut manifest = Manifest {
         name: b.name.clone(),
@@ -467,8 +484,8 @@ pub async fn publish(state: State<Arc<Settings>>, body: axum::Json<PublishBody>)
         capabilities: b.capabilities,
         ui: b.ui,
         sig: String::new(),
-        projections: Vec::new(),
-        attention: Vec::new(),
+        projections: b.projections,
+        attention: b.attention,
     };
     manifest.sign(&key);
 

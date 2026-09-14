@@ -26,6 +26,10 @@
     --sans: -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
   }
   * { box-sizing: border-box; }
+  /* A component that sets `display` outranks the `hidden` attribute, so an
+     element told to hide keeps rendering as an empty box. Say it once, here,
+     rather than remembering it at every call site. */
+  [hidden] { display: none !important; }
   html, body { height: 100%; }
   body {
     margin: 0;
@@ -44,7 +48,7 @@
   ::-webkit-scrollbar-track { background: transparent; }
   button { font-family: inherit; }
 
-  .shell { display: grid; grid-template-columns: 232px 1fr; height: 100vh; }
+  .shell { display: grid; grid-template-columns: 248px 1fr; height: 100vh; }
 
   /* ---- sidebar ---- */
   .sidebar {
@@ -67,14 +71,150 @@
   }
   .brand .name { font-weight: 700; letter-spacing: 0.04em; font-size: 15px; }
   .brand .name small { display: block; font-weight: 500; color: var(--dim); font-size: 10px; letter-spacing: 0.14em; text-transform: uppercase; }
-  .space-switch { padding: 10px 14px 12px; border-bottom: 1px solid rgba(120,140,200,0.12); margin-bottom: 8px; }
-  .space-switch label { display: block; font-size: 10px; letter-spacing: 0.08em; text-transform: uppercase; opacity: 0.55; margin-bottom: 4px; }
-  .space-switch select { width: 100%; background: rgba(120,140,200,0.08); color: var(--text); border: 1px solid rgba(120,140,200,0.18); border-radius: 6px; padding: 5px 7px; font: inherit; font-size: 12px; }
-  .space-meaning { font-size: 10.5px; line-height: 1.45; opacity: 0.6; margin-top: 6px; }
+  /* ---- sidebar regions -------------------------------------------------
+     Three regions, separated by space rather than by rules: a hairline
+     between every group turns a sidebar into a form. */
+  .region { display: flex; flex-direction: column; gap: 2px; }
+  .region + .region { margin-top: 18px; }
+  .region-label {
+    font-size: 9.5px; letter-spacing: 0.14em; text-transform: uppercase;
+    color: var(--dim); padding: 0 10px 6px; font-weight: 600;
+  }
+  .region-quiet { margin-top: auto; padding-top: 18px; }
+  .region-quiet .nav-item { color: var(--dim); }
+  .region-quiet .nav-item:hover, .region-quiet .nav-item.active { color: var(--text); }
+
+  /* The lens. A native <select> in a dark custom UI is the single loudest
+     "nobody designed this" signal, and it cannot show a tier chip. */
+  .lens {
+    display: flex; align-items: center; gap: 9px; width: 100%;
+    background: rgba(120,140,200,0.06);
+    border: 1px solid var(--line); border-radius: 9px;
+    padding: 8px 10px; color: var(--text); font: inherit; font-size: 13px;
+    cursor: pointer; text-align: left; transition: background 120ms, border-color 120ms;
+  }
+  .lens:hover { background: rgba(120,140,200,0.11); border-color: var(--line-2); }
+  .lens .ico { color: var(--cyan); font-size: 13px; }
+  /* The name gets the room; the tier shrinks instead. A lens that truncates
+     the space name has failed its one job. */
+  .lens-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .lens .tier { flex: 0 0 auto; font-size: 8.5px; padding: 2px 5px; letter-spacing: 0.04em; }
+  .lens-caret { color: var(--dim); font-size: 10px; }
+
+  /* Apps sit under the lens with a hairline showing containment -- the point
+     the old sidebar lost by putting them at the bottom. */
+  .subnav { margin: 4px 0 0 18px; padding-left: 10px; border-left: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; }
+  .subnav:empty { display: none; }
+
+  .badge {
+    margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px;
+    border-radius: 999px; background: var(--cyan); color: #04121a;
+    font-size: 10.5px; font-weight: 800; display: grid; place-items: center;
+  }
+  .node-dot { margin-left: auto; width: 6px; height: 6px; border-radius: 50%; background: var(--green); box-shadow: 0 0 8px rgba(67,224,160,0.7); }
+  .node-dot.warn { background: var(--amber); box-shadow: 0 0 8px rgba(255,196,107,0.7); }
+
+  .foot .hint {
+    display: flex; align-items: center; gap: 5px; width: 100%;
+    background: none; border: 0; color: var(--dim); cursor: pointer;
+    font: inherit; font-size: 11px; padding: 6px 4px 10px;
+  }
+  .foot .hint:hover { color: var(--muted); }
+  kbd {
+    font-family: var(--mono); font-size: 10px; line-height: 1;
+    padding: 3px 5px; border-radius: 4px;
+    background: rgba(120,140,200,0.12); border: 1px solid var(--line);
+    color: var(--muted);
+  }
+
+  .tier {
+    display: inline-block; font-size: 9.5px; letter-spacing: 0.07em;
+    text-transform: uppercase; padding: 2px 6px; border-radius: 999px;
+    border: 1px solid currentColor; opacity: 0.9; font-weight: 600;
+  }
+
+  /* ---- command palette -------------------------------------------------
+     One shortcut that reaches every destination. A tool people open daily
+     earns a keyboard path; hunting a sidebar is not one. */
+  .palette-wrap {
+    position: fixed; inset: 0; z-index: 90;
+    background: rgba(4, 7, 14, 0.62); backdrop-filter: blur(3px);
+    display: grid; place-items: start center; padding-top: 14vh;
+  }
+  .palette-wrap[hidden] { display: none; }
+  .palette {
+    width: min(560px, 92vw);
+    background: linear-gradient(180deg, rgba(28,36,60,0.98), rgba(18,24,42,0.98));
+    border: 1px solid var(--line-2); border-radius: 14px;
+    box-shadow: 0 30px 80px rgba(0,0,0,0.55);
+    overflow: hidden;
+  }
+  .palette input {
+    width: 100%; background: none; border: 0; border-bottom: 1px solid var(--line);
+    color: var(--text); font: inherit; font-size: 15px; padding: 16px 18px; outline: none;
+  }
+  .palette input::placeholder { color: var(--dim); }
+  .palette-list { max-height: 46vh; overflow-y: auto; padding: 6px; }
+  .palette-group { font-size: 9.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--dim); padding: 10px 12px 4px; font-weight: 600; }
+  .palette-item {
+    display: flex; align-items: center; gap: 10px;
+    padding: 9px 12px; border-radius: 8px; cursor: pointer; font-size: 13px;
+  }
+  .palette-item .ico { color: var(--muted); width: 16px; text-align: center; }
+  .palette-item .meta { margin-left: auto; color: var(--dim); font-size: 11px; }
+  .palette-item .meta.space-chip { border-color: currentColor; padding: 2px 8px; }
+  .palette-item[aria-selected="true"] { background: rgba(56,225,255,0.13); }
+  .palette-item[aria-selected="true"] .ico { color: var(--cyan); }
+  .palette-foot { display: flex; gap: 6px; align-items: center; padding: 10px 14px; border-top: 1px solid var(--line); color: var(--dim); font-size: 11px; }
+
+  /* ---- inbox -----------------------------------------------------------
+     Every row names its space. A cross-space list without that is ambiguous,
+     and ambiguity about scope is the failure this whole design removes. */
+  #inbox-body { max-width: 860px; }
+  .inbox-row {
+    display: grid; grid-template-columns: 1fr auto; gap: 4px 14px;
+    align-items: center; padding: 13px 16px;
+    border: 1px solid var(--line); border-radius: 11px;
+    background: var(--panel); margin-bottom: 8px;
+    cursor: pointer; transition: border-color 120ms, transform 120ms, background 120ms;
+  }
+  .inbox-row:hover { border-color: var(--line-2); background: var(--panel-2); transform: translateY(-1px); }
+  .inbox-row:focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; }
+  .inbox-label { font-size: 13.5px; font-weight: 600; }
+  .inbox-sub { grid-column: 1; color: var(--muted); font-size: 11.5px; font-family: var(--mono); }
+  .inbox-where { grid-column: 2; grid-row: 1 / span 2; display: flex; align-items: center; gap: 8px; }
+  .space-chip {
+    display: inline-flex; align-items: center; gap: 6px;
+    font-size: 11px; padding: 4px 9px; border-radius: 999px;
+    border: 1px solid var(--line-2); color: var(--muted); white-space: nowrap;
+  }
+  .space-chip .dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; }
+  .space-chip.public { color: var(--cyan); }
+  .space-chip.protected { color: #e8c07d; }
+  .space-chip.private { color: var(--red); }
+
+  /* ---- node sub-navigation --------------------------------------------
+     A segmented control, not a second sidebar: these are four views of one
+     subject, and nesting a menu inside a menu is how the first sidebar grew. */
+  .card h3 .muted { text-transform: none; letter-spacing: normal; }
+  .caps li .pico { flex: 0 0 auto; width: 12px; color: var(--violet); text-align: center; }
+  .tabs { display: flex; gap: 4px; margin: 0 0 18px; padding: 4px; border: 1px solid var(--line); border-radius: 10px; background: rgba(120,140,200,0.05); width: fit-content; }
+  .tab-btn {
+    display: flex; align-items: center; gap: 7px;
+    background: none; border: 0; border-radius: 7px; cursor: pointer;
+    color: var(--muted); font: inherit; font-size: 12.5px; padding: 7px 13px;
+    transition: background 120ms, color 120ms;
+  }
+  .tab-btn .ico { font-size: 12px; opacity: 0.85; }
+  .tab-btn:hover { color: var(--text); }
+  .tab-btn.on { background: rgba(56,225,255,0.12); color: var(--text); }
+  .tab-btn.on .ico { color: var(--cyan); }
+
+  :focus-visible { outline: 2px solid var(--cyan); outline-offset: 2px; border-radius: 6px; }
   .tier { display: inline-block; font-size: 10px; letter-spacing: 0.06em; text-transform: uppercase; padding: 1px 6px; border-radius: 999px; border: 1px solid rgba(120,140,200,0.3); opacity: 0.85; }
   .tier.public { color: var(--cyan); }
   .tier.protected { color: #e8c07d; }
-  .tier.private { color: #e88; }
+  .tier.private { color: var(--red); }
   .nav-item {
     display: flex; align-items: center; gap: 11px;
     padding: 9px 12px; border-radius: 10px; cursor: pointer;
@@ -93,6 +233,8 @@
 
   /* ---- content ---- */
   .content { overflow-y: auto; padding: 22px 26px 40px; }
+  /* Content is measured, not stretched. */
+  .content > * { max-width: 1160px; }
   .content-head { display: flex; align-items: center; justify-content: space-between; margin-bottom: 18px; }
   .content-head h1 { margin: 0; font-size: 20px; font-weight: 700; letter-spacing: 0.01em; }
   .content-head .sub { color: var(--muted); font-size: 12px; margin-top: 2px; }
@@ -234,7 +376,7 @@
   .plug-actions { display: flex; flex-direction: column; gap: 7px; align-items: stretch; }
   .caps { margin-top: 12px; border-top: 1px solid var(--line); padding-top: 10px; }
   .caps li { font-size: 12.5px; color: var(--text); margin: 4px 0; list-style: none; display: flex; gap: 8px; }
-  .caps li::before { content: "▸"; color: var(--violet); }
+  .caps li:not(:has(.pico))::before { content: "▸"; color: var(--violet); }
   .caps ul { margin: 0; padding: 0; }
   .keyline { font-family: var(--mono); font-size: 11px; color: var(--dim); word-break: break-all; }
 
@@ -302,24 +444,53 @@
       <div class="logo">R</div>
       <div class="name">Reactor<small>local console</small></div>
     </div>
-    <div class="space-switch">
-      <label for="space-pick">space</label>
-      <select id="space-pick"><option value="">no space</option></select>
-      <div class="space-meaning" id="space-meaning"></div>
-    </div>
-    <div class="nav-item active" data-tab="overview"><span class="ico">◈</span> Home</div>
-    <div class="nav-item" data-tab="spaces"><span class="ico">⬢</span> Spaces</div>
-    <div class="nav-item" data-tab="groups"><span class="ico">⬡</span> Groups</div>
-    <div class="nav-item" data-tab="plugins"><span class="ico">▣</span> Plugins</div>
-    <div class="nav-item" data-tab="settings"><span class="ico">⚙</span> Settings</div>
-    <div class="nav-item" data-tab="profile"><span class="ico">☺</span> Profile</div>
-    <div id="nav-plugins"></div>
+    <!-- Region 1: attention. Above the lens because it is deliberately NOT
+         scoped by it -- "what needs me" is the one question you should never
+         have to ask five times. -->
+    <nav class="region" id="region-inbox" aria-label="Attention">
+      <div class="nav-item" data-tab="inbox">
+        <span class="ico">◈</span> Inbox
+        <span class="badge" id="inbox-count" hidden></span>
+      </div>
+    </nav>
+
+    <!-- Region 2: the lens, and the things it scopes -- adjacent, because the
+         old sidebar put three unrelated items between them. -->
+    <nav class="region" id="region-space" aria-label="Current space">
+      <div class="region-label">Space</div>
+      <button class="lens" id="lens" aria-haspopup="dialog">
+        <span class="ico">⬢</span>
+        <span class="lens-name" id="lens-name">All spaces</span>
+        <span class="tier" id="lens-tier" hidden></span>
+        <span class="lens-caret">▾</span>
+      </button>
+      <div id="space-apps" class="subnav"></div>
+    </nav>
+
+    <!-- Region 3: the node. One click away, never nested in a space, never a
+         sibling of a space's app -- so nothing moves the day the operator and
+         the user are different people. -->
+    <nav class="region region-quiet" id="region-node" aria-label="This node">
+      <div class="nav-item" data-tab="node">
+        <span class="ico">⚙</span> This node
+        <span class="node-dot" id="node-dot" title="node health"></span>
+      </div>
+    </nav>
+
     <div class="foot">
-      <div class="row"><span>peers</span><span class="mono" id="side-peers">–</span></div>
+      <button class="hint" id="hint-palette"><kbd id="kbd-mod">⌘</kbd><kbd>K</kbd> <span>search</span></button>
+      <div class="row"><span id="side-peers-label">peers</span><span class="mono" id="side-peers">–</span></div>
       <div class="row"><span>docs</span><span class="mono" id="side-docs">–</span></div>
     </div>
   </aside>
   <main class="content" id="content"></main>
+</div>
+<div class="palette-wrap" id="palette" hidden>
+  <div class="palette" role="dialog" aria-modal="true" aria-label="Go to">
+    <input id="palette-input" placeholder="Go to a space, an app, or a node section…" autocomplete="off" spellcheck="false">
+    <div class="palette-list" id="palette-list"></div>
+    <div class="palette-foot"><kbd>↑</kbd><kbd>↓</kbd> move <kbd>↵</kbd> open <kbd>esc</kbd> close</div>
+  </div>
 </div>
 <div class="toast-wrap" id="toasts"></div>
 
@@ -327,6 +498,7 @@
 "use strict";
 const $ = (s, r = document) => r.querySelector(s);
 const $$ = (s, r = document) => Array.from(r.querySelectorAll(s));
+const plural = (n, one, many) => `${n} ${n === 1 ? one : many || one + "s"}`;
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmtTs = (t) => (t ? new Date(t).toLocaleTimeString() : "—");
 
@@ -358,8 +530,10 @@ function toast(msg, isErr = false) {
 
 const state = { tab: "overview", fireCursor: {}, lastFire: {} };
 const TITLES = {
-  overview: ["Home", "peers, live activity, and your subscriptions"],
+  inbox: ["Inbox", "what needs you, gathered from every space you are in"],
   spaces: ["Spaces", "who can read, and which apps run there — a space's tier is fixed when it is made"],
+  node: ["This node", "the machine: identity, peers, software and the raw store"],
+  overview: ["Home", "peers, live activity, and your subscriptions"],
   groups: ["Groups", "shared spaces — channels and a folder drive, signed and synced over the mesh"],
   plugins: ["Plugins", "applications published to the mesh — verified, sandboxed, installed by your decision"],
   settings: ["Settings", "drive, identity, and LLM configuration"],
@@ -393,7 +567,26 @@ function routeFromHash() {
     };
   }
   const h = decodeURIComponent(raw);
-  return { tab: RENDER[h] ? h : "overview", plugin: null, view: "" };
+  // "node/<section>" -- the node region's own sub-navigation.
+  if (h.startsWith("node/")) return { tab: "node", plugin: null, view: h.slice(5) };
+  // Everything the old sidebar addressed still resolves. A link someone
+  // bookmarked or pasted into a message should not become a dead end because
+  // we reorganised a menu.
+  const REDIRECTS = {
+    overview: "inbox", home: "inbox",
+    groups: "spaces",
+    plugins: "node/software",
+    settings: "node/identity", profile: "node/identity",
+    documents: "node/store", types: "node/store", folders: "node/store",
+  };
+  if (REDIRECTS[h]) {
+    const to = REDIRECTS[h];
+    history.replaceState(null, "", "#" + to);
+    return to.startsWith("node/")
+      ? { tab: "node", plugin: null, view: to.slice(5) }
+      : { tab: to, plugin: null, view: "" };
+  }
+  return { tab: RENDER[h] ? h : "inbox", plugin: null, view: "" };
 }
 
 async function applyRoute() {
@@ -425,9 +618,6 @@ async function renderOverview() {
     peers = ov.peerCount ?? 0;
     docCount = ov.liveDocCount ?? 0;
   } catch {}
-  $("#side-peers").textContent = peers;
-  $("#side-docs").textContent = docCount;
-
   const [procs, ov] = await Promise.all([get("/api/processors").catch(() => []), get("/api/overview").catch(() => ({}))]);
   const fireEl = document.createElement("div");
   fireEl.innerHTML = head("overview") + `
@@ -928,7 +1118,7 @@ async function showGroup(name) {
     <div class="card" style="border-color:var(--line-2)">
       <div style="display:flex;align-items:baseline;gap:10px;margin-bottom:4px">
         <h3>${esc(name)}</h3>
-        <span class="muted" style="font-size:12.5px">${(g.members || []).length} member(s) · ${(g.managers || []).length} manager(s)</span>
+        <span class="muted" style="font-size:12.5px">${plural((g.members || []).length, "member")} · ${plural((g.managers || []).length, "manager")}</span>
       </div>
       <div class="subtabs" id="grp-subtabs">
         <button class="subtab" data-sub="overview">Overview</button>
@@ -1395,7 +1585,7 @@ function sheet(html) {
  * this publisher -- so the prompt leads with the key and says, in words, what
  * saying yes allows. A JSON blob is not a decision anyone can make. */
 function installPrompt(pkg, onConfirm) {
-  const capLines = (pkg.capabilities || []).map((c) => `<li>${esc(c)}</li>`).join("");
+  const capLines = permissionLines(pkg);
   const firstTime = !pkg.trusted;
   const { el, close } = sheet(`
     <h2>Install ${esc(pkg.name)}</h2>
@@ -1470,7 +1660,7 @@ async function renderPlugins() {
         <div class="plug-title">${esc(p.name)}</div>
         <div class="plug-by">${esc(p.publisher || "unnamed publisher")} · v${esc(p.version)}</div>
         ${p.description ? `<div class="plug-desc">${esc(p.description)}</div>` : ""}
-        <div class="caps"><ul>${(p.capabilities || []).map((c) => `<li>${esc(c)}</li>`).join("")}</ul></div>
+        <div class="caps"><ul>${permissionLines(p)}</ul></div>
       </div>
       <div class="plug-actions">
         ${p.hasEditor ? `<button class="btn primary sm" data-open-btn="${esc(p.name)}">Open</button>` : `<span class="badge b-dim">no editor</span>`}
@@ -1601,7 +1791,7 @@ async function renderUpdateBanner() {
  * with nothing marking them as third-party, so the name has to be the guard.
  */
 async function renderPluginNav() {
-  const host = $("#nav-plugins");
+  const host = $("#space-apps");
   if (!host) return;
   let inst = [];
   try { inst = await get("/api/plugins"); } catch { host.innerHTML = ""; return; }
@@ -1624,10 +1814,13 @@ async function renderPluginNav() {
     for (const n of nav) items.push({ plugin: p.name, ...n });
   }
 
+  SPACE_NAV = items;
   host.innerHTML = items.map((n) => `
     <div class="nav-item" data-plugin="${esc(n.plugin)}" data-view="${esc(n.view || "")}">
       <span class="ico">${esc(n.icon || "◈")}</span> ${esc(n.label)}
-    </div>`).join("");
+    </div>`).join("")
+    // A space's own settings belong inside the space, not in a global list.
+    + (CURRENT_SPACE ? `<div class="nav-item" data-tab="spaces"><span class="ico">⚙</span> Members &amp; apps</div>` : "");
 
   $$("[data-plugin]", host).forEach((el) => (el.onclick = () => {
     location.hash = "plugin/" + encodeURIComponent(el.dataset.plugin)
@@ -1648,6 +1841,46 @@ function markActiveNav() {
         : !r.plugin && el.dataset.tab === r.tab
     );
   });
+}
+
+/* ---- the lens -------------------------------------------------------
+ * The current space, rendered as its name plus its tier. The tier travels
+ * with the space everywhere it appears -- switcher, chips, composer -- so
+ * exposure becomes something you recognise rather than something you re-read.
+ */
+function renderLens() {
+  const name = $("#lens-name"), tier = $("#lens-tier");
+  if (!name) return;
+  const sp = SPACES.find((x) => x.name === CURRENT_SPACE);
+  name.textContent = sp ? sp.name : "All spaces";
+  if (sp) {
+    tier.textContent = sp.visibility;
+    tier.className = "tier " + sp.visibility;
+    tier.hidden = false;
+    tier.title = sp.meaning;
+  } else {
+    tier.hidden = true;
+  }
+}
+
+/* A count that is sometimes stale is worse than no count, so the badge is
+   hidden rather than zeroed when nothing is waiting. */
+async function refreshFooter() {
+  try {
+    const ov = await get("/api/overview");
+    $("#side-peers").textContent = ov.peerCount ?? 0;
+    $("#side-docs").textContent = ov.liveDocCount ?? 0;
+  } catch { /* leave the last known values rather than flashing a dash */ }
+}
+
+async function refreshInboxCount() {
+  const el = $("#inbox-count");
+  if (!el) return;
+  try {
+    const rows = await get("/api/inbox");
+    el.textContent = String(rows.length);
+    el.hidden = rows.length === 0;
+  } catch { el.hidden = true; }
 }
 
 /* ---- the capability bridge ---- */
@@ -1740,6 +1973,19 @@ function closeBridge() { if (bridgeOff) { bridgeOff(); bridgeOff = null; } }
 
 /* ============================ DISPATCH ============================ */
 
+/* What an app is permitted to do, in the operator's language. Three lists,
+   not one: what it may read and write, what it will publish into another
+   space, and what it may put in your inbox. The last two are new permissions
+   and the reason they are shown here is that nobody can consent to a JSON
+   blob. */
+function permissionLines(p) {
+  const out = [];
+  for (const c of p.capabilities || []) out.push(["▸", c]);
+  for (const c of p.publishes || []) out.push(["◈", c]);
+  for (const c of p.interrupts || []) out.push(["◉", c]);
+  return out.map(([ico, t]) => `<li><span class="pico">${ico}</span>${esc(t)}</li>`).join("");
+}
+
 /* ---- spaces -----------------------------------------------------------
  *
  * A space is the unit of access; an app is the unit of schema and UI. The
@@ -1769,6 +2015,9 @@ const TIER_MEANING = {
 };
 
 let SPACES = [];
+/* What the sidebar currently offers, so the palette and the sidebar can
+   never disagree about which apps this space has. */
+let SPACE_NAV = [];
 let CURRENT_SPACE = localStorage.getItem("ph.space") || "";
 
 function currentSpace() { return CURRENT_SPACE || null; }
@@ -1781,32 +2030,24 @@ async function loadSpaces() {
     CURRENT_SPACE = "";
     localStorage.removeItem("ph.space");
   }
-  const pick = $("#space-pick");
-  if (!pick) return;
-  pick.innerHTML = `<option value="">no space</option>`
-    + SPACES.map((s) => `<option value="${esc(s.name)}">${esc(s.name)}</option>`).join("");
-  pick.value = CURRENT_SPACE;
-  pick.onchange = () => {
-    CURRENT_SPACE = pick.value;
-    if (CURRENT_SPACE) localStorage.setItem("ph.space", CURRENT_SPACE);
-    else localStorage.removeItem("ph.space");
-    showSpaceMeaning();
-    renderPluginNav();
-    render();
-  };
-  showSpaceMeaning();
+  renderLens();
+}
+
+/* Change the lens. One place does it, so the sidebar, the bridge and the
+   current screen can never disagree about which space you are in. */
+function setSpace(name) {
+  CURRENT_SPACE = name || "";
+  if (CURRENT_SPACE) localStorage.setItem("ph.space", CURRENT_SPACE);
+  else localStorage.removeItem("ph.space");
+  renderLens();
+  renderPluginNav();
+  render();
 }
 
 /* The tier's actual guarantee, always in view while you are inside it.
    "Protected" reads like a private channel and is not one; saying so once at
    creation time is not enough, because the person reading a document later is
    usually not the person who made the space. */
-function showSpaceMeaning() {
-  const el = $("#space-meaning");
-  if (!el) return;
-  const s = SPACES.find((x) => x.name === CURRENT_SPACE);
-  el.textContent = s ? s.meaning : "";
-}
 
 async function renderSpaces() {
   await loadSpaces();
@@ -1852,7 +2093,7 @@ async function renderSpaces() {
             <span class="tier ${esc(sp.visibility)}">${esc(sp.visibility)}</span>
           </div>
           <div class="muted" style="font-size:12px;line-height:1.5;margin:6px 0">${esc(sp.meaning)}</div>
-          <div class="muted" style="font-size:12px">${sp.members.length} member(s) · ${sp.apps.length} app(s) enabled</div>
+          <div class="muted" style="font-size:12px">${plural(sp.members.length, "member")} · ${plural(sp.apps.length, "app")} enabled</div>
           <div style="margin-top:8px;display:flex;flex-wrap:wrap;gap:6px">
             ${plugins.length ? plugins.map((p) => {
               const on = sp.apps.some((a) => a.name === p.name);
@@ -1891,7 +2132,225 @@ async function renderSpaces() {
   };
 }
 
+
+/* ============================ INBOX ============================
+ *
+ * The landing screen, and deliberately not scoped by the lens. With five
+ * spaces, "is anything waiting?" should be one look, not five visits -- that
+ * is the difference between a coordination tool and a chore.
+ *
+ * Rows come from attention rules each app declared in its signed manifest, so
+ * the meaning of "this needs you" belongs to the app that understands it.
+ */
+async function renderInbox() {
+  let rows = [];
+  let failed = false;
+  try { rows = await get("/api/inbox"); } catch { failed = true; }
+
+  const el = document.createElement("div");
+  el.innerHTML = head("inbox") + `<div id="inbox-body"></div>`;
+  $("#content").replaceChildren(el);
+  const body = $("#inbox-body");
+  // The page and the sidebar badge must never disagree about the number.
+  const sub = $(".content-head .sub");
+  if (sub && !failed) {
+    sub.textContent = rows.length
+      ? `${rows.length} waiting, across ${plural(new Set(rows.map((r) => r.space)).size, "space")}`
+      : "what needs you, gathered from every space you are in";
+  }
+
+  if (failed) {
+    body.innerHTML = `<div class="empty"><div class="big">⚠</div>
+      Could not read the inbox. The daemon may be restarting.</div>`;
+    return;
+  }
+  if (!rows.length) {
+    // An empty state says what is true and what to do next. A bare void makes
+    // the reader wonder whether it is empty or broken.
+    body.innerHTML = `<div class="empty"><div class="big">◈</div>
+      <div style="font-size:15px;color:var(--text);margin-bottom:6px">Nothing needs you.</div>
+      <div style="font-size:12.5px;max-width:42ch;margin:0 auto">Items appear here when an app you have
+      enabled says you are on the hook — a proposal to review, a milestone to accept.</div></div>`;
+    return;
+  }
+
+  body.innerHTML = rows.map((r, i) => `
+    <div class="inbox-row" data-i="${i}" tabindex="0" role="link">
+      <div class="inbox-label">${esc(r.label)}</div>
+      <div class="inbox-sub">${esc(r.doc)}</div>
+      <div class="inbox-where">
+        <span class="space-chip ${esc(r.spaceTier)}" title="${esc(r.spaceTier)} space">
+          <span class="dot"></span>${esc(r.space)}
+        </span>
+      </div>
+    </div>`).join("");
+
+  const open = (r) => {
+    // Acting on an item must not mean first working out where it lives: the
+    // lens follows the row, so you land in the app already in the right space
+    // and can see that you moved.
+    if (r.space && r.space !== CURRENT_SPACE) setSpace(r.space);
+    location.hash = "plugin/" + encodeURIComponent(r.app);
+  };
+  $$("#inbox-body .inbox-row").forEach((node) => {
+    const r = rows[Number(node.dataset.i)];
+    node.onclick = () => open(r);
+    node.onkeydown = (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); open(r); } };
+  });
+}
+
+/* ============================ THIS NODE ============================
+ *
+ * The machine, not the work. One click from anywhere, never nested inside a
+ * space and never a sibling of a space's app -- so the day the operator and
+ * the user are different people, nothing here has to move.
+ */
+const NODE_SECTIONS = [
+  ["overview", "Overview", "◈", renderOverview],
+  ["software", "Software", "▣", renderPlugins],
+  ["store", "Store", "▤", renderDocuments],
+  ["identity", "Identity", "⚙", renderSettings],
+];
+
+async function renderNode() {
+  const r = routeFromHash();
+  const want = NODE_SECTIONS.some(([k]) => k === r.view) ? r.view : "overview";
+  const el = document.createElement("div");
+  el.innerHTML = head("node") + `
+    <div class="tabs" id="node-tabs">${NODE_SECTIONS.map(([k, label, ico]) => `
+      <button class="tab-btn${k === want ? " on" : ""}" data-sec="${k}">
+        <span class="ico">${ico}</span> ${label}</button>`).join("")}</div>
+    <div id="node-body"></div>`;
+  $("#content").replaceChildren(el);
+  $$("#node-tabs .tab-btn").forEach((b) => (b.onclick = () => { location.hash = "node/" + b.dataset.sec; }));
+
+  // Each section reuses the renderer that already knows how to draw it; they
+  // paint into #content, so hand them a scratch node and move the result.
+  const host = $("#node-body");
+  const scratch = document.createElement("div");
+  scratch.id = "content";
+  const real = $("#content");
+  real.id = "content-real";
+  document.body.appendChild(scratch);
+  try {
+    await (NODE_SECTIONS.find(([k]) => k === want)[3])();
+    // Drop the section's own page header: it already sits under one.
+    const h = $(".content-head", scratch);
+    if (h) h.remove();
+    host.replaceChildren(...Array.from(scratch.childNodes));
+  } finally {
+    scratch.remove();
+    real.id = "content";
+  }
+}
+
+/* ============================ COMMAND PALETTE ============================
+ *
+ * One shortcut that reaches every destination: spaces, the apps in the space
+ * you are in, and the node's sections. Hunting a sidebar is not a keyboard
+ * path, and this is a tool people open every day.
+ */
+let PALETTE = { items: [], sel: 0, restore: null };
+
+function paletteItems() {
+  const out = [];
+  out.push({ group: "Attention", ico: "◈", label: "Inbox", go: () => (location.hash = "inbox") });
+  for (const sp of SPACES) {
+    out.push({
+      group: "Spaces", ico: "⬢", label: sp.name, meta: sp.visibility, tier: sp.visibility,
+      go: () => { setSpace(sp.name); location.hash = "spaces"; },
+    });
+  }
+  for (const n of SPACE_NAV) {
+    out.push({
+      group: CURRENT_SPACE ? `Apps in ${CURRENT_SPACE}` : "Apps",
+      ico: n.icon || "◈", label: n.label,
+      go: () => { location.hash = "plugin/" + encodeURIComponent(n.plugin) + (n.view ? "/" + encodeURIComponent(n.view) : ""); },
+    });
+  }
+  for (const [k, label, ico] of NODE_SECTIONS) {
+    out.push({ group: "This node", ico, label, go: () => (location.hash = "node/" + k) });
+  }
+  return out;
+}
+
+function openPalette() {
+  PALETTE.restore = document.activeElement;
+  PALETTE.items = paletteItems();
+  PALETTE.sel = 0;
+  $("#palette").hidden = false;
+  const input = $("#palette-input");
+  input.value = "";
+  drawPalette("");
+  input.focus();
+}
+
+function closePalette() {
+  $("#palette").hidden = true;
+  // Returning focus where it came from is what makes a dialog feel attached
+  // to the thing that opened it rather than thrown over the top of it.
+  if (PALETTE.restore && PALETTE.restore.focus) PALETTE.restore.focus();
+}
+
+function drawPalette(q) {
+  const needle = q.trim().toLowerCase();
+  const hits = PALETTE.items.filter((i) => !needle || i.label.toLowerCase().includes(needle));
+  PALETTE.hits = hits;
+  if (PALETTE.sel >= hits.length) PALETTE.sel = Math.max(0, hits.length - 1);
+  const list = $("#palette-list");
+  if (!hits.length) {
+    list.innerHTML = `<div class="palette-group">No match</div>`;
+    return;
+  }
+  let html = "", group = null;
+  hits.forEach((i, n) => {
+    if (i.group !== group) { group = i.group; html += `<div class="palette-group">${esc(group)}</div>`; }
+    html += `<div class="palette-item" data-n="${n}" role="option" aria-selected="${n === PALETTE.sel}">
+      <span class="ico">${esc(i.ico)}</span><span>${esc(i.label)}</span>
+      ${i.meta ? `<span class="meta${i.tier ? " space-chip " + esc(i.tier) : ""}">${esc(i.meta)}</span>` : ""}</div>`;
+  });
+  list.innerHTML = html;
+  $$("#palette-list .palette-item").forEach((el) => (el.onclick = () => {
+    const it = PALETTE.hits[Number(el.dataset.n)];
+    closePalette(); it.go();
+  }));
+  const sel = $(`#palette-list .palette-item[aria-selected="true"]`);
+  if (sel) sel.scrollIntoView({ block: "nearest" });
+}
+
+function wirePalette() {
+  const input = $("#palette-input");
+  if (!input) return;
+  $("#lens").onclick = openPalette;
+  $("#hint-palette").onclick = openPalette;
+  $("#palette").onclick = (e) => { if (e.target.id === "palette") closePalette(); };
+  input.oninput = () => drawPalette(input.value);
+  input.onkeydown = (e) => {
+    const n = (PALETTE.hits || []).length;
+    if (e.key === "Escape") { e.preventDefault(); closePalette(); }
+    else if (e.key === "ArrowDown") { e.preventDefault(); PALETTE.sel = Math.min(n - 1, PALETTE.sel + 1); drawPalette(input.value); }
+    else if (e.key === "ArrowUp") { e.preventDefault(); PALETTE.sel = Math.max(0, PALETTE.sel - 1); drawPalette(input.value); }
+    else if (e.key === "Enter") {
+      e.preventDefault();
+      const it = (PALETTE.hits || [])[PALETTE.sel];
+      if (it) { closePalette(); it.go(); }
+    }
+  };
+  // Ctrl on everything that is not a Mac; the hint in the footer says which.
+  const mac = /Mac|iPhone|iPad/.test(navigator.platform || navigator.userAgent);
+  const kbd = $("#kbd-mod");
+  if (kbd) kbd.textContent = mac ? "⌘" : "Ctrl";
+  window.addEventListener("keydown", (e) => {
+    if ((mac ? e.metaKey : e.ctrlKey) && (e.key === "k" || e.key === "K")) {
+      e.preventDefault();
+      $("#palette").hidden ? openPalette() : closePalette();
+    }
+  });
+}
+
 const RENDER = {
+  inbox: renderInbox,
+  node: renderNode,
   overview: renderOverview,
   spaces: renderSpaces,
   documents: renderDocuments,
@@ -1906,9 +2365,14 @@ function render() { closeBridge(); (RENDER[state.tab] || renderOverview)(); }
 
 $$(".nav-item").forEach((n) => (n.onclick = () => switchTab(n.dataset.tab)));
 window.addEventListener("hashchange", applyRoute);
-loadSpaces().then(renderPluginNav);
-applyRoute();
+wirePalette();
+loadSpaces().then(() => { renderPluginNav(); applyRoute(); });
+refreshInboxCount();
+refreshFooter();
 renderUpdateBanner();
+// The badge is the only thing on screen claiming a number about the world, so
+// it is refreshed rather than left to go stale behind your back.
+setInterval(() => { refreshInboxCount(); refreshFooter(); }, 30 * 1000);
 setInterval(renderUpdateBanner, 5 * 60 * 1000);
 </script>
 </body>

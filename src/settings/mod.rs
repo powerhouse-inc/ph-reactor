@@ -2464,6 +2464,104 @@ mod console_tests {
     /// preventDefault and posts over the bridge silently does nothing. That
     /// failure is invisible -- no exception, no request, just a form that never
     /// fires -- which is exactly how it was found.
+    /// The sidebar is three regions, in this order, and nothing else at the
+    /// top level. The defect this replaced was a menu where a scope selector,
+    /// node status, a software catalogue and the current space's apps were all
+    /// siblings.
+    #[test]
+    fn the_sidebar_is_three_regions_in_order() {
+        let ids = ["region-inbox", "region-space", "region-node"];
+        let mut last = 0usize;
+        for id in ids {
+            let at = PAGE_V2
+                .find(&format!("id=\"{id}\""))
+                .unwrap_or_else(|| panic!("the sidebar declares {id}"));
+            assert!(at > last, "regions must appear in order; {id} is out of place");
+            last = at;
+        }
+    }
+
+    /// The lens must sit directly above the things it scopes. The old sidebar
+    /// put three unrelated items between them, which is the whole defect.
+    #[test]
+    fn the_lens_is_adjacent_to_the_apps_it_scopes() {
+        let lens = PAGE_V2.find("id=\"lens\"").expect("the lens exists");
+        let apps = PAGE_V2.find("id=\"space-apps\"").expect("the app list exists");
+        let between = &PAGE_V2[lens..apps];
+        assert!(
+            !between.contains("data-tab=\"node\""),
+            "nothing node-level may sit between the lens and the apps it scopes"
+        );
+    }
+
+    /// A link someone bookmarked or pasted into a message must not become a
+    /// dead end because we reorganised a menu.
+    #[test]
+    fn every_old_tab_still_resolves() {
+        let i = PAGE_V2.find("const REDIRECTS").expect("redirects are declared");
+        let block = &PAGE_V2[i..i + 460];
+        for old in [
+            "overview", "groups", "plugins", "settings", "profile", "documents", "types", "folders",
+        ] {
+            assert!(block.contains(old), "'{old}' must still resolve: {block}");
+        }
+    }
+
+    /// An empty state says what is true and what to do next. A bare void
+    /// leaves the reader unable to tell empty from broken.
+    #[test]
+    fn an_empty_inbox_says_what_is_true() {
+        assert!(
+            PAGE_V2.contains("Nothing needs you."),
+            "the empty inbox must say so in words"
+        );
+        assert!(
+            PAGE_V2.contains("Could not read the inbox"),
+            "and a failure must not be dressed up as emptiness"
+        );
+    }
+
+    /// Every inbox row names its space. A cross-space list without that is
+    /// ambiguous, and ambiguity about scope is what this design removes.
+    #[test]
+    fn an_inbox_row_names_its_space() {
+        let i = PAGE_V2
+            .find("class=\"inbox-row\"")
+            .expect("the row template exists");
+        let block = &PAGE_V2[i..i + 900];
+        assert!(block.contains("space-chip"), "a row must carry its space: {block}");
+        assert!(block.contains("spaceTier"), "and be coloured by its tier");
+    }
+
+    /// Nobody can consent to a JSON blob. What an app may do is three
+    /// questions -- what it reads, what it publishes into another space, and
+    /// what it may put in front of you -- and all three have to be on the
+    /// install prompt, not just the first.
+    #[test]
+    fn the_install_prompt_discloses_all_three_permissions() {
+        let i = PAGE_V2
+            .find("function permissionLines")
+            .expect("permissions are rendered in one place");
+        let block = &PAGE_V2[i..i + 420];
+        for k in ["capabilities", "publishes", "interrupts"] {
+            assert!(block.contains(k), "the prompt must disclose {k}: {block}");
+        }
+    }
+
+    /// A tool people open daily earns a keyboard path to every destination.
+    #[test]
+    fn the_palette_is_reachable_by_keyboard() {
+        assert!(PAGE_V2.contains("function openPalette"));
+        let i = PAGE_V2.find("function wirePalette").expect("the palette is wired");
+        let block = &PAGE_V2[i..i + 1400];
+        assert!(block.contains("metaKey") && block.contains("ctrlKey"), "both platforms: {block}");
+        assert!(block.contains("Escape"), "escape must close it");
+        assert!(
+            PAGE_V2.contains("if (PALETTE.restore && PALETTE.restore.focus)"),
+            "focus must return where it came from"
+        );
+    }
+
     /// Every bridge call carries the space the plugin is open in. Without it
     /// the daemon falls back to node-wide scope and a plugin open in one
     /// client's space reads another client's documents of the same model.
