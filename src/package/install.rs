@@ -250,6 +250,7 @@ mod tests {
             capabilities: Capabilities::default(),
             ui: Default::default(),
             sig: String::new(),
+            projections: Vec::new(),
         };
         m.sign(k);
         m

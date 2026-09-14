@@ -35,6 +35,7 @@ pub mod p2p;
 pub mod package;
 pub mod paths;
 pub mod processor;
+pub mod projection;
 pub mod query;
 pub mod settings;
 pub mod status;

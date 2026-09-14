@@ -367,6 +367,13 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
     let processor_handle = processor_runner.handle();
     processor_runner.spawn();
 
+    // Projections: an installed app publishing a narrower record from one
+    // space into another. Its own feed subscriber rather than a processor,
+    // because a processor is something the operator writes and edits, while a
+    // projection is something the *publisher* declared and the operator
+    // approved at install time -- different authors, different lifetimes.
+    crate::projection::spawn(store.clone(), paths.packages_file());
+
     // The loopback settings server.
     let settings = Settings::new(
         cmd_tx.clone(),

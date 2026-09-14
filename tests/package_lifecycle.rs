@@ -67,6 +67,7 @@ fn achra_manifest(blobs: &BlobStore) -> Manifest {
         },
         ui: Default::default(),
         sig: String::new(),
+        projections: Vec::new(),
     };
     m.sign(&k);
     m

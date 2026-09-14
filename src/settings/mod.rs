@@ -1106,6 +1106,7 @@ async fn plugins_api(state: axum::extract::State<Arc<Settings>>) -> Response {
                 "publisherKey": p.manifest.publisher_key,
                 "hasEditor": p.manifest.bundle.is_some(),
                 "capabilities": p.manifest.capabilities.describe(),
+                "publishes": p.manifest.projections.iter().map(crate::package::Projection::describe).collect::<Vec<_>>(),
                 "nav": p.manifest.ui.nav,
                 "installedAt": p.installed_at,
             })

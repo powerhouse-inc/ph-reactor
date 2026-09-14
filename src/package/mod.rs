@@ -61,6 +61,70 @@ pub struct WriteCapability {
     pub kinds: Vec<String>,
 }
 
+/// A record this app publishes from one space into another.
+///
+/// The transparency case -- "show the finances from contributor billing on the
+/// public forum" -- is not one document with two audiences. In a system where
+/// every member holds a full replica, redaction-by-view is a lie: the document
+/// is already on the reader's disk. So it is two documents, and the public one
+/// carries only the fields named here.
+///
+/// Declared in the manifest rather than coded inside the app, so the install
+/// prompt can say *"this app will publish payment records publicly"*. That is
+/// the consent that matters, and it is only possible because the publisher had
+/// to write it down and sign it.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Projection {
+    /// Source model name.
+    pub from: String,
+    /// The reducer whose application triggers this.
+    pub on: String,
+    /// Target model name.
+    pub to: String,
+    /// Target space, by name.
+    pub into: String,
+    /// The only fields copied across. Everything else stays behind.
+    #[serde(default)]
+    pub fields: Vec<String>,
+}
+
+impl Projection {
+    /// A plain-language line for the install prompt.
+    pub fn describe(&self) -> String {
+        let what = if self.fields.is_empty() {
+            "nothing".to_string()
+        } else {
+            self.fields.join(", ")
+        };
+        format!(
+            "when a {} is {}, publish its {} into the '{}' space as a {}",
+            self.from, self.on, what, self.into, self.to
+        )
+    }
+
+    /// A projection that copies nothing, or into nowhere, is a mistake worth
+    /// refusing at install rather than discovering as an empty document later.
+    pub fn validate(&self) -> Result<(), String> {
+        for (label, v) in [
+            ("from", &self.from),
+            ("on", &self.on),
+            ("to", &self.to),
+            ("into", &self.into),
+        ] {
+            if v.trim().is_empty() {
+                return Err(format!("a projection needs '{label}'"));
+            }
+        }
+        if self.fields.is_empty() {
+            return Err(format!(
+                "the projection from {} would publish a document with no fields",
+                self.from
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl Capabilities {
     pub fn may_read(&self, model: &str) -> bool {
         self.read.iter().any(|m| m == model)
@@ -241,6 +305,14 @@ pub struct Manifest {
     pub bundle: Option<BlobRef>,
     #[serde(default)]
     pub capabilities: Capabilities,
+    /// Records this app publishes from one space into another.
+    ///
+    /// `skip_serializing_if` for the same load-bearing reason as `ui` below:
+    /// a field that always appears changes the bytes every past signature was
+    /// made over, and every package published before it existed stops
+    /// verifying.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub projections: Vec<Projection>,
     /// Console chrome the plugin asks for — sidebar entries. Signed with the
     /// rest, so what appears in the navigation is what the publisher vouched
     /// for and the operator approved.
@@ -342,6 +414,7 @@ mod tests {
             },
             ui: Default::default(),
             sig: String::new(),
+            projections: Vec::new(),
         };
         m.sign(k);
         m
@@ -638,6 +711,7 @@ mod tests {
             capabilities: Capabilities::default(),
             ui: PluginUi::default(),
             sig: String::new(),
+            projections: Vec::new(),
         };
         let v: serde_json::Value = serde_json::to_value(&m).expect("serialize");
         let keys: Vec<&str> = v.as_object().expect("object").keys().map(String::as_str).collect();
@@ -658,5 +732,55 @@ mod tests {
             "a new optional field must omit itself when empty, or it \
              invalidates every signature made before it existed"
         );
+    }
+
+    /// The same trap as `ui`, one field later: a manifest field that always
+    /// serializes changes the bytes every past signature was made over, and
+    /// every package published before it existed stops verifying. It happened
+    /// once already, in production, visible in the console as "bad signature"
+    /// on a package nobody had touched.
+    #[test]
+    fn adding_projections_did_not_invalidate_existing_signatures() {
+        let k = SigningKey::from_bytes(&[7u8; 32]);
+        let mut m = Manifest {
+            name: "acme".into(),
+            version: "1.0.0".into(),
+            description: String::new(),
+            category: String::new(),
+            publisher: PublisherInfo::default(),
+            publisher_key: hex::encode(k.verifying_key().to_bytes()),
+            document_models: Vec::new(),
+            processors: Vec::new(),
+            bundle: None,
+            capabilities: Capabilities::default(),
+            projections: Vec::new(),
+            ui: PluginUi::default(),
+            sig: String::new(),
+        };
+        m.sign(&k);
+        assert!(m.verify().is_ok(), "a manifest with no projections verifies");
+
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(
+            !json.contains("projections"),
+            "an empty projections list must not appear in the signed bytes: {json}"
+        );
+
+        // And a manifest that declares one still verifies -- against its own
+        // signature, made over bytes that do include it.
+        let mut with = m.clone();
+        with.projections = vec![Projection {
+            from: "milestone".into(),
+            on: "accept".into(),
+            to: "ledger-entry".into(),
+            into: "commons".into(),
+            fields: vec!["amount".into()],
+        }];
+        assert!(
+            with.verify().is_err(),
+            "declaring a projection after signing must break the signature"
+        );
+        with.sign(&k);
+        assert!(with.verify().is_ok());
     }
 }

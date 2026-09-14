@@ -309,6 +309,7 @@ mod tests {
             capabilities: Default::default(),
             ui: Default::default(),
             sig: String::new(),
+            projections: Vec::new(),
         };
         let key = ed25519_dalek::SigningKey::from_bytes(&[3u8; 32]);
         manifest.publisher_key = hex::encode(key.verifying_key().to_bytes());
