@@ -68,6 +68,43 @@ for the whole instance) under `~/.ph/reactor/` and starts listening on
 `/ip4/0.0.0.0/tcp/4201`. Peers on the LAN can also be found via mDNS
 (`p2p.mdns`); everything else is explicit multiaddr.
 
+#### The Powerhouse bootstrap node
+
+A permanently-running reactor in the Powerhouse Kubernetes cluster acts as the
+mesh's rendezvous: a DHT seed, a circuit relay for peers behind NAT, and a
+vault that keeps syncing while every laptop is shut. Point a new reactor at it
+once and it never needs to change:
+
+```sh
+ph-reactor drive add \
+  /ip4/46.225.34.129/tcp/25422/p2p/12D3KooWPTgWt8RdEdD23qDpkUM3vNeXebm7u2E7XAvhWi5Htdeg \
+  --name "Powerhouse"
+```
+
+Or seed the DHT without pinning a drive, by adding it to `p2p.bootstraps` in
+`~/.ph/reactor/config.json`:
+
+```json
+"p2p": {
+  "dht": true,
+  "bootstraps": [
+    "/ip4/46.225.34.129/tcp/25422/p2p/12D3KooWPTgWt8RdEdD23qDpkUM3vNeXebm7u2E7XAvhWi5Htdeg"
+  ]
+}
+```
+
+`reactor.vetra.io` resolves to the same address, but the multiaddr above uses
+the IP directly: libp2p dials it without a DNS round trip, and the address is
+a stable Hetzner load-balancer IP.
+
+The node listens on **TCP 25422**, not the 4201 default. 25422 sits in IANA's
+explicitly-unassigned `25101-25470` block, inside RFC 6335's User range, and
+below the Linux ephemeral floor of 32768 — so a fixed listener there cannot
+lose a bind race against an outbound connection's source port.
+
+Its peer id is a stable contract: the identity lives in OpenBao rather than on
+the node's volume, so it survives the node being rebuilt.
+
 ### Syncing a knowledge vault
 
 The native reactor is self-contained (no Node, no switchboard process). A
