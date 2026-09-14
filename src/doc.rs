@@ -630,6 +630,131 @@ mod tests {
         }
     }
 
+    /// The 50-peer convergence guarantee (item: "does group-chat work with
+    /// 50 peers, and are there conflicts?"). 50 origins each write (a) one
+    /// DISTINCT field and (b) the SAME field "counter" concurrently — 100
+    /// concurrent ops. The set is applied in 10 different orders (each peer
+    /// sees a different gossip delivery order). The final Doc must be
+    /// identical in every order (no divergence): every distinct field is
+    /// retained, and the same-field conflict resolves to one deterministic
+    /// winner (LWW on (ts, origin)).
+    #[test]
+    fn fifty_concurrent_origins_converge_regardless_of_order() {
+        const N: usize = 50;
+        let id = DocId::new();
+        let mut keys = Vec::with_capacity(N);
+        let mut origins = Vec::with_capacity(N);
+        for i in 0..N {
+            let (k, o) = origin(i as u8);
+            keys.push(k);
+            origins.push(o);
+        }
+
+        let mut ops = Vec::with_capacity(2 * N);
+        for i in 0..N {
+            // (a) a distinct field per origin — all must survive.
+            let mut c = VecClock::default();
+            c.tick(&origins[i]);
+            ops.push(make_op(
+                id, &keys[i], &origins[i],
+                Some(&format!("f{i:02}")),
+                Some(serde_json::json!(i)),
+                1, c,
+            ));
+            // (b) the same field "counter", concurrently, with distinct ts.
+            let mut c2 = VecClock::default();
+            c2.tick(&origins[i]);
+            ops.push(make_op(
+                id, &keys[i], &origins[i],
+                Some("counter"),
+                Some(serde_json::json!(i)),
+                (2 * i) as u64, c2,
+            ));
+        }
+
+        // The LWW winner of "counter" is the max (ts, origin): origin[N-1]
+        // has the largest ts (2*(N-1)) and value N-1.
+        let win_origin = origins[N - 1].clone();
+        let win_ts = (2 * (N - 1)) as u64;
+
+        // Several distinct application orders: forward, reverse, 8 shuffles.
+        let base: Vec<&Op> = ops.iter().collect();
+        let mut perms: Vec<Vec<&Op>> = Vec::new();
+        perms.push(base.clone());
+        let mut rev = base.clone();
+        rev.reverse();
+        perms.push(rev);
+        for seed in 0..8u32 {
+            let mut sh = base.clone();
+            let mut x = 0x1234_5678u32 ^ seed.wrapping_mul(0x9E37_79B9);
+            for i in (1..sh.len()).rev() {
+                x = x.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                let j = (x % (i as u32 + 1)) as usize;
+                sh.swap(i, j);
+            }
+            perms.push(sh);
+        }
+
+        let mut baseline: Option<(Doc, VecClock)> = None;
+        for perm in &perms {
+            let mut doc = Doc { id, name: "group".into(), fields: Default::default() };
+            let mut rclock = VecClock::default();
+            let mut deleted = false;
+            for op in perm {
+                apply_op(&mut doc, &mut rclock, &mut deleted, op);
+            }
+            assert!(!deleted);
+            match baseline.as_ref() {
+                None => baseline = Some((doc, rclock)),
+                Some((bd, bc)) => {
+                    assert_eq!(&doc, bd, "doc fields diverged across orders");
+                    assert_eq!(&rclock, bc, "doc clock diverged across orders");
+                }
+            }
+        }
+        let (final_doc, _) = baseline.unwrap();
+
+        // Every distinct field is retained with its value.
+        for i in 0..N {
+            let f = &final_doc.fields[&format!("f{i:02}")];
+            assert_eq!(f.value, i, "distinct field lost or wrong");
+        }
+        // The same-field conflict resolved to exactly one deterministic winner.
+        let counter = &final_doc.fields["counter"];
+        assert_eq!(counter.value, N - 1);
+        assert_eq!(counter.ts, win_ts);
+        assert_eq!(counter.origin, win_origin);
+        // 50 distinct + 1 "counter" = 51 fields.
+        assert_eq!(final_doc.fields.len(), N + 1);
+    }
+
+    /// Two concurrent writers with the SAME timestamp break the tie by the
+    /// origin string (the (ts, origin) total order) — deterministic in both
+    /// arrival orders.
+    #[test]
+    fn same_ts_same_field_breaks_by_origin() {
+        let (ka, a) = origin(1);
+        let (kb, b) = origin(2);
+        let id = DocId::new();
+        let mut ca = VecClock::default();
+        ca.tick(&a);
+        let op_a = make_op(id, &ka, &a, Some("f"), Some("A".into()), 5, ca);
+        let mut cb = VecClock::default();
+        cb.tick(&b);
+        let op_b = make_op(id, &kb, &b, Some("f"), Some("B".into()), 5, cb);
+        // origin(2) = "peer-02" sorts above origin(1) = "peer-01", so B wins.
+        assert!(b > a);
+        for order in [vec![&op_a, &op_b], vec![&op_b, &op_a]] {
+            let mut doc = Doc { id, name: "n".into(), fields: Default::default() };
+            let mut rclock = VecClock::default();
+            let mut deleted = false;
+            for op in order {
+                apply_op(&mut doc, &mut rclock, &mut deleted, op);
+            }
+            assert_eq!(doc.fields["f"].value, "B");
+        }
+    }
+
     #[test]
     fn causally_later_write_wins_regardless_of_arrival_order() {
         // A writes f. B observes A's write (merges A's clock) and then
