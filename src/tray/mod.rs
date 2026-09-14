@@ -1,4 +1,4 @@
-//! Status-bar tray via `org.kde.StatusNotifierItem` + `org.kde.DBusMenu`
+//! Status-bar tray via `org.kde.StatusNotifierItem` + `com.canonical.dbusmenu`
 //! over the session bus (zbus, no GTK).
 //!
 //! Registration: when a StatusNotifierWatcher is present (KDE/GNOME
@@ -22,8 +22,12 @@ pub mod menu;
 use crate::status::StatusSnapshot;
 use menu::{Action, MenuItem};
 
-const SNI_PATH: &str = "/StatusNotifier/Item/PhReactor";
-const MENU_PATH: &str = "/StatusNotifier/Item/PhReactor/Menu";
+// The spec's conventional paths. These are not arbitrary: a host that is
+// handed a BUS NAME (which is how we register) looks the item up at
+// `/StatusNotifierItem`. A custom path is only reachable when registering by
+// path, which not every host implements.
+const SNI_PATH: &str = "/StatusNotifierItem";
+const MENU_PATH: &str = "/StatusNotifierItem/Menu";
 
 /// The result of starting the tray.
 pub enum Tray {
@@ -110,10 +114,19 @@ impl Sni {
         ""
     }
 
-    /// The menu's object path (SNI spec: `s` property).
+    /// The menu's object path.
+    ///
+    /// This is `o` (an object path) in the SNI spec, NOT `s`. Returning a
+    /// string makes the property unreadable to a host expecting `o`, so the
+    /// icon appears but right-clicking it produces nothing. Every working
+    /// tray item on a KDE session returns `o` here.
+    ///
+    /// `MENU_PATH` is a compile-time constant proven valid by
+    /// `menu_path_is_a_valid_object_path`; the fallback exists only so a
+    /// malformed constant could never panic a running daemon.
     #[zbus(property)]
-    fn menu(&self) -> &str {
-        MENU_PATH
+    fn menu(&self) -> ObjectPath<'_> {
+        ObjectPath::try_from(MENU_PATH).unwrap_or_default()
     }
 
     #[zbus(property, name = "ItemActivationRequested")]
@@ -162,7 +175,10 @@ impl Sni {
     async fn new_title(signal_ctxt: &SignalContext<'_>, title: &str) -> zbus::Result<()>;
 }
 
-#[zbus::interface(name = "org.kde.DBusMenu", spawn = false)]
+// com.canonical.dbusmenu, not org.kde.DBusMenu: the canonical name is what
+// hosts import. KDE's own tray items expose com.canonical.dbusmenu, and a
+// host that cannot find that interface simply shows no menu.
+#[zbus::interface(name = "com.canonical.dbusmenu", spawn = false)]
 impl DbusMenu {
     #[zbus(property)]
     fn version(&self) -> u32 {
@@ -314,37 +330,37 @@ async fn run(
         tracing::warn!("DBusMenu object already at {MENU_PATH}; not registered");
     }
 
-    // Register with the watcher when one is present; else take the
-    // fallback well-known name indicator implementations scan for.
-    // Register with the watcher when one is present; else take the
-    // fallback well-known name indicator implementations scan for.
+    // Own the well-known name FIRST, then hand that name to the watcher.
+    //
+    // Order matters: the watcher resolves the name we give it and queries the
+    // item on it, so the name has to exist before we register. Registering by
+    // name (rather than by object path) is also what the GNOME AppIndicator
+    // extension expects, so this works on both desktops.
     let uid = nix_uid();
-    let watcher = "org.kde.StatusNotifierWatcher";
-    let registered = match raw_register(conn.as_ref(), watcher, SNI_PATH).await {
-        Ok(service) => {
-            tracing::info!("registered with status notifier watcher {service}");
-            true
-        }
-        Err(err) => {
-            tracing::warn!("watcher registration failed ({err:#}); using fallback name");
-            false
-        }
-    };
-    if !registered {
-        let name = format!("org.kde.StatusNotifierItem-{uid}-1");
-        match WellKnownName::try_from(name.clone()) {
-            Ok(n) => match conn.request_name(n).await {
-                Ok(_) => tracing::info!("taking fallback name {name}"),
-                Err(err) => {
-                    tracing::warn!("cannot take fallback name {name}: {err:#}");
-                    return;
-                }
-            },
+    let name = format!("org.kde.StatusNotifierItem-{uid}-1");
+    match WellKnownName::try_from(name.clone()) {
+        Ok(n) => match conn.request_name(n).await {
+            Ok(_) => tracing::debug!("took tray name {name}"),
             Err(err) => {
-                tracing::warn!("bad name {name}: {err}");
+                tracing::warn!("cannot take tray name {name}: {err:#}");
                 return;
             }
+        },
+        Err(err) => {
+            tracing::warn!("bad tray name {name}: {err}");
+            return;
         }
+    }
+
+    let watcher = "org.kde.StatusNotifierWatcher";
+    match raw_register(conn.as_ref(), watcher, &name).await {
+        Ok(()) => tracing::info!("registered {name} with the status notifier watcher"),
+        // Not fatal: with no watcher running, some hosts still discover the
+        // item by scanning for the well-known name we already own.
+        Err(err) => tracing::warn!(
+            "watcher registration failed ({err:#}); \
+             the tray name is held, so a host that scans for it can still find us"
+        ),
     }
 
     // Initial property advertisement.
@@ -405,19 +421,24 @@ async fn run(
 
 /// `RegisterStatusNotifierItem` as a raw method call (avoids a proxy
 /// derive for a one-shot call).
-async fn raw_register(conn: &Connection, watcher: &str, path: &str) -> anyhow::Result<String> {
-    let item = ObjectPath::try_from(path)?;
-    let reply = conn
-        .call_method(
-            Some(watcher),
-            "/StatusNotifierWatcher",
-            Some(watcher),
-            "RegisterStatusNotifierItem",
-            &(item,),
-        )
-        .await?;
-    let service: String = reply.body().deserialize()?;
-    Ok(service)
+///
+/// The argument is a STRING, not an object path. Passing an `ObjectPath`
+/// builds the call with signature `o` and every real implementation rejects
+/// it -- KDE answers `UnknownMethod: No such method 'RegisterStatusNotifierItem'
+/// ... (signature 'o')`, which reads like a missing method rather than the
+/// type error it is.
+///
+/// The method also returns nothing, so there is no reply body to deserialize.
+async fn raw_register(conn: &Connection, watcher: &str, service: &str) -> anyhow::Result<()> {
+    conn.call_method(
+        Some(watcher),
+        "/StatusNotifierWatcher",
+        Some(watcher),
+        "RegisterStatusNotifierItem",
+        &(service,),
+    )
+    .await?;
+    Ok(())
 }
 
 fn nix_uid() -> u32 {
@@ -444,5 +465,33 @@ pub async fn start(
     Tray::Running {
         stop: stop_tx,
         task: handle,
+    }
+}
+
+#[cfg(test)]
+mod path_tests {
+    use super::{MENU_PATH, SNI_PATH};
+    use zbus::zvariant::ObjectPath;
+
+    /// The Menu property returns `MENU_PATH` as an object path with a safe
+    /// fallback. That fallback must never be reachable in practice: if the
+    /// constant were malformed, hosts would silently show no menu.
+    #[test]
+    fn menu_path_is_a_valid_object_path() {
+        let p = ObjectPath::try_from(MENU_PATH).expect("MENU_PATH must be a valid object path");
+        assert_eq!(p.as_str(), MENU_PATH);
+    }
+
+    #[test]
+    fn sni_path_is_a_valid_object_path() {
+        let p = ObjectPath::try_from(SNI_PATH).expect("SNI_PATH must be a valid object path");
+        assert_eq!(p.as_str(), SNI_PATH);
+    }
+
+    /// Hosts handed a bus name look the item up at the conventional path.
+    #[test]
+    fn paths_follow_the_spec_convention() {
+        assert_eq!(SNI_PATH, "/StatusNotifierItem");
+        assert!(MENU_PATH.starts_with(SNI_PATH));
     }
 }

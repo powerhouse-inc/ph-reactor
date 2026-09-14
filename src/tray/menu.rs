@@ -1,5 +1,5 @@
 //! The tray's DBusMenu model: menu items and the XML layout served over
-//! `org.kde.DBusMenu`.
+//! `com.canonical.dbusmenu`.
 
 use crate::status::StatusSnapshot;
 
