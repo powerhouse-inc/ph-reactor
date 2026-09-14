@@ -19,7 +19,7 @@
 
 pub mod codec;
 pub mod invite;
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::os::unix::fs::PermissionsExt;
 use std::sync::Arc;
 use std::time::Duration;
@@ -37,7 +37,7 @@ use libp2p::{mdns, noise, tcp, yamux, Multiaddr, PeerId, StreamProtocol, SwarmBu
 use tokio::sync::mpsc;
 
 use crate::action::Action;
-use crate::doc::{DocId, ModelRef, VecClock};
+use crate::doc::{DocId, Hash32, ModelRef, VecClock};
 use crate::drives::{Drive, DriveStatus};
 use crate::model::{l1::L1, model_def_hash};
 use crate::p2p::codec::{
@@ -57,6 +57,10 @@ const CATCH_UP_TICK: Duration = Duration::from_secs(30);
 /// How often the engine wakes to check commands, idle state, and the
 /// store's outbound op queue (independent of the per-drive cadence).
 const TICK_INTERVAL: Duration = Duration::from_secs(5);
+/// Bound on the published-action dedupe set (the tick's drain skips what
+/// the outbound feed already published). Eviction is FIFO; a re-published
+/// action is idempotent on the receiver (same content, LWW merge).
+const PUBLISHED_CAP: usize = 8192;
 /// A drive that has been silent this long is reported idle (the daemon
 /// may let it sleep; the store stays warm).
 const IDLE_AFTER_SILENCE: Duration = Duration::from_secs(30 * 60);
@@ -268,6 +272,12 @@ pub struct SyncEngine {
     /// `(name, version)` of models already requested over the mesh (so a
     /// missing model is not re-requested in a loop).
     requested_models: HashSet<(String, String)>,
+    /// Actions already published to the mesh (content hash -> true), so
+    /// the periodic drain never publishes what the outbound feed already
+    /// did. Bounded by [`PUBLISHED_CAP`] via `published_order`.
+    published: HashSet<Hash32>,
+    /// Insertion order for [`Self::published`] (FIFO eviction).
+    published_order: VecDeque<Hash32>,
 }
 
 #[derive(NetworkBehaviour)]
@@ -390,10 +400,13 @@ impl SyncEngine {
             identity_sent: false,
             pending_actions: Vec::new(),
             requested_models: HashSet::new(),
+            published: HashSet::new(),
+            published_order: VecDeque::new(),
         })
     }
 
-    /// The main loop: swarm events, commands, and the catch-up tick.
+    /// The main loop: swarm events, commands, the outbound feed, and the
+    /// catch-up tick.
     pub async fn run(mut self) {
         // Subscribe to the mesh topic up front.
         let topic = gossipsub::IdentTopic::new(GOSSIPSUB_TOPIC);
@@ -405,6 +418,11 @@ impl SyncEngine {
         if let Err(err) = self.swarm.listen_on(self.listen.clone()) {
             tracing::warn!("cannot listen on {:?}: {err:?}", self.listen);
         }
+
+        // The store's outbound feed: local actions are published as soon
+        // as they are applied (the tick's drain remains as a backstop for
+        // actions applied before this point; dedupe makes it lossless).
+        let mut outbound_rx = self.store.connect_outbound();
 
         let mut tick = tokio::time::interval(TICK_INTERVAL);
         tick.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
@@ -425,9 +443,41 @@ impl SyncEngine {
                     self.on_swarm_event(event);
                     last_activity = tokio::time::Instant::now();
                 }
+                action = outbound_rx.recv() => {
+                    if let Some(action) = action {
+                        self.publish_action(&action);
+                    }
+                }
             }
         }
         tracing::debug!("engine shutting down");
+    }
+
+    /// Publishes one of our own actions to the mesh topic exactly once.
+    /// The dedupe set covers the overlap between the immediate outbound
+    /// feed and the periodic drain.
+    fn publish_action(&mut self, action: &Action) {
+        let h = action.hash();
+        if !self.published.insert(h) {
+            return;
+        }
+        self.published_order.push_back(h);
+        while self.published_order.len() > PUBLISHED_CAP {
+            if let Some(old) = self.published_order.pop_front() {
+                self.published.remove(&old);
+            }
+        }
+        let topic = gossipsub::IdentTopic::new(GOSSIPSUB_TOPIC);
+        let msg = ActionMsg {
+            action: action.clone(),
+            name: Some(self.pub_name.clone()),
+        };
+        match serde_json::to_vec(&msg) {
+            Ok(bytes) => {
+                let _ = self.swarm.behaviour_mut().gossipsub.publish(topic.hash(), bytes);
+            }
+            Err(e) => tracing::warn!("gossip encode failed: {e}"),
+        }
     }
 
     // -- commands -------------------------------------------------------
@@ -689,24 +739,11 @@ impl SyncEngine {
     // -- the tick ---------------------------------------------------------
 
     fn tick(&mut self, last_activity: tokio::time::Instant) {
-        // Fan out newly applied local ops to the mesh (the store's
-        // outbound queue is local-only; remote ops are not re-gossiped).
-        let topic = gossipsub::IdentTopic::new(GOSSIPSUB_TOPIC);
+        // Backstop for the outbound feed: publish whatever is still in
+        // the store's queue (actions applied before the feed was
+        // connected). The dedupe set makes a double delivery a no-op.
         for action in self.store.drain_outbound() {
-            let msg = ActionMsg {
-                action,
-                name: Some(self.pub_name.clone()),
-            };
-            match serde_json::to_vec(&msg) {
-                Ok(bytes) => {
-                    let _ = self
-                        .swarm
-                        .behaviour_mut()
-                        .gossipsub
-                        .publish(topic.hash(), bytes);
-                }
-                Err(e) => tracing::warn!("gossip encode failed: {e}"),
-            }
+            self.publish_action(&action);
         }
         // Idle accounting: any drive activity resets the window.
         let idle_for = last_activity.elapsed();
@@ -723,11 +760,11 @@ impl SyncEngine {
         let mut to_catch: Vec<(String, Vec<(DocId, VecClock)>)> = Vec::new();
         let mut to_summarize: Vec<(String, PeerId)> = Vec::new();
 
+        let own = self.store.summary();
         for (name, rt) in self.drives.iter() {
             if rt.drive.paused || !rt.handshaken || now < rt.next_catch_up {
                 continue;
             }
-            let own = self.store.summary();
             // Docs where they are ahead of us.
             let mut gaps = Vec::new();
             for (id, their) in &rt.remote_clocks {
@@ -754,12 +791,13 @@ impl SyncEngine {
         // Proactive summary exchange: give them our clocks so they can
         // catch up to what we have.
         for (name, peer) in to_summarize {
-            let own: Vec<(DocId, VecClock)> = self.store.summary().into_iter().collect();
+            let clocks: Vec<(DocId, VecClock)> =
+                own.iter().map(|(id, c)| (*id, c.clone())).collect();
             let _ = self
                 .swarm
                 .behaviour_mut()
                 .sync
-                .send_request(&peer, SyncMsg::Summary(Summary { clocks: own }));
+                .send_request(&peer, SyncMsg::Summary(Summary { clocks }));
             if let Some(rt) = self.drives.get_mut(&name) {
                 if rt.status == DriveStatus::Connecting {
                     // A full exchange round completed with no gaps
