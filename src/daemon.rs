@@ -148,6 +148,10 @@ pub fn run_daemonized(state_dir: Option<&Path>) -> Result<i32> {
 
 /// The daemon proper: store, p2p engine, settings server, tray, and the
 /// status/command loop. Runs on a fresh runtime in both modes.
+/// Set across the handover exec so a staged binary that somehow points back at
+/// an older one cannot bounce between the two forever.
+const HANDOVER_GUARD: &str = "PH_REACTOR_HANDED_OVER";
+
 async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
     let paths = StatePaths::resolve(state_dir);
     paths
@@ -155,6 +159,48 @@ async fn run_inner(state_dir: Option<&Path>, to_stdout: bool) -> Result<()> {
         .with_context(|| format!("creating {}", paths.root.display()))?;
     let config = config::load(&paths)?;
     init_logging(&paths, &config, to_stdout)?;
+
+    // Hand over to a staged binary, if one supersedes this process.
+    //
+    // This exists for the container case. There the daemon cannot replace the
+    // binary it was started from -- the root filesystem is read-only -- so an
+    // update lands in the state directory instead, and something has to make
+    // the next start use it. Without this handover the supervisor relaunches
+    // the image binary, which finds the same release still newer than itself
+    // and applies it again: a restart loop wearing the costume of an upgrade.
+    //
+    // Before the lock is taken and before anything is opened, so the replacement
+    // inherits a clean process rather than one holding a lock it does not know
+    // about. Every failure falls through to running this binary, because a node
+    // that starts is better than one that is certain it should not.
+    if let Some((path, version)) = crate::update::apply::staged_replacement(&paths.root, crate::VERSION) {
+        if std::env::var_os(HANDOVER_GUARD).is_some() {
+            // Already handed over once and still here: the staged binary
+            // re-execed back to us, or the marker is lying about its version.
+            // Either way, stop bouncing and run what we have.
+            tracing::warn!(
+                "ignoring staged {version} at {}: already handed over once this start",
+                path.display()
+            );
+        } else {
+            tracing::warn!(
+                "handing over to staged {version} at {} (this binary is {running})",
+                path.display(),
+                running = crate::VERSION,
+            );
+            let err = std::os::unix::process::CommandExt::exec(
+                std::process::Command::new(&path)
+                    .args(std::env::args_os().skip(1))
+                    .env(HANDOVER_GUARD, "1"),
+            );
+            // exec only returns on failure.
+            tracing::error!(
+                "could not exec staged {}: {err}; continuing as {running}",
+                path.display(),
+                running = crate::VERSION,
+            );
+        }
+    }
 
     let lock = acquire_lock(&paths)?;
     let pid = std::process::id();

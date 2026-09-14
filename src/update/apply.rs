@@ -165,7 +165,47 @@ pub fn apply(
     std::fs::rename(&staged, &target)
         .map_err(|e| ApplyError::Io(format!("installing {}: {e}", target.display())))?;
 
+    // When the update did NOT land on the path this process was started from --
+    // a container, where the binary sits on a read-only root -- something has
+    // to make the next start use it. Without this the supervisor re-launches
+    // the image binary, which finds the same release still newer than itself
+    // and applies it again: a restart loop that looks like an upgrade.
+    //
+    // A marker file rather than running the staged binary with `--version`:
+    // reading a file is cheap, cannot hang, and does not execute a binary
+    // before it has been decided that it should run.
+    if target != exe {
+        let marker = dir.join(STAGED_MARKER);
+        let body = serde_json::json!({ "version": release.version, "path": target });
+        std::fs::write(&marker, body.to_string())
+            .map_err(|e| ApplyError::Io(format!("writing {}: {e}", marker.display())))?;
+    }
+
     Ok(target)
+}
+
+/// Names the staged binary the next start should run instead of this one.
+pub const STAGED_MARKER: &str = "staged.json";
+
+/// A staged binary that supersedes the running one, if there is one.
+///
+/// Returns its path and version. Everything that could be wrong is treated as
+/// "there isn't one": a missing file, unreadable JSON, a version that does not
+/// compare, a path that no longer exists. Falling back to the binary that is
+/// already running is always safe; refusing to start is not.
+pub fn staged_replacement(state_dir: &Path, current_version: &str) -> Option<(PathBuf, String)> {
+    let marker = state_dir.join("bin").join(STAGED_MARKER);
+    let raw = std::fs::read_to_string(marker).ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    let version = v.get("version")?.as_str()?.to_string();
+    let path = PathBuf::from(v.get("path")?.as_str()?);
+    if !path.is_file() {
+        return None;
+    }
+    match super::compare(&version, current_version) {
+        Some(std::cmp::Ordering::Greater) => Some((path, version)),
+        _ => None,
+    }
 }
 
 /// Puts the preserved binary back. The rollback half of [`apply`].
@@ -193,6 +233,74 @@ pub fn ready(blobs: &BlobStore, binary: &BlobRef) -> bool {
 mod tests {
     use super::*;
     use ed25519_dalek::SigningKey;
+
+    /// Without a marker the container case is a restart loop: the image binary
+    /// comes back, sees the same release is still newer than itself, and
+    /// applies it again forever.
+    #[test]
+    fn staging_outside_the_running_path_records_what_to_run_next() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let blobs = BlobStore::open(&dir.path().join("blobs")).expect("blobs");
+        let ro = dir.path().join("image-bin");
+        std::fs::create_dir_all(&ro).expect("mkdir");
+        let exe = ro.join("ph-reactor");
+        std::fs::write(&exe, b"the image binary").expect("write");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o555)).expect("chmod");
+
+        let state = dir.path().join("state");
+        let r = release_for(&blobs, b"the new binary", "9.9.9", super::super::current_platform());
+        let applied = apply(&r, &blobs, &exe, &state, "1.0.0");
+        std::fs::set_permissions(&ro, std::fs::Permissions::from_mode(0o755)).expect("chmod");
+        let target = applied.expect("apply");
+
+        let (path, version) =
+            staged_replacement(&state, "1.0.0").expect("a staged binary is recorded");
+        assert_eq!(path, target);
+        assert_eq!(version, "9.9.9");
+
+        // And once the staged binary IS what is running, it must not be
+        // offered again -- that is the loop, one step later.
+        assert!(
+            staged_replacement(&state, "9.9.9").is_none(),
+            "a staged binary must not supersede itself"
+        );
+    }
+
+    /// Replacing the running binary in place needs no marker, and must not
+    /// leave one that would redirect a later start.
+    #[test]
+    fn replacing_in_place_records_no_marker() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let blobs = BlobStore::open(&dir.path().join("blobs")).expect("blobs");
+        let exe = dir.path().join("ph-reactor");
+        std::fs::write(&exe, b"old").expect("write");
+        let r = release_for(&blobs, b"new", "9.9.9", super::super::current_platform());
+        apply(&r, &blobs, &exe, dir.path(), "1.0.0").expect("apply");
+        assert!(staged_replacement(dir.path(), "1.0.0").is_none());
+    }
+
+    /// Anything wrong with the marker means "run what is already running".
+    #[test]
+    fn a_broken_marker_is_ignored_rather_than_fatal() {
+        let dir = tempfile::tempdir().expect("tmp");
+        let bin = dir.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("mkdir");
+        let marker = bin.join(STAGED_MARKER);
+
+        for body in [
+            "not json",
+            "{}",
+            r#"{"version":"9.9.9"}"#,
+            r#"{"version":"9.9.9","path":"/nonexistent/ph-reactor"}"#,
+            r#"{"version":"nightly","path":"/bin/sh"}"#,
+        ] {
+            std::fs::write(&marker, body).expect("write");
+            assert!(
+                staged_replacement(dir.path(), "1.0.0").is_none(),
+                "must ignore marker {body:?}"
+            );
+        }
+    }
 
     fn release_for(blobs: &BlobStore, bytes: &[u8], version: &str, platform: &str) -> Release {
         let binary = blobs.put(bytes).expect("store");
