@@ -257,3 +257,55 @@ mod tests {
         assert!(!a.verify_cosig(1, &cosigner.verifying_key()));
     }
 }
+
+#[cfg(test)]
+mod wire_format_tests {
+    use super::*;
+    use crate::doc::{DocId, ModelRef, VecClock};
+    use serde_json::json;
+
+    /// A golden vector for [`Action::message_bytes`].
+    ///
+    /// Every signer -- including a browser that never runs this code -- must
+    /// produce these exact bytes, or its signatures will not verify. Pinning
+    /// them makes an accidental change to the canonical form a test failure
+    /// rather than a fleet-wide signature outage.
+    ///
+    /// The payload keys are deliberately out of alphabetical order in the
+    /// source: serde_json serialises a Value::Object from a BTreeMap, so the
+    /// output is key-SORTED. A client using JSON.stringify on an object in
+    /// insertion order would produce different bytes, and this vector is what
+    /// catches that.
+    #[test]
+    fn message_bytes_golden_vector() {
+        let a = Action {
+            doc_id: DocId::parse("00000000-0000-0000-0000-000000000001").expect("doc id"),
+            model: ModelRef::new("group", "1"),
+            kind: "post".into(),
+            payload: json!({ "zeta": 1, "alpha": "x" }),
+            ts: 7,
+            clock: VecClock::default(),
+            origin: "alice".into(),
+            cosig: Vec::new(),
+            prev_hash: None,
+            sig: [0u8; 64],
+        };
+        let hex = hex::encode(a.message_bytes());
+        assert_eq!(hex, GOLDEN, "the canonical signing form changed");
+
+        // Co-signatures must not affect the bytes: that is what lets a
+        // co-signer sign the same message the origin did.
+        let mut with_cosig = a.clone();
+        with_cosig.cosig.push(CoSig {
+            origin: "bob".into(),
+            sig: [9u8; 64],
+        });
+        assert_eq!(
+            hex::encode(with_cosig.message_bytes()),
+            hex,
+            "cosigs must be excluded from the signed bytes"
+        );
+    }
+
+    const GOLDEN: &str = "00000000000000000000000000000001010000000567726f7570010000000131000100000004706f737401000000167b22616c706861223a2278222c227a657461223a317d000000000000000701000000000100000005616c69636500";
+}

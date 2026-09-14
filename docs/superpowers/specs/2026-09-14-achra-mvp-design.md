@@ -218,9 +218,34 @@ same shape `rfp-hub` already uses (`app.enabled`, Traefik ingress, cert-manager)
 It talks to the narrow endpoint on the bootstrap node, which is already public,
 already has a stable peer id, and already serves as the mesh rendezvous.
 
-## Spikes — before any implementation
+## Spikes — RESOLVED 2026-09-14, both pass
 
-Both are cheap and both can invalidate the design:
+Both were run before implementation. Results:
+
+**1. Cross-language identity — PASS.** A Node script derived
+`12D3KooWPTgWt8RdEdD23qDpkUM3vNeXebm7u2E7XAvhWi5Htdeg` from the bootstrap
+node's real 32-byte seed, identical to the peer id Rust produces. The
+derivation is `base58btc(multihash(identity, protobuf(PublicKey{Ed25519,
+pubkey})))`. Browser actors can therefore be group members with no change to
+membership, auth or quorum.
+
+**2. Canonical signing bytes — PASS, with a required constraint.** JS
+reproduces `Action::message_bytes()` byte for byte, **but only when the payload
+is serialised with sorted keys.** Rust serialises a `Value::Object` from a
+BTreeMap, so its JSON is key-sorted; `JSON.stringify` preserves insertion order
+and produces different bytes, which would make every browser signature fail.
+
+The client must therefore use canonical (sorted-key) JSON. This is not a
+preference — it is a correctness requirement, and it is the single easiest way
+to break the browser half by accident.
+
+`action::wire_format_tests::message_bytes_golden_vector` pins the exact bytes
+so a change to the canonical form fails a test instead of silently invalidating
+every signature in the fleet.
+
+### Original statement of the spikes
+
+Both were cheap and both could have invalidated the design:
 
 1. **Cross-language identity.** A JS-generated ed25519 key must derive the same
    peer id as Rust, byte for byte. If not, browser actors cannot be group members
