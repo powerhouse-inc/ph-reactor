@@ -335,12 +335,18 @@ impl Store {
     pub fn quarantined_count(&self) -> u64 {
         self.inner.lock().quarantined
     }
-    /// The peer ids (base58) whose keys this store has pinned — the remote
-    /// peers it has authenticated, from any handshake. Excludes the local
-    /// origin (stored separately), so the caller adds one for "yourself" to
-    /// get a peer count that is never zero.
+    /// The peer ids (base58) whose keys this store has pinned — the *remote*
+    /// peers it has authenticated, from any handshake. The local origin's key
+    /// is also pinned (so local actions verify) but is filtered out here: the
+    /// caller adds one for "yourself" to get a peer count that is never zero.
     pub fn known_peers(&self) -> Vec<String> {
-        self.inner.lock().known_keys.keys().cloned().collect()
+        let inner = self.inner.lock();
+        inner
+            .known_keys
+            .keys()
+            .filter(|id| *id != &inner.origin)
+            .cloned()
+            .collect()
     }
 
     /// Record a peer's public key (from a Hello handshake) so its actions
