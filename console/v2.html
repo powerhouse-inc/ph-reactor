@@ -86,20 +86,25 @@
 
   /* The lens. A native <select> in a dark custom UI is the single loudest
      "nobody designed this" signal, and it cannot show a tier chip. */
+  /* Two rows rather than one: a tier chip competing with the name for a
+     248px column truncates the name, and naming the space is the lens's only
+     job. The tier stays visible, just underneath. */
   .lens {
-    display: flex; align-items: center; gap: 9px; width: 100%;
+    display: grid; align-items: center; gap: 0 9px; width: 100%;
+    grid-template-columns: auto 1fr auto;
+    grid-template-areas: "ico name caret" "tier tier tier";
     background: rgba(120,140,200,0.06);
     border: 1px solid var(--line); border-radius: 9px;
     padding: 8px 10px; color: var(--text); font: inherit; font-size: 13px;
     cursor: pointer; text-align: left; transition: background 120ms, border-color 120ms;
   }
   .lens:hover { background: rgba(120,140,200,0.11); border-color: var(--line-2); }
-  .lens .ico { color: var(--cyan); font-size: 13px; }
+  .lens .ico { grid-area: ico; color: var(--cyan); font-size: 13px; }
   /* The name gets the room; the tier shrinks instead. A lens that truncates
      the space name has failed its one job. */
-  .lens-name { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
-  .lens .tier { flex: 0 0 auto; font-size: 8.5px; padding: 2px 5px; letter-spacing: 0.04em; }
-  .lens-caret { color: var(--dim); font-size: 10px; }
+  .lens-name { grid-area: name; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 600; }
+  .lens .tier { grid-area: tier; justify-self: start; margin-top: 6px; font-size: 8.5px; padding: 2px 6px; letter-spacing: 0.05em; }
+  .lens-caret { grid-area: caret; color: var(--dim); font-size: 10px; }
 
   /* Apps sit under the lens with a hairline showing containment -- the point
      the old sidebar lost by putting them at the bottom. */
