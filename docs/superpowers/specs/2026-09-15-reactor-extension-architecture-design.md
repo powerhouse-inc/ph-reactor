@@ -122,15 +122,42 @@ the caller supplies**, defeated by typing someone else's name. The L1 form
 compares against `$actor`, the key that signed the action, and the store
 enforces it before reduce on one path.
 
-So the gap is not power. It is that L1 offers no types, no autocomplete, no
-refactoring and no test runner, and "it is safer" is not an answer to that.
+So the gap is not power. It is that L1 offers no validation feedback until you
+load a definition, and no way to exercise a reducer without writing Rust — and
+"it is safer" is not an answer to that. Note what the gap is *not*: nobody
+needs a nicer syntax for the JSON. They need to know it is wrong before
+shipping it, and to be able to try it.
 
 ### What changes
 
-1. **A TypeScript authoring layer.** A typed builder that emits an L1
-   definition. Real code, real types, vitest — and the artifact that travels
-   the mesh is still a hashable, auditable definition. This is the answer to
-   the tooling complaint and it changes nothing at runtime.
+1. **A JSON Schema and two CLI verbs** — *not* an authoring layer.
+
+   A typed TypeScript builder that emits L1 was considered and **rejected**. It
+   would put Node, npm and a build step inside a Rust project whose pitch is
+   not needing them, create two representations to keep in sync forever, and
+   leave you debugging generated JSON rather than what you wrote. It buys
+   autocomplete on a 24KB file — and it does not even answer the complaint it
+   was meant to answer, because a DSL that emits JSON is not "real code in a
+   reducer" either. It pays the full cost and lands nowhere near the ask.
+
+   Plain JSON also happens to be the right format for who writes these now:
+   models are increasingly authored by agents, and a schema-backed JSON object
+   is the most tractable thing for that. A bespoke DSL is a language with one
+   user and no training data.
+
+   What closes the actual gap:
+
+   - **A JSON Schema for L1** — autocomplete and inline errors in any editor,
+     no build step, nothing to keep in sync, and it doubles as the reference.
+   - **`ph-reactor model check <file>`** — runs the real `L1::from_def`, so
+     validation *is* the loader rather than a second implementation that can
+     drift from it.
+   - **`ph-reactor model try <file> --action <kind> --payload '{…}'`** — apply
+     actions to a scratch document and print the resulting state, or the
+     precondition that refused. The reducer test loop, without writing Rust.
+
+   `/api/models` and `/api/models/register` already exist, so the CLI is a thin
+   wrapper over machinery that is in the tree.
 2. **One new write operation.** Of the two gaps `knowledge-note` appeared to
    have, only one is real:
    - `splice` — `{offset, removeCount, insert}` on a string field.
@@ -345,7 +372,7 @@ Not part of this spec, but the reason it exists, and it is now much cheaper:
 | 3 | A service that is down silently stops maintaining its read model | Cursor position is observable per service; a stale cursor is a reportable state, not an invisible one |
 | 4 | Field indexes drift from documents | Built on the single apply path that everything already goes through, and rebuildable from the log like any derived state |
 | 5 | A resumable feed lets a service read history it should not | The feed is filtered by the same predicate as replication, and a service's scope names its spaces |
-| 6 | The TS authoring layer diverges from what L1 accepts | The builder emits a definition that is then loaded by the real `L1::from_def`; a round-trip test is the gate |
+| 6 | The JSON Schema drifts from what `L1::from_def` actually accepts | `model check` validates through the real loader, not the schema, so the schema is an editor aid and never the authority. A test asserts every in-tree model passes both |
 | 7 | Adding L1 operations tempts unbounded growth | Each addition requires a named application that cannot be expressed without it. One is earned (`splice`); the bar does not move |
 | 8 | A secret reaches a document and replicates to every member of a space, permanently and unencryptably | The rule is absolute and tierless (Secrets, rule 1). A service writing back is scope-limited to declared models and reducers, and no reducer takes a credential-shaped payload |
 | 9 | A daemon compromise yields cloud credentials | It cannot: the daemon never holds a secret value and offers no broker API. Credentials exist only in the service process that uses them |
@@ -353,6 +380,8 @@ Not part of this spec, but the reason it exists, and it is now much cheaper:
 
 ## Non-goals
 
+- A TypeScript (or any) authoring layer that compiles to L1. Rejected above
+  with reasons, not deferred.
 - WASM or JavaScript reducers. Documented as an escape hatch in tier 2's
   discussion, deliberately not built. If it is ever built, the coherent form is
   QuickJS-in-WASM with no clock, network or randomness, and a distribution
