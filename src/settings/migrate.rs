@@ -278,16 +278,17 @@ mod tests {
         })
     }
 
-    /// The projection a real daemon returns has no id. If this ever gains one,
-    /// the fixture has drifted from reality and these tests stop proving
-    /// anything about the running system.
+    /// This plan resolves the document id through the store by name, so it
+    /// works whether or not the projection carries one. The fixture therefore
+    /// deliberately omits `id`: if the code ever starts depending on the
+    /// projection having it, this test fails rather than the endpoint quietly
+    /// returning "nothing to migrate".
     #[test]
-    fn the_query_projection_carries_no_document_id() {
+    fn a_plan_does_not_depend_on_the_projection_carrying_an_id() {
         let d = group_doc("core");
-        assert!(
-            d.get("id").is_none(),
-            "query_docs returns name/model/fields only: {d}"
-        );
+        assert!(d.get("id").is_none(), "the fixture omits id on purpose: {d}");
+        let p = plan_for(&d, "11111111-1111-1111-1111-111111111111".into());
+        assert!(p.is_some(), "a plan is still produced without it");
     }
 
     #[test]

@@ -1,0 +1,44 @@
+{
+  "$comment": "The drive was a field of group@1 for the same historical reason as chat. It is an app now. Adding an item answers to the space's members; removing one answers to its managers -- both decided by the space, not by anything stored here.",
+  "name": "@powerhousedao/drive",
+  "version": "1.0.2",
+  "description": "A folder tree for a space. Members add, managers remove, everything signed.",
+  "category": "Collaboration",
+  "publisher": {
+    "name": "Powerhouse",
+    "url": "https://powerhouse.inc"
+  },
+  "documentModels": [],
+  "editor": "editor.html",
+  "ui": {
+    "nav": [
+      {
+        "label": "Drive",
+        "icon": "\u25a5",
+        "view": ""
+      }
+    ]
+  },
+  "capabilities": {
+    "read": [
+      "drive@1",
+      "note@1"
+    ],
+    "write": [
+      {
+        "model": "drive@1",
+        "kinds": [
+          "init",
+          "add-item",
+          "remove-item"
+        ]
+      },
+      {
+        "model": "note@1",
+        "kinds": [
+          "init"
+        ]
+      }
+    ]
+  }
+}

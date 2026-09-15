@@ -1955,7 +1955,19 @@ function openPlugin(name, installed, view) {
         // `view` is which of the plugin's own screens the operator asked for,
         // taken from the sidebar entry they clicked. It was validated at
         // install time to be a plain identifier.
-        reply({ result: { plugin: name, publisher: (pkg && pkg.publisher) || "", theme: "dark", view: view || "" } });
+        // Plus the space it is open in: its name, its tier, and what that
+        // tier actually means. An app that lets someone write needs to be able
+        // to tell them who will be able to read it, at the moment they write
+        // it -- and it cannot ask the daemon for that itself. Still no node
+        // identity, no peer list, no configuration.
+        const sp = SPACES.find((x) => x.name === CURRENT_SPACE) || null;
+        reply({ result: {
+          plugin: name,
+          publisher: (pkg && pkg.publisher) || "",
+          theme: "dark",
+          view: view || "",
+          space: sp ? { name: sp.name, tier: sp.visibility, meaning: sp.meaning } : null,
+        } });
       } else {
         reply({ error: `unknown operation: ${String(m.op)}` });
       }

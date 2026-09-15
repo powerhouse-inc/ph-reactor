@@ -1,0 +1,295 @@
+<!--
+  Chat — channels in a space.
+
+  Two deliberate things about this editor:
+
+  1. It states the audience next to the composer, not in a settings page. A
+     person about to write needs to know who will be able to read it at the
+     moment they write it, and "protected" reads like a private channel when it
+     is not one. The host hands over the space's tier and its plain-language
+     meaning for exactly this.
+
+  2. It carries no member list. Who may post is the space's `members`, checked
+     by the store. A refusal comes back from the daemon and is shown verbatim,
+     because the model's own rules are the honest explanation.
+-->
+<!doctype html>
+<meta charset="utf-8">
+<title>Chat</title>
+<style>
+  :root {
+    --bg: #0b0e14; --raise: #141821; --sunk: #0e1219;
+    --ink: #e9edf5; --muted: #9aa3b8; --faint: #6b7489;
+    --line: #222836; --line-2: #2f3646;
+    --accent: #38e1ff; --accent-ink: #04121a; --violet: #a78bfa;
+    --ok: #43e0a0; --warn: #ffc46b; --bad: #ff6b81;
+    --mono: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+    --r: 12px;
+  }
+  * { box-sizing: border-box; }
+  [hidden] { display: none !important; }
+  html, body { height: 100%; margin: 0; }
+  body {
+    background: var(--bg); color: var(--ink);
+    font: 14px/1.5 -apple-system, BlinkMacSystemFont, "Inter", "Segoe UI", Roboto, sans-serif;
+    display: grid; grid-template-columns: 208px 1fr; height: 100vh;
+  }
+
+  /* ---- channels ---- */
+  .rail { border-right: 1px solid var(--line); background: var(--sunk); display: flex; flex-direction: column; padding: 16px 10px; gap: 2px; }
+  .rail h2 { font-size: 9.5px; letter-spacing: 0.14em; text-transform: uppercase; color: var(--faint); margin: 0 0 8px 8px; font-weight: 700; }
+  .chan {
+    display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-radius: 8px;
+    cursor: pointer; color: var(--muted); font-size: 13px; border: 0; background: none;
+    width: 100%; text-align: left; font-family: inherit;
+  }
+  .chan:hover { background: rgba(120,140,200,0.08); color: var(--ink); }
+  .chan.on { background: rgba(56,225,255,0.12); color: var(--ink); font-weight: 600; }
+  .chan .hash { color: var(--faint); }
+  .chan.on .hash { color: var(--accent); }
+  .rail .new { margin-top: 8px; color: var(--faint); font-size: 12.5px; }
+  .rail .new:hover { color: var(--accent); }
+
+  /* ---- conversation ---- */
+  .main { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
+  .head { padding: 16px 22px 13px; border-bottom: 1px solid var(--line); display: flex; align-items: baseline; gap: 12px; }
+  .head h1 { margin: 0; font-size: 16px; font-weight: 700; }
+  .head .count { color: var(--faint); font-size: 12px; }
+
+  .log { overflow-y: auto; padding: 18px 22px 8px; }
+  .msg { display: grid; grid-template-columns: 34px 1fr; gap: 11px; padding: 3px 6px; margin: 0 -6px; border-radius: 8px; }
+  /* Grouped messages still have to be individually legible as messages.
+     Hover isolates one line and shows its own time in the gutter, which is
+     what keeps a block of three from reading as one message in paragraphs. */
+  .msg:hover { background: rgba(120,140,200,0.06); }
+  .gutter-at { display: none; font-size: 10px; color: var(--faint); font-family: var(--mono); text-align: right; padding-top: 3px; }
+  .msg.cont:hover .gutter-at { display: block; }
+  /* Consecutive messages from one author are one block: repeating the avatar
+     for every line turns a conversation into a list of records. */
+  .msg.cont { margin-top: 0; }
+  .msg.cont .who { visibility: hidden; height: 0; }
+  .msg.first { margin-top: 15px; }
+  .avatar {
+    width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center;
+    font-size: 11px; font-weight: 800; color: #04121a; font-family: var(--mono);
+  }
+  .who { display: flex; align-items: baseline; gap: 9px; margin-bottom: 2px; }
+  .who .id { font-weight: 700; font-size: 13px; }
+  .who .at { color: var(--faint); font-size: 11px; }
+  .text { white-space: pre-wrap; overflow-wrap: anywhere; font-size: 13.5px; }
+
+  /* ---- composer ---- */
+  .composer { border-top: 1px solid var(--line); padding: 12px 22px 16px; background: var(--sunk); }
+  .audience {
+    display: flex; align-items: flex-start; gap: 8px;
+    font-size: 11.5px; line-height: 1.45; color: var(--muted); margin-bottom: 9px;
+  }
+  .audience .tier {
+    flex: 0 0 auto; font-size: 9px; letter-spacing: 0.07em; text-transform: uppercase;
+    padding: 2px 6px; border-radius: 999px; border: 1px solid currentColor; font-weight: 700;
+  }
+  .tier.public { color: var(--accent); }
+  .tier.protected { color: var(--warn); }
+  .tier.private { color: var(--bad); }
+  .box { display: flex; gap: 10px; align-items: flex-end; }
+  textarea {
+    flex: 1; resize: none; min-height: 42px; max-height: 180px;
+    background: var(--raise); color: var(--ink); border: 1px solid var(--line-2);
+    border-radius: 10px; padding: 11px 13px; font: inherit; font-size: 13.5px; outline: none;
+  }
+  textarea:focus { border-color: var(--accent); }
+  button.send {
+    background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 10px;
+    padding: 11px 17px; font: inherit; font-weight: 700; cursor: pointer; font-size: 13px;
+  }
+  button.send:disabled { opacity: 0.45; cursor: default; }
+  .hint { color: var(--faint); font-size: 11px; margin-top: 7px; }
+  .err { color: var(--bad); font-size: 12px; margin-top: 7px; white-space: pre-wrap; }
+
+  .empty { color: var(--muted); text-align: center; padding: 56px 24px; }
+  .empty .big { font-size: 26px; opacity: 0.5; margin-bottom: 10px; }
+  .empty strong { display: block; color: var(--ink); font-size: 15px; margin-bottom: 5px; font-weight: 600; }
+  :focus-visible { outline: 2px solid var(--accent); outline-offset: 2px; border-radius: 8px; }
+</style>
+
+<aside class="rail">
+  <h2>Channels</h2>
+  <div id="chans"></div>
+  <button class="chan new" id="new-chan">+ New channel</button>
+</aside>
+
+<section class="main">
+  <div class="head"><h1 id="title">—</h1><span class="count" id="count"></span></div>
+  <div class="log" id="log"></div>
+  <div class="composer">
+    <div class="audience" id="audience" hidden></div>
+    <div class="box">
+      <textarea id="say" rows="1" placeholder="Write a message…" disabled></textarea>
+      <button class="send" id="send" disabled>Send</button>
+    </div>
+    <div class="hint">Enter sends · Shift+Enter for a new line</div>
+    <div class="err" id="err" hidden></div>
+  </div>
+</section>
+
+<script>
+<!--#include ph-reactor-sdk.js-->
+
+const $ = (s) => document.querySelector(s);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+
+const client = createClient();
+let SPACE = null;
+let CHANNELS = [];
+let CURRENT = null;
+let stop = null;
+
+/* A key is not a name, but it is an identity, and a wall of identical
+   base58 is unreadable. Short form plus a stable colour gives each person a
+   recognisable face without inventing a display name nobody chose. */
+const shortId = (k) => (k || "").length > 12 ? `${k.slice(0, 5)}…${k.slice(-4)}` : (k || "?");
+function hue(k) { let h = 0; for (const c of String(k)) h = (h * 31 + c.charCodeAt(0)) % 360; return h; }
+const initials = (k) => String(k || "?").replace(/^12D3KooW/, "").slice(0, 2).toUpperCase();
+
+/* Action timestamps are microseconds. Rendering them as milliseconds puts
+   every message in the year 58,000 -- a mistake this codebase has made once
+   already, so the conversion is explicit rather than assumed. */
+function when(ts) {
+  const ms = ts > 1e14 ? Math.floor(ts / 1000) : ts;
+  const d = new Date(ms);
+  const age = (Date.now() - ms) / 1000;
+  if (age < 45) return "just now";
+  if (age < 3600) return `${Math.round(age / 60)}m`;
+  if (age < 86400) return d.toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
+  return d.toLocaleDateString([], { month: "short", day: "numeric" });
+}
+const full = (ts) => new Date(ts > 1e14 ? Math.floor(ts / 1000) : ts).toLocaleString();
+
+function showAudience() {
+  const el = $("#audience");
+  if (!SPACE) { el.hidden = true; return; }
+  el.hidden = false;
+  el.innerHTML = `<span class="tier ${esc(SPACE.tier)}">${esc(SPACE.tier)}</span><span>${esc(SPACE.meaning)}</span>`;
+}
+
+function renderChannels() {
+  $("#chans").innerHTML = CHANNELS.map((c) => `
+    <button class="chan${c.name === CURRENT ? " on" : ""}" data-c="${esc(c.name)}">
+      <span class="hash">#</span>${esc(c.channel || c.name)}
+    </button>`).join("");
+  document.querySelectorAll("[data-c]").forEach((b) => (b.onclick = () => open(b.dataset.c)));
+}
+
+function renderLog(doc) {
+  const log = $("#log");
+  const from = doc?.fields?.msg_from || [];
+  const text = doc?.fields?.msg_text || [];
+  const ts = doc?.fields?.msg_ts || [];
+  $("#count").textContent = text.length ? `${text.length} message${text.length === 1 ? "" : "s"}` : "";
+
+  if (!text.length) {
+    log.innerHTML = `<div class="empty"><div class="big">▦</div>
+      <strong>No messages yet.</strong>Say something — it is signed by this node and replicated to everyone the space allows.</div>`;
+    return;
+  }
+  const atBottom = log.scrollHeight - log.scrollTop - log.clientHeight < 60;
+  let prev = null;
+  log.innerHTML = text.map((t, i) => {
+    const who = from[i] || "?";
+    const cont = who === prev;
+    prev = who;
+    return `<div class="msg ${cont ? "cont" : "first"}">
+      ${cont
+        ? `<div class="gutter-at" title="${esc(full(ts[i] || 0))}">${esc(when(ts[i] || 0))}</div>`
+        : `<div class="avatar" style="background:hsl(${hue(who)} 70% 62%)">${esc(initials(who))}</div>`}
+      <div>
+        <div class="who"><span class="id" title="${esc(who)}">${esc(shortId(who))}</span>
+          <span class="at" title="${esc(full(ts[i] || 0))}">${esc(when(ts[i] || 0))}</span></div>
+        <div class="text">${esc(t)}</div>
+      </div></div>`;
+  }).join("");
+  // Follow the conversation only if the reader was already at the bottom;
+  // yanking someone away from what they are reading is not "live".
+  if (atBottom) log.scrollTop = log.scrollHeight;
+}
+
+function open(name) {
+  CURRENT = name;
+  const c = CHANNELS.find((x) => x.name === name);
+  $("#title").textContent = "# " + (c?.channel || name || "");
+  $("#say").disabled = false;
+  $("#send").disabled = false;
+  renderChannels();
+  if (stop) stop();
+  stop = client.useQuery("chat@1", null, (rows) => {
+    CHANNELS = rows || [];
+    renderChannels();
+    renderLog((rows || []).find((d) => d.name === CURRENT));
+  }, { everyMs: 3000 });
+}
+
+async function send() {
+  const box = $("#say");
+  const body = box.value.trim();
+  if (!body || !CURRENT) return;
+  $("#send").disabled = true;
+  $("#err").hidden = true;
+  try {
+    await client.submit("chat@1", "post", CURRENT, { text: body });
+    box.value = "";
+    box.style.height = "auto";
+  } catch (e) {
+    // Verbatim: the space's membership rule speaks through this, and
+    // paraphrasing it would hide which rule refused.
+    $("#err").textContent = e.message || String(e);
+    $("#err").hidden = false;
+  } finally {
+    $("#send").disabled = false;
+    box.focus();
+  }
+}
+
+async function newChannel() {
+  const name = prompt("Channel name (letters, numbers and dashes)");
+  if (!name) return;
+  const clean = name.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "");
+  if (!clean) return;
+  try {
+    await client.submit("chat@1", "init", clean, { name: clean, channel: clean });
+    const rows = await client.query("chat@1", null);
+    CHANNELS = rows || [];
+    open(clean);
+  } catch (e) {
+    $("#err").textContent = e.message || String(e);
+    $("#err").hidden = false;
+  }
+}
+
+(async function boot() {
+  try {
+    const h = await client.host();
+    SPACE = h.space || null;
+  } catch {}
+  showAudience();
+
+  let rows = [];
+  try { rows = await client.query("chat@1", null); } catch {}
+  CHANNELS = rows || [];
+
+  if (!CHANNELS.length) {
+    $("#title").textContent = "No channels yet";
+    $("#log").innerHTML = `<div class="empty"><div class="big">▦</div>
+      <strong>This space has no channels.</strong>Create one to start a conversation that everyone the space allows can read.</div>`;
+  } else {
+    open(CHANNELS[0].name);
+  }
+
+  $("#new-chan").onclick = newChannel;
+  $("#send").onclick = send;
+  const box = $("#say");
+  box.addEventListener("input", () => { box.style.height = "auto"; box.style.height = Math.min(box.scrollHeight, 180) + "px"; });
+  box.addEventListener("keydown", (e) => {
+    if (e.key === "Enter" && !e.shiftKey) { e.preventDefault(); send(); }
+  });
+})();
+</script>

@@ -77,7 +77,15 @@ pub fn query_docs(store: &Store, model: &str, filter: Option<&FieldFilter>) -> V
             .iter()
             .map(|(k, v)| (k.clone(), v.value.clone()))
             .collect();
+        // `id` is in the projection because leaving it out cost two bugs.
+        // Callers that needed the document's identity -- the group migration,
+        // and the space filter on plugin queries -- each reached for `id`,
+        // found `None`, and silently produced an empty result instead of an
+        // error: "0 groups to migrate", "this space has no channels". A field
+        // whose absence turns a lookup into a silent empty set does not earn
+        // its omission.
         out.push(json!({
+            "id": state.doc.id.to_string(),
             "name": state.doc.name,
             "model": model_name,
             "fields": fields,

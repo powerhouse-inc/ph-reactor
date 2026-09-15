@@ -1157,10 +1157,14 @@ async fn plugin_query(
     if let Some(space) = &body.space {
         let space_id = state.store.get(space).map(|d| d.id);
         docs.retain(|d| {
-            d.get("id")
+            // Resolved through the store by name rather than trusting the
+            // projection to carry an id: this filter returning an empty list
+            // is indistinguishable from "this space has nothing", which is
+            // exactly how it failed the first time.
+            d.get("name")
                 .and_then(|v| v.as_str())
-                .and_then(|s| crate::doc::DocId::parse(s).ok())
-                .and_then(|id| state.store.space_of(id))
+                .and_then(|n| state.store.get(n))
+                .and_then(|doc| state.store.space_of(doc.id))
                 == space_id
         });
     }
@@ -2448,6 +2452,34 @@ async fn page_v2() -> Html<&'static str> {
 
 const PAGE: &str = include_str!("console.html");
 const PAGE_V2: &str = include_str!("../../console/v2.html");
+
+#[cfg(test)]
+mod space_scope_tests {
+    /// A plugin query narrowed to a space must return that space's documents.
+    ///
+    /// The first implementation resolved the document id out of the query
+    /// projection, which does not carry one, so every scoped query returned
+    /// nothing -- and "nothing" is indistinguishable from "this space is
+    /// empty". The console said "This space has no channels" over two
+    /// channels holding three messages.
+    #[test]
+    fn the_space_filter_resolves_documents_by_name() {
+        let src = include_str!("mod.rs");
+        let body = src
+            .split("docs.retain(|d| {")
+            .nth(1)
+            .expect("the space filter exists");
+        let head = &body[..body.find("});").unwrap_or(body.len())];
+        assert!(
+            head.contains("get(\"name\")") && head.contains("space_of"),
+            "the filter must resolve through the store, not trust the projection: {head}"
+        );
+        assert!(
+            !head.contains("get(\"id\")"),
+            "reading the id straight off the projection is the bug: {head}"
+        );
+    }
+}
 
 #[cfg(test)]
 mod console_tests {

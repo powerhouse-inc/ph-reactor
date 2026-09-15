@@ -1,0 +1,36 @@
+{
+  "$comment": "Chat used to be four parallel arrays inside group@1, which made conversation a privileged feature of the container: no plugin could add anything like it. It is an app now, installed and enabled exactly like any other. Who may post is the space's members list, enforced by the store through the model's space-member precondition -- this package declares no membership of its own.",
+  "name": "@powerhousedao/chat",
+  "version": "1.0.1",
+  "description": "Channels in a space. Signed, replicated, and readable by exactly the people the space says.",
+  "category": "Collaboration",
+  "publisher": {
+    "name": "Powerhouse",
+    "url": "https://powerhouse.inc"
+  },
+  "documentModels": [],
+  "editor": "editor.html",
+  "ui": {
+    "nav": [
+      {
+        "label": "Chat",
+        "icon": "\u25a6",
+        "view": ""
+      }
+    ]
+  },
+  "capabilities": {
+    "read": [
+      "chat@1"
+    ],
+    "write": [
+      {
+        "model": "chat@1",
+        "kinds": [
+          "init",
+          "post"
+        ]
+      }
+    ]
+  }
+}
