@@ -49,6 +49,16 @@
   .chan.on .hash { color: var(--accent); }
   .rail .new { margin-top: 8px; color: var(--faint); font-size: 12.5px; }
   .rail .new:hover { color: var(--accent); }
+  /* Inline, not a browser prompt: a sandboxed frame has no modals at all
+     (`allow-modals` is deliberately not granted), so prompt() returns null
+     with no error and the button simply does nothing. */
+  .newform { margin-top: 8px; display: flex; gap: 6px; }
+  .newform input {
+    flex: 1; min-width: 0; background: var(--raise); color: var(--ink);
+    border: 1px solid var(--accent); border-radius: 8px; padding: 7px 9px;
+    font: inherit; font-size: 12.5px; outline: none;
+  }
+  .newform .go { background: var(--accent); color: var(--accent-ink); border: 0; border-radius: 8px; padding: 0 11px; font: inherit; font-weight: 700; font-size: 12px; cursor: pointer; }
 
   /* ---- conversation ---- */
   .main { display: grid; grid-template-rows: auto 1fr auto; min-width: 0; }
@@ -116,6 +126,10 @@
   <h2>Channels</h2>
   <div id="chans"></div>
   <button class="chan new" id="new-chan">+ New channel</button>
+  <form class="newform" id="chan-form" hidden>
+    <input id="chan-name" placeholder="channel-name" autocomplete="off" spellcheck="false" maxlength="40">
+    <button class="go" type="submit">Add</button>
+  </form>
 </aside>
 
 <section class="main">
@@ -249,15 +263,23 @@ async function send() {
   }
 }
 
-async function newChannel() {
-  const name = prompt("Channel name (letters, numbers and dashes)");
-  if (!name) return;
-  const clean = name.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "");
+function openNewChannel(on) {
+  $("#new-chan").hidden = on;
+  $("#chan-form").hidden = !on;
+  if (on) { $("#chan-name").value = ""; $("#chan-name").focus(); }
+}
+
+async function newChannel(ev) {
+  ev.preventDefault();
+  const raw = $("#chan-name").value;
+  const clean = raw.trim().toLowerCase().replace(/[^a-z0-9-]+/g, "-").replace(/^-|-$/g, "");
   if (!clean) return;
+  $("#err").hidden = true;
   try {
     await client.submit("chat@1", "init", clean, { name: clean, channel: clean });
     const rows = await client.query("chat@1", null);
     CHANNELS = rows || [];
+    openNewChannel(false);
     open(clean);
   } catch (e) {
     $("#err").textContent = e.message || String(e);
@@ -270,6 +292,22 @@ async function newChannel() {
     const h = await client.host();
     SPACE = h.space || null;
   } catch {}
+
+  // Everything here lives in a space. Without one, every write is refused by
+  // the store with a message about reducers -- true, and useless. Say the
+  // thing that is actually actionable.
+  if (!SPACE) {
+    document.body.innerHTML = `<div style="display:grid;place-items:center;height:100vh;text-align:center;padding:32px">
+      <div style="max-width:44ch">
+        <div style="font-size:26px;opacity:.5;margin-bottom:12px">\u2b22</div>
+        <div style="font-size:16px;font-weight:600;margin-bottom:8px">Choose a space first.</div>
+        <div style="color:#9aa3b8;font-size:13px;line-height:1.55">
+          This app works inside a space, which decides who can read what you write.
+          Pick one from the switcher in the sidebar \u2014 or press Ctrl/\u2318 K.
+        </div>
+      </div></div>`;
+    return;
+  }
   showAudience();
 
   let rows = [];
@@ -284,7 +322,9 @@ async function newChannel() {
     open(CHANNELS[0].name);
   }
 
-  $("#new-chan").onclick = newChannel;
+  $("#new-chan").onclick = () => openNewChannel(true);
+  $("#chan-form").onsubmit = newChannel;
+  $("#chan-name").addEventListener("keydown", (e) => { if (e.key === "Escape") openNewChannel(false); });
   $("#send").onclick = send;
   const box = $("#say");
   box.addEventListener("input", () => { box.style.height = "auto"; box.style.height = Math.min(box.scrollHeight, 180) + "px"; });

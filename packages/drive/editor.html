@@ -74,6 +74,16 @@
   .chev { color: var(--faint); font-size: 16px; width: 14px; text-align: center; }
   .item.folder:hover .chev { color: var(--accent); }
 
+  /* Inline, not a browser prompt: a sandboxed frame has no modals at all
+     (`allow-modals` is deliberately not granted), so prompt() returns null
+     with no error and the button simply does nothing. */
+  .newrow { display: flex; gap: 8px; align-items: center; padding: 10px 12px; margin-bottom: 6px; }
+  .newrow .glyph { width: 30px; height: 30px; border-radius: 9px; display: grid; place-items: center; background: rgba(120,140,200,0.10); font-size: 15px; }
+  .newrow input {
+    flex: 1; min-width: 0; background: var(--raise); color: var(--ink);
+    border: 1px solid var(--accent); border-radius: 9px; padding: 9px 11px;
+    font: inherit; font-size: 13.5px; outline: none;
+  }
   .empty { color: var(--muted); text-align: center; padding: 60px 24px; }
   .empty .big { font-size: 26px; opacity: 0.5; margin-bottom: 10px; }
   .empty strong { display: block; color: var(--ink); font-size: 15px; margin-bottom: 5px; font-weight: 600; }
@@ -90,7 +100,15 @@
   <button class="act" id="new-folder">+ Folder</button>
   <button class="act primary" id="new-doc">+ Document</button>
 </div>
-<div class="list" id="list"></div>
+<div class="list" id="list">
+  <form class="newrow" id="newrow" hidden>
+    <span class="glyph" id="newrow-glyph">▤</span>
+    <input id="newrow-name" autocomplete="off" spellcheck="false" maxlength="60" placeholder="Name">
+    <button class="act primary" type="submit">Create</button>
+    <button class="act" type="button" id="newrow-cancel">Cancel</button>
+  </form>
+  <div id="rows"></div>
+</div>
 <div class="err" id="err" hidden></div>
 
 <script>
@@ -139,7 +157,7 @@ function render() {
   // changes with insertion time is a listing nobody can scan twice.
   rows.sort((a, b) => (a.kind === b.kind ? String(a.name).localeCompare(String(b.name)) : a.kind === "folder" ? -1 : 1));
 
-  const list = $("#list");
+  const list = $("#rows");
   if (!rows.length) {
     list.innerHTML = PATH.length
       ? `<div class="empty"><div class="big">▥</div><strong>This folder is empty.</strong>Add a document or another folder.</div>`
@@ -163,12 +181,12 @@ function render() {
     </div>`;
   }).join("");
 
-  document.querySelectorAll(".item.folder").forEach((el) => (el.onclick = (e) => {
+  document.querySelectorAll("#rows .item.folder").forEach((el) => (el.onclick = (e) => {
     if (e.target.closest("[data-rm]")) return;
     PATH = PATH.concat([el.dataset.n]);
     render();
   }));
-  document.querySelectorAll("[data-rm]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); remove(b.dataset.rm); }));
+  document.querySelectorAll("#rows [data-rm]").forEach((b) => (b.onclick = (e) => { e.stopPropagation(); remove(b.dataset.rm); }));
 }
 
 async function ensureDrive() {
@@ -182,9 +200,23 @@ async function ensureDrive() {
   ITEMS = (DRIVE && DRIVE.fields && DRIVE.fields.items) || [];
 }
 
-async function add(kind) {
-  const what = kind === "folder" ? "Folder name" : "Document name";
-  const raw = prompt(what);
+let NEW_KIND = "folder";
+
+function openNew(kind) {
+  NEW_KIND = kind;
+  const form = $("#newrow");
+  form.hidden = false;
+  $("#newrow-glyph").textContent = kind === "folder" ? "▤" : "≡";
+  $("#newrow-name").placeholder = kind === "folder" ? "Folder name" : "Document name";
+  $("#newrow-name").value = "";
+  $("#newrow-name").focus();
+}
+const closeNew = () => { $("#newrow").hidden = true; };
+
+async function add(ev) {
+  if (ev) ev.preventDefault();
+  const kind = NEW_KIND;
+  const raw = $("#newrow-name").value;
   if (!raw || !raw.trim()) return;
   const name = raw.trim();
   clearFail();
@@ -198,6 +230,7 @@ async function add(kind) {
     await client.submit("drive@1", "add-item", DRIVE.name, {
       item: { name, kind, model: kind === "doc" ? "note@1" : null, parent: here() },
     });
+    closeNew();
     await refresh();
   } catch (e) { fail(e); }
 }
@@ -225,6 +258,22 @@ async function refresh() {
     const h = await client.host();
     SPACE = h.space || null;
   } catch {}
+
+  // Everything here lives in a space. Without one, every write is refused by
+  // the store with a message about reducers -- true, and useless. Say the
+  // thing that is actually actionable.
+  if (!SPACE) {
+    document.body.innerHTML = `<div style="display:grid;place-items:center;height:100vh;text-align:center;padding:32px">
+      <div style="max-width:44ch">
+        <div style="font-size:26px;opacity:.5;margin-bottom:12px">\u2b22</div>
+        <div style="font-size:16px;font-weight:600;margin-bottom:8px">Choose a space first.</div>
+        <div style="color:#9aa3b8;font-size:13px;line-height:1.55">
+          This app works inside a space, which decides who can read what you write.
+          Pick one from the switcher in the sidebar \u2014 or press Ctrl/\u2318 K.
+        </div>
+      </div></div>`;
+    return;
+  }
   showAudience();
   if (SPACE) $("#title").textContent = "Drive · " + SPACE.name;
 
@@ -239,7 +288,10 @@ async function refresh() {
     render();
   }, { everyMs: 4000 });
 
-  $("#new-folder").onclick = () => add("folder");
-  $("#new-doc").onclick = () => add("doc");
+  $("#new-folder").onclick = () => openNew("folder");
+  $("#new-doc").onclick = () => openNew("doc");
+  $("#newrow").onsubmit = add;
+  $("#newrow-cancel").onclick = closeNew;
+  $("#newrow-name").addEventListener("keydown", (e) => { if (e.key === "Escape") closeNew(); });
 })();
 </script>

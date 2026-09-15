@@ -110,6 +110,7 @@
      the old sidebar lost by putting them at the bottom. */
   .subnav { margin: 4px 0 0 18px; padding-left: 10px; border-left: 1px solid var(--line); display: flex; flex-direction: column; gap: 2px; }
   .subnav:empty { display: none; }
+  .pick-hint { color: var(--dim); font-size: 11.5px; line-height: 1.45; padding: 6px 4px 2px; }
 
   .badge {
     margin-left: auto; min-width: 18px; height: 18px; padding: 0 5px;
@@ -1801,10 +1802,21 @@ async function renderPluginNav() {
   let inst = [];
   try { inst = await get("/api/plugins"); } catch { host.innerHTML = ""; return; }
 
-  // Only the apps enabled in the space you are looking at. With no space
-  // selected every installed app is offered, which is what a node with no
-  // spaces yet should do rather than showing an empty sidebar.
+  // Only the apps enabled in the space you are looking at.
+  //
+  // With spaces on the node but none chosen, offering them all was worse than
+  // offering none: every app is scoped to a space, so clicking one led to a
+  // screen that looked working and then refused the first thing you did with
+  // "this reducer requires a space, and the document has none". Say what is
+  // needed instead. A node with no spaces at all still lists its apps, since
+  // there is nothing to choose and nothing to explain.
   const sp = SPACES.find((x) => x.name === CURRENT_SPACE);
+  if (!sp && SPACES.length) {
+    host.innerHTML = `<div class="pick-hint">Choose a space to see its apps.</div>`;
+    SPACE_NAV = [];
+    markActiveNav();
+    return;
+  }
   const enabled = sp ? new Set(sp.apps.map((a) => a.name)) : null;
 
   const items = [];
@@ -1971,7 +1983,13 @@ function openPlugin(name, installed, view) {
           publisher: (pkg && pkg.publisher) || "",
           theme: "dark",
           view: view || "",
-          space: sp ? { name: sp.name, tier: sp.visibility, meaning: sp.meaning } : null,
+          // Members too: an app scoped to a space needs to address the people
+          // in it -- who approves, who is assigned, who gets paid. That is the
+          // space's own data, not node identity and not the peer list, and the
+          // alternative is every app asking the operator to paste public keys.
+          space: sp
+            ? { name: sp.name, tier: sp.visibility, meaning: sp.meaning, members: sp.members, managers: sp.managers }
+            : null,
         } });
       } else {
         reply({ error: `unknown operation: ${String(m.op)}` });

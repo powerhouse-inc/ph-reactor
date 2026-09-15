@@ -58,6 +58,7 @@
   .stat .l { font-size: 11px; color: var(--faint); text-transform: uppercase; letter-spacing: .08em; margin-top: 2px; }
 
   nav { display: flex; gap: 7px; margin-bottom: 18px; flex-wrap: wrap; }
+  .who-approves { color: var(--muted); font-size: 12.5px; margin: 0 0 12px; }
   .tab {
     border: 1px solid var(--line); background: var(--raise); color: var(--muted);
     padding: 7px 14px; border-radius: 999px; cursor: pointer; font: inherit; font-size: 13px;
@@ -179,6 +180,9 @@
 <!--#include ph-reactor-sdk.js-->
 
 const ph = createClient();
+/* The host handshake, kept because more than the theme is useful now: the
+   space it is open in, and who is in it. */
+let HOST = null;
 
 /* ---------- helpers ---------- */
 const $ = (s, r = document) => r.querySelector(s);
@@ -257,12 +261,89 @@ function refreshStats() {
 }
 
 /* ---------- views ---------- */
+function publishForm() {
+  return `
+    <article class="card" id="new-rfp">
+      <div class="row"><div style="min-width:0"><h3>Publish an objective</h3>
+        <p>Anyone in this space can see it and submit a proposal against it.</p></div>
+        <button class="go" id="new-rfp-toggle" type="button">+ New objective</button></div>
+      <form id="new-rfp-form" hidden style="margin-top:14px">
+        <label>Title<input name="title" required maxlength="120" placeholder="Durability guarantees for the store"></label>
+        <label>Brief<textarea name="brief" rows="3" required placeholder="What needs doing, and what done looks like."></textarea></label>
+        <div class="two">
+          <label>Budget<input name="budget" type="number" min="0" step="1" required placeholder="40000"></label>
+          <label>Currency<input name="currency" maxlength="8" value="USD" required></label>
+        </div>
+        <label>Deadline<input name="deadline" type="date" required></label>
+        <p class="who-approves" id="who-approves"></p>
+        <button class="go" type="submit">Publish</button>
+      </form>
+      <div class="out"></div>
+    </article>`;
+}
+
+function wirePublish() {
+  const card = document.querySelector("#new-rfp");
+  if (!card) return;
+  const form = card.querySelector("#new-rfp-form");
+  const space = (HOST && HOST.space) || null;
+  const n = (space && space.members ? space.members : []).length;
+  const who = card.querySelector("#who-approves");
+  if (who) {
+    who.textContent = !space
+      ? "Choose a space in the sidebar first — an objective is published into a space, and that is what decides who can see it."
+      : n
+        ? `${n} member${n === 1 ? "" : "s"} of ${space.name} will be asked to approve it, and it will appear in their inbox.`
+        : "Nobody in this space is set to approve it yet — it will be published, but no one is asked.";
+  }
+  if (!space) {
+    card.querySelector("#new-rfp-toggle").disabled = true;
+    form.hidden = true;
+    if (who) who.style.display = "block";
+  }
+  card.querySelector("#new-rfp-toggle").onclick = () => {
+    form.hidden = !form.hidden;
+    if (!form.hidden) form.querySelector("input[name=title]").focus();
+  };
+  form.addEventListener("submit", async (ev) => {
+    ev.preventDefault();
+    const b = form.querySelector("button[type=submit]");
+    const out = card.querySelector(".out");
+    const d = Object.fromEntries(new FormData(form));
+    const slug = String(d.title).trim().toLowerCase().replace(/[^a-z0-9]+/g, "-").replace(/^-|-$/g, "").slice(0, 40);
+    const name = `rfp-${slug || "objective"}-${Date.now().toString(36)}`;
+    b.disabled = true; out.innerHTML = "";
+    try {
+      // The publisher is the signing node, taken from $actor by the model.
+      // `approvers` is who the objective needs; it starts as the publisher so
+      // the objective has someone accountable from the moment it exists.
+      const approvers = (HOST && HOST.space && HOST.space.members) || [];
+      await ph.submit("rfp@1", "init", name, {
+        name, title: d.title, brief: d.brief,
+        budget: Number(d.budget), currency: d.currency, deadline: d.deadline,
+        approvers,
+      });
+      out.innerHTML = `<div class="note good">Published as <b>${esc(name)}</b>.</div>`;
+      form.reset(); form.hidden = true;
+      poll();
+    } catch (e) {
+      out.innerHTML = `<div class="note bad">${esc(e.message)}</div>`;
+    } finally { b.disabled = false; }
+  });
+}
+
 function showRfps() {
   const open = data.rfp.filter((r) => f(r, "status") === "open");
   const rest = data.rfp.filter((r) => f(r, "status") !== "open");
-  if (!data.rfp.length) return empty("No objectives yet", "When an organization publishes an RFP to a drive you're on, it appears here.");
+  if (!data.rfp.length) {
+    view.innerHTML = publishForm()
+      + `<article class="card"><h3>No objectives yet</h3>
+         <p>Publish one above, or wait for someone else in this space to.</p></article>`;
+    wirePublish();
+    return;
+  }
 
-  view.innerHTML = [...open, ...rest].map((r) => `
+  view.innerHTML = publishForm() + [...open, ...rest].map((r) => `
     <article class="card">
       <div class="row">
         <div style="min-width:0">
@@ -284,6 +365,7 @@ function showRfps() {
       ${trailFor("rfp@1", r.name)}
     </article>`).join("");
 
+  wirePublish();
   view.querySelectorAll("[data-propose]").forEach((b) => (b.onclick = () => proposeForm(b.dataset.propose, b)));
   bindTrails();
 }
@@ -497,6 +579,7 @@ skel();
 ph.host()
   .then((h) => {
     if (!h) return;
+    HOST = h;
     if (h.theme) document.documentElement.dataset.theme = h.theme;
     // The operator clicked a specific sidebar entry, so open what they asked
     // for rather than always landing on the default tab.

@@ -1,7 +1,7 @@
 {
   "$comment": "The drive was a field of group@1 for the same historical reason as chat. It is an app now. Adding an item answers to the space's members; removing one answers to its managers -- both decided by the space, not by anything stored here.",
   "name": "@powerhousedao/drive",
-  "version": "1.0.2",
+  "version": "1.0.4",
   "description": "A folder tree for a space. Members add, managers remove, everything signed.",
   "category": "Collaboration",
   "publisher": {

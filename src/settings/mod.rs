@@ -2454,6 +2454,57 @@ const PAGE: &str = include_str!("console.html");
 const PAGE_V2: &str = include_str!("../../console/v2.html");
 
 #[cfg(test)]
+mod editor_tests {
+    /// No editor may call a browser modal.
+    ///
+    /// The plugin iframe is sandboxed without `allow-modals`, so `prompt()`,
+    /// `alert()` and `confirm()` are *ignored* -- they return null, throw
+    /// nothing, and log only to the console. Every creation flow in Chat and
+    /// Drive was built on `prompt()` and every one of them silently did
+    /// nothing: the button was there, you clicked it, and no dialog appeared.
+    /// Exactly the `allow-forms` failure again, one sandbox token along.
+    /// Remove `/* block */`, `<!-- html -->` and `// line` comments.
+    fn strip_comments(src: &str) -> String {
+        let mut out = String::with_capacity(src.len());
+        let b = src.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i..].starts_with(b"/*") {
+                i = src[i..].find("*/").map(|j| i + j + 2).unwrap_or(b.len());
+            } else if b[i..].starts_with(b"<!--") {
+                i = src[i..].find("-->").map(|j| i + j + 3).unwrap_or(b.len());
+            } else if b[i..].starts_with(b"//") {
+                i = src[i..].find('\n').map(|j| i + j).unwrap_or(b.len());
+            } else {
+                out.push(b[i] as char);
+                i += 1;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn no_editor_reaches_for_a_browser_modal() {
+        for (name, src) in [
+            ("chat", include_str!("../../packages/chat/editor.html")),
+            ("drive", include_str!("../../packages/drive/editor.html")),
+            ("achra", include_str!("../../packages/achra/editor.html")),
+        ] {
+            // Comments explaining the rule are allowed to name it; code is not.
+            // Stripping them properly beats guessing from indentation, since
+            // the sentence that names the trap wraps onto its own line.
+            let code = strip_comments(src);
+            for call in ["prompt(", "alert(", "confirm("] {
+                assert!(
+                    !code.contains(call),
+                    "{name} calls {call} -- a sandboxed frame ignores it silently"
+                );
+            }
+        }
+    }
+}
+
+#[cfg(test)]
 mod space_scope_tests {
     /// A plugin query narrowed to a space must return that space's documents.
     ///
