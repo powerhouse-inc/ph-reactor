@@ -131,15 +131,23 @@ refactoring and no test runner, and "it is safer" is not an answer to that.
    definition. Real code, real types, vitest — and the artifact that travels
    the mesh is still a hashable, auditable definition. This is the answer to
    the tooling complaint and it changes nothing at runtime.
-2. **Two new write operations**, which are the only two things `knowledge-note`
-   genuinely cannot express:
+2. **One new write operation.** Of the two gaps `knowledge-note` appeared to
+   have, only one is real:
    - `splice` — `{offset, removeCount, insert}` on a string field.
-   - a **dynamic write target** — the field named by the payload. The
-     whitelist lives in the reducer's own `writes` entry (e.g.
-     `{"$payload.field": {"set": "$payload.value", "among": [...]}}`), so the
-     complete set of fields a reducer can write is still readable in the
-     definition. A payload naming a field outside the list is rejected before
-     reduce, like any other precondition failure.
+   - ~~a dynamic write target~~ — **dropped.** `setMetadataField(field, value)`
+     exists only because one model does duty for many note kinds:
+     `knowledge-note` carries `scope`, `confidence`, `severity`, `editor`,
+     `modelId`, `modules`, `computes`, `inputs`, `outputs`, `consumedBy`,
+     `context`, `alternatives`, `consequences`, `decisionStatus`, `sourceType`,
+     `targetType`, `relationType`, `cardinality`, `errorMessage`, `rootCause`
+     and `correctPattern` as optional fields behind a `noteType` discriminator,
+     with a hand-maintained `STRING_METADATA_FIELDS` whitelist to police them.
+     That is several models wearing one name. Since we are rewriting rather
+     than transliterating, the fix is to split them — or to carry the variable
+     part as a single `object` field written whole. Either way L1 needs nothing
+     new.
+
+   So **L1 gains exactly one operation, `splice`.**
 
    L1's ops today are exactly `set`, `append`, `remove`; field types are
    `string`, `number`, `boolean`, `object`, `array`, `string[]`, `number[]`.
@@ -171,10 +179,24 @@ prerequisite for tier 3, because the feed is what a service consumes.
 
 ## Tier 3 — services
 
-The evidence says the daemon should **not** provide a database. Every processor
-in all three packages is already written against pglite and kysely with its own
-schema and migrations; any substrate the daemon invents — KV, SQLite, or
-pglite-in-wasmtime — forces a rewrite of working code and buys nothing.
+**The old reactor is not being kept, and rewriting is accepted.** That removes
+code reuse as an argument, so the case for services has to stand on its own —
+and it does, on marginal cost.
+
+Some extensions cannot be sandboxed at all: `vetra-github-auth` signs GitHub
+App JWTs, `vetra-cloud-secrets` calls the Kubernetes API, `vetra-cloud-observability`
+presigns S3 URLs, and embeddings need an HTTP call. A WASM module with no
+sockets cannot do any of it, and granting it ambient network defeats the
+sandbox. So a trusted, networked runtime has to exist regardless.
+
+Once it exists, a read model costs nothing extra to run there — whereas putting
+read models *inside* the daemon means designing a host ABI, a fuel and memory
+regime, SQL or KV host calls, and rebuild machinery. The marginal cost of one
+more service is near zero; the marginal cost of tier 2 is a new runtime surface
+kept stable for years.
+
+So the daemon provides **no storage substrate for extensions**. A service brings
+its own database and the daemon does not care which.
 
 A service keeps its own storage. The daemon provides four things:
 
@@ -187,9 +209,14 @@ A service keeps its own storage. The daemon provides four things:
    via the host bridge; routing services through it means no CORS, no second
    origin, and the space scope travels with the call.
 
-With that, the knowledge graph indexer (~3.4k lines), the Vetra subgraphs (18k)
-and the dtbau subgraphs (7.1k) port with their SQL, kysely, octokit, k8s and
-glTF code substantially intact. Only their input changes.
+That is a small and stable surface, and it is deliberately the *whole* of it.
+The daemon gains no database, no query language and no plugin runtime for
+extensions — which is what keeps this affordable to build and to keep working.
+
+Since these are rewrites rather than ports, a service is free to choose its own
+language, database and libraries. What it inherits from this design is not
+code: it is a defined input (the feed), a defined way to write back, an
+identity, and a way to be reached.
 
 ### A service is trusted code and must be installed like it
 
@@ -204,6 +231,79 @@ enforces plugin capabilities. Powerhouse subgraphs today run with ambient
 reactor privilege and no declared scope; **declaring the scope and signing the
 writes is the one place this design is strictly better than what it replaces.**
 
+## Secrets
+
+Services need real credentials: GitHub App private keys, `kubeconfig`, AWS
+keys, Dalux/Speckle/SharePoint tokens, database passwords, and an LLM key for
+embeddings. How those are handled is a design decision, not an operational
+detail, so it is settled here.
+
+### One principle
+
+**The daemon never holds a secret value. It holds, at most, a reference to
+one.**
+
+This is already the convention and it only needs extending. `src/config.rs`
+stores `tokenEnv` and `apiKeyEnv` — the *names* of environment variables, never
+their contents (`src/config.rs:110,141,177`). That is precisely why
+`/api/config` can serialize the entire configuration and leak nothing. The node
+identity key follows the same discipline: on the cluster it lives in OpenBao,
+is projected in at runtime by the External Secrets Operator, and local copies
+were shredded after minting.
+
+### Five rules
+
+1. **No secret in a document. Ever. In any space.** Documents replicate, and a
+   protected space is *not* a secret store — every member holds a full
+   plaintext copy and keeps it after removal. Private spaces are no better:
+   "private" means not replicated, not encrypted, and the WAL and snapshots are
+   plain JSON on disk. This rule has no exceptions and no tier.
+2. **No secret through the daemon.** A service is a separate process, so its
+   credentials go *to it* — never through the daemon and never into the
+   daemon's memory. This is a real security gain of the service architecture,
+   not an accident: the daemon is the component exposed to the mesh and to an
+   unauthenticated console, so a daemon compromise must not yield cloud
+   credentials. There is therefore **no secret-broker API**: nothing a service
+   can call to ask the daemon for a credential.
+3. **Declared by reference, and disclosed at install.** A service manifest
+   names what it needs and where it comes from — `{"secrets": [{"name":
+   "GITHUB_APP_KEY", "from": "env"}]}` — never a value. Install shows the set in
+   plain language beside the scope, the way capabilities, projections and
+   attention rules already are: *"this service reads GITHUB_APP_KEY and
+   AWS_SECRET_ACCESS_KEY from the environment."* An operator can consent to a
+   list of names; nobody can consent to an opaque blob.
+4. **Never in a response, never in a log.** `/api/services` reports each
+   reference and *whether it resolved* — never the value. The existing practice
+   of never printing OpenBao values to a terminal extends unchanged.
+5. **Rotation is external.** Because the daemon holds references, rotation
+   happens in OpenBao / the k8s Secret and takes effect when the service
+   restarts. The daemon's job is to report that a reference failed to resolve,
+   not to manage the lifecycle of a credential it cannot see.
+
+### Service authentication, without inventing a secret
+
+A service must authenticate to the daemon, and the obvious designs create a
+new secret to manage. They are not needed: **a service generates its own
+ed25519 keypair on first run and the operator approves its public key.**
+
+That is the TOFU publisher-trust flow that already exists for packages, applied
+to processes — so no shared secret is ever created, transmitted or stored, and
+the same keypair makes every write the service performs *signed and
+attributable*. A bearer token would be a secret to issue, store, rotate and
+leak; a public key is not a secret at all.
+
+### On the cluster
+
+Nothing new is required. A service's secrets are Kubernetes Secrets projected
+as environment variables, sourced from OpenBao through the External Secrets
+Operator — the same path the node identity already takes. `readOnlyRootFilesystem`
+and the existing NetworkPolicy continue to apply, and a service that needs
+egress declares it there rather than the daemon widening its own.
+
+Note that `vetra-cloud-secrets` — a 1.9k-line subgraph that manages secrets via
+the Kubernetes API — becomes an ordinary tier-3 service under this design. It
+holds credentials; the daemon still never sees them.
+
 ## Tier 2 — WASM views, deferred
 
 A host ABI is the most novel and least reversible thing here: designed once and
@@ -216,21 +316,25 @@ concrete: **something that must run inside the daemon, cannot hold credentials,
 and is too hot for a round trip.** If that arrives, the ABI is an ordered KV
 with prefix scan — small and stable — because real SQL lives in tier 3.
 
-## What this means for the knowledge-vault port
+## What this means for the knowledge-vault rewrite
 
 Not part of this spec, but the reason it exists, and it is now much cheaper:
 
 - 12 document models → L1 definitions, TS-authored, using `splice` and dynamic
   targets.
-- Graph indexer + subgraph → **one tier-3 service**, keeping its SQL and its
-  embedder. Embeddings need network, which settles the tier by itself.
+- Graph indexer + subgraph → **one tier-3 service**, free to pick its own
+  database rather than inheriting pglite. Embeddings need network and an API
+  key, which settles the tier by itself.
 - 12 React editors → single-file bridge editors. **This is the real remaining
   work** and it is a rewrite, not a port: `@powerhousedao/reactor-browser`
   hooks and the design system do not exist inside the sandbox.
-- Live documents must be migrated off Switchboard, and every
-  `powerhouse-knowledge` skill that drives it through the Switchboard CLI needs
-  repointing. That is the cost of the move and belongs in a decision, not a
-  discovery.
+- Live documents are exported once and imported; the old reactor is then
+  switched off rather than kept in step. Every `powerhouse-knowledge` skill
+  that drives it through the Switchboard CLI needs repointing at the new API —
+  known and accepted, not a discovery.
+- The 12 models are an opportunity to fix `knowledge-note` splitting into
+  distinct types rather than carrying 21 optional fields behind a
+  discriminator.
 
 ## Risks
 
@@ -242,7 +346,10 @@ Not part of this spec, but the reason it exists, and it is now much cheaper:
 | 4 | Field indexes drift from documents | Built on the single apply path that everything already goes through, and rebuildable from the log like any derived state |
 | 5 | A resumable feed lets a service read history it should not | The feed is filtered by the same predicate as replication, and a service's scope names its spaces |
 | 6 | The TS authoring layer diverges from what L1 accepts | The builder emits a definition that is then loaded by the real `L1::from_def`; a round-trip test is the gate |
-| 7 | Adding L1 operations tempts unbounded growth | Each addition requires a named application that cannot be expressed without it. Two are earned; the bar does not move |
+| 7 | Adding L1 operations tempts unbounded growth | Each addition requires a named application that cannot be expressed without it. One is earned (`splice`); the bar does not move |
+| 8 | A secret reaches a document and replicates to every member of a space, permanently and unencryptably | The rule is absolute and tierless (Secrets, rule 1). A service writing back is scope-limited to declared models and reducers, and no reducer takes a credential-shaped payload |
+| 9 | A daemon compromise yields cloud credentials | It cannot: the daemon never holds a secret value and offers no broker API. Credentials exist only in the service process that uses them |
+| 10 | Service authentication creates a new secret to manage | It does not. The service generates its own keypair and the operator approves the public key, reusing the package TOFU flow |
 
 ## Non-goals
 
@@ -251,7 +358,12 @@ Not part of this spec, but the reason it exists, and it is now much cheaper:
   QuickJS-in-WASM with no clock, network or randomness, and a distribution
   class that is never auto-fetched from a peer.
 - GraphQL in the daemon. A service may speak GraphQL; the daemon does not.
-- Replacing Switchboard. Services are an extension point, not a migration plan.
+- Backwards compatibility with the old reactor. It is not being kept, so
+  nothing here preserves Powerhouse interfaces, pglite schemas or the
+  Switchboard CLI. Ports are rewrites, and that is the accepted cost.
+- A secret-broker API in the daemon. Explicitly rejected: it would put
+  credentials in the memory of the process that is exposed to the mesh and to
+  an unauthenticated console.
 - Multi-tenant service hosting. One node, one operator, as with the console.
 
 ## Open questions
